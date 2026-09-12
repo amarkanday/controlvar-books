@@ -177,9 +177,11 @@ python -m pytest backend/tests/unit/services/test_cuped_service.py -k theta -v  
 cd frontend && npm test                                           # Jest, 550+ tests
 ```
 
-> **Watch Out!** Three harness facts that cost people hours: (1) `pytest.ini`'s `addopts`
-> carries coverage flags that silently produce no report in some venvs — pass `--cov` explicitly
-> when you want numbers, and `-p no:cov` when you want speed. (2) Running unit and integration
+> **Watch Out!** Three harness facts that cost people hours: (1) pytest is configured in one
+> place — `[tool.pytest.ini_options]` in `pyproject.toml` (the old `pytest.ini` files are gone)
+> — and coverage is deliberately **not** in `addopts` because it slowed every run and silently
+> produced no report under some plugin combinations; ask for it explicitly with
+> `--cov=backend.app --cov-report=term`. (2) Running unit and integration
 > suites in _one_ pytest session surfaces ~10 order-dependent failures (list pagination, the
 > CloudWatch client) that pass when the suites run separately; CI runs them separately.
 > (3) `backend/tests/smoke/test_production.py` targets a live server via `SMOKE_TEST_API_URL`
@@ -591,9 +593,12 @@ pre-deployment-checks → run-tests → build-and-push (ECR, immutable tag)
 _before_ traffic shifts and are additive (Week 2, Day 14), the previous image is always
 compatible with the current schema.
 
-> **Watch Out!** Two CI facts that look like flakes and aren't. `pytest.ini`'s `addopts`
-> adds `--cov`, so a job that installs only `pytest` (the SDK contract job) must pass
-> `-o addopts=""` or it fails on an unknown option. And gitleaks on `pull_request` needs
+> **Watch Out!** Three CI facts that look like flakes and aren't. The SDK contract job
+> installs only `pytest` and passes `-o addopts=""` defensively (a leftover from when the
+> root config added `--cov`; harmless now that `addopts` is empty in `pyproject.toml`).
+> `curl … | grep -q` under `set -o pipefail` fails for any response larger than the pipe
+> buffer (curl exits 23 on SIGPIPE) — the docker-smoke job fetches to a file first for
+> exactly that reason. And gitleaks on `pull_request` needs
 > `pull-requests: read` permission to list the PR's commits — the release gate grants it
 > explicitly; a copied workflow without it fails with an opaque API error.
 
@@ -629,8 +634,8 @@ Fail fast: with 3,700 tests, stopping at the first failure gives feedback minute
 keeps the log readable. The nightly run doesn't use `-x`, so you get the full failure list
 there.
 
-**Q. The process memory says every PR needs a GitHub issue and a `/review`. Where's that
-enforced?**
+**Q. The team's working agreements say every PR needs a GitHub issue and a `/review`. Where's
+that enforced?**
 By convention and review, not CI: each work item gets an issue, the PR says `Closes #N`, and
 `/code-review` runs before merge. It's in the team's working agreements (see the onboarding
 guide).

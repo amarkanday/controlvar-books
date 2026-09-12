@@ -300,7 +300,7 @@ if wrong, produce the most confusing failures in the repo.
 
 The backend needs three things: a **Python 3.11 virtual environment** with the pinned
 dependencies, a **PostgreSQL** server on `localhost:5432`, and a handful of **environment
-variables** that pick the schema and the auth mode. The dashboard needs Node 20 and a backend
+variables** that pick the schema and the auth mode. The dashboard needs Node 22 (`.nvmrc`) and a backend
 to talk to. Redis is optional — the rate limiter and caches degrade gracefully without it.
 
 #### Why a virtualenv, and why the tests care so much
