@@ -1,0 +1,801 @@
+# Part VI — Testing & Operating
+
+### Hours 22–24
+
+[← Part V](./part-5-beyond-requests.md) · [Contents](./README.md)
+
+The last three hours are about trust: how you know an endpoint works (Hour 22), how you test
+the paths that touch a real database without the tests trampling each other (Hour 23), and
+how the running service tells you it's healthy — plus the style guide that collects every
+convention this book has taught (Hour 24). Hour 22 opens with the incident that reshaped the
+platform's testing policy; keep it in mind whenever you're tempted to mock the thing you're
+testing.
+
+---
+
+## Hour 22 — `TestClient`, `dependency_overrides`, and the mocked-seam lesson
+
+### What & why
+
+FastAPI ships a **`TestClient`** (built on `httpx`) that calls your app in-process — no
+server, no network — with the same `.get`/`.post` API you'd use against a URL. Combined
+with **`app.dependency_overrides`**, it lets a test replace exactly the leaves it needs
+(the session, the current user) while running everything else for real: routing,
+middleware, validation, serialisation, the endpoint body, the service.
+
+That "everything else for real" is the point, and it's where a test suite can quietly go
+wrong. Consider the alternative — a test of `POST /tracking/track` that patches
+`EventService.track_event` with a `MagicMock` and asserts it was called. Fast, isolated,
+green. And it never notices that the endpoint builds an `EventCreate` with field names the
+real service rejects.
+
+#### The mocked-seam lesson
+
+That's not hypothetical. In September 2026 the platform had 5,000+ green tests and a broken
+public tracking API: the endpoint's `EventCreate` didn't match the service, the experiments
+endpoints returned shapes their response models refused, the safety service read a table
+nobody wrote to, and the bandit scheduler called a method that didn't exist on the DynamoDB
+client. Each path had tests that **mocked the collaborator** and asserted on the mock.
+
+The policy the team adopted (`docs/testing/testing-audit-2026-09.md`), in one line: **mock
+what you don't own; drive what you do.** External services (AWS via `moto`, Slack, SendGrid,
+the LLM APIs) are mocked. Anything in `backend/app` is exercised for real — through
+`TestClient`, against a real database — at least once per hot path. Unit tests with mocks are
+still welcome for branch coverage, and they _name their integration twin_ in the docstring.
+
+### In the wild
+
+The `client` fixture is the harness's centrepiece. Trimmed to what matters:
+
+```python
+# 📁 backend/tests/conftest.py
+@pytest.fixture
+def client(db_session, monkeypatch):
+    """Create a test client for the FastAPI application."""
+    # Override the get_db dependency
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    # Mock Cognito auth service
+    def mock_get_user_with_groups(*args, **kwargs):
+        return {"username": "test_user", "attributes": {"email": "test@example.com"}, "groups": ["admin-group"]}
+
+    monkeypatch.setattr("backend.app.services.auth_service.CognitoAuthService.get_user_with_groups", mock_get_user_with_groups)
+    ...
+    # Get or create a superuser for authentication
+    user = db_session.query(User).filter(User.email == "test@example.com").first()
+    if not user:
+        user = User(
+            username="test_user",
+            email="test@example.com",
+            full_name="Test User",
+            hashed_password="$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",
+            is_active=True,
+            is_superuser=True,
+            role=UserRole.ADMIN
+        )
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+
+    # Create both sync and async return functions for user
+    async def override_get_current_user():
+        return user
+
+    def override_get_current_active_user():
+        return user
+
+    def override_get_current_superuser():
+        return user
+
+    async def override_get_cache_control():
+        return CacheControl(enabled=False, skip=True)
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[deps.get_db] = override_get_db
+    app.dependency_overrides[deps.get_current_user] = override_get_current_user
+    app.dependency_overrides[deps.get_current_active_user] = override_get_current_active_user
+    app.dependency_overrides[deps.get_current_superuser] = override_get_current_superuser
+    app.dependency_overrides[deps.get_cache_control] = override_get_cache_control
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    app.dependency_overrides.clear()
+```
+
+Three things to notice. The overrides are keyed by the **function objects** the endpoints
+reference — both `get_db` spellings are overridden because both exist. The auth overrides
+return a real `User` _row_ (with a real bcrypt hash, so nothing downstream trips on a
+null), so permission checks run for real against a superuser. And `dependency_overrides.clear()`
+in teardown — overrides are global on the app, and a leaked one poisons the next test.
+
+A real test through the public API, with the database as the oracle:
+
+```python
+# 📁 backend/tests/integration/api/test_tracking_api.py
+class TestAssignEligibility:
+    """``/tracking/assign`` honours the global holdout, mutual exclusion groups
+    and experiment targeting rules for *new* users; sticky users bypass all."""
+
+    def test_holdout_users_get_control_and_are_not_recorded(
+        self, admin_client, active_experiment, active_holdout, db_session
+    ):
+        inside, outside = _users_by_holdout_membership(10, 10)
+
+        for user_id in inside:
+            resp = admin_client.post(
+                "/api/v1/tracking/assign",
+                json={"experiment_key": active_experiment.key, "user_id": user_id},
+            )
+            data = _assert_unassigned(resp, active_experiment, "holdout")
+            assert data["experiment_key"] == active_experiment.key
+            assert data["user_id"] == user_id
+            assert _assignment_rows(db_session, active_experiment, user_id) == []
+            assert _event_rows(db_session, active_experiment, user_id) == []
+
+            # Still no row after a second call: the response is not sticky.
+            again = admin_client.post(
+                "/api/v1/tracking/assign",
+                json={"experiment_key": active_experiment.key, "user_id": user_id},
+            )
+            assert again.json()["assigned"] is False
+            assert _assignment_rows(db_session, active_experiment, user_id) == []
+
+        for user_id in outside:
+            resp = admin_client.post(...)
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["assigned"] is True
+            assert data["reason"] == "assigned"
+            assert len(_assignment_rows(db_session, active_experiment, user_id)) == 1
+```
+
+Everything in that test is real except the credential: the request goes through the
+middleware, the API-key dependency (overridden to the test user by `admin_client`), the
+endpoint, `AssignmentService`, `GlobalHoldoutService`, and PostgreSQL — and the assertions
+read the tables back. The helper `_users_by_holdout_membership` generates ids and sorts them
+by the _real_ holdout hash, so the test can't pass by accident.
+
+The fixture that builds the experiment shows the data-shape discipline the harness relies
+on — unique suffixes instead of truncation:
+
+```python
+# 📁 backend/tests/integration/api/test_tracking_api.py
+def active_experiment(db_session, make_experiment):
+    """An ACTIVE experiment with a control and a treatment variant."""
+    suffix = uuid.uuid4().hex[:8]
+    experiment = make_experiment(
+        name=f"Tracking API {suffix}",
+        key=f"tracking-api-{suffix}",
+        status=ExperimentStatus.ACTIVE,
+    )
+    for name, is_control in (("control", True), ("treatment", False)):
+        db_session.add(Variant(experiment_id=experiment.id, name=name, description=f"{name} variant",
+                               is_control=is_control, traffic_allocation=50, configuration={"color": name}))
+```
+
+And the unit-side twin, with mocks used for what they're good at — driving a branch that
+would take real infrastructure to reach:
+
+```python
+# 📁 backend/tests/unit/services/test_assignment_service_eligibility.py
+"""
+Unit tests for the eligibility gate in ``AssignmentService.assign_user``.
+
+New users are checked, in order, against the global holdout, the experiment's
+mutual exclusion group and its targeting rules.  These tests use a MagicMock
+session and stub the holdout / mutual-exclusion services so each branch can be
+driven directly; the DB-backed behaviour lives in
+``backend/tests/integration/api/test_tracking_api.py::TestAssignEligibility``.
+"""
+```
+
+> **Watch Out!** `with TestClient(app) as test_client:` runs the **lifespan**. That's why the
+> lifespan skips the schedulers under `settings.is_test` — before that guard, a test that
+> used the client as a context manager started five background loops against the test
+> database. If you construct the app with non-test settings in a test, you'll start them.
+
+> **Did You Know?** The `-x` flag on the CI unit job (stop at first failure) plus
+> `--tb=short` is a deliberate feedback-speed choice for a 3,700-test suite; the nightly run
+> drops `-x` so you see everything. Locally, `-p no:cov -q` is the fast form; coverage is
+> explicit (`--cov=backend.app --cov-report=term`) and configured in `pyproject.toml`.
+
+### Try It Yourself
+
+Write the pair for `POST /feature-flags/{id}/activate`:
+
+1. **API test** with the `client` fixture: create a flag via `POST /api/v1/feature-flags/`,
+   `POST .../activate`, then `GET /api/v1/feature-flags/evaluate/{key}?user_id=u` via an API
+   key (create one with `POST /api/v1/api-keys` and send `X-API-Key`). Assert `reason ==
+   "rollout"` and that `db_session.query(FeatureFlag).get(id).status == FeatureFlagStatus.ACTIVE`.
+2. **Unit test** of `FeatureFlagService.activate_feature_flag` with a `MagicMock` session:
+   assert the status is set and `commit` was called once; name the API test in the docstring.
+
+Run both: `python -m pytest backend/tests/integration/api/<your file> backend/tests/unit/services/<your file> -p no:cov -q`.
+
+### Common mistakes
+
+- **Mocking the service the endpoint calls.** You've tested that a mock was called.
+- **Forgetting `dependency_overrides.clear()`.** The next test runs as your user.
+- **Asserting only on the response.** The database is the oracle; read the row.
+- **Reusing fixed names/keys across tests.** The session fixture doesn't truncate; use
+  unique suffixes.
+
+### Key takeaways
+
+- `TestClient(app)` + `dependency_overrides` = real routing, middleware, validation,
+  endpoint, service and database, with only the leaves swapped.
+- Overrides are keyed by function object and must be cleared.
+- Mock what you don't own; drive what you do; unit tests name their integration twin.
+- Assert on rows, not just JSON; generate unique data.
+
+---
+
+## Hour 23 — DB-backed tests: the harness, per-process databases, async tests
+
+### What & why
+
+A test that touches PostgreSQL needs four things the harness provides: a database that's
+_yours_ (not the dev one, not another process's), a schema that matches the models, a session
+whose lifetime you control, and cleanup that doesn't deadlock. Each was learned the hard way,
+and each is documented in the conftest itself.
+
+1. **Environment before import.** The schema name is fixed when `backend.app.models` is
+   imported (`get_schema_name()` reads `APP_ENV`/`TESTING`), so the conftest sets them at the
+   top of the module — and pops `ENVIRONMENT`, because a developer's shell may export
+   `ENVIRONMENT=development`, which would win.
+2. **A database per process.** `experimentation_test_<pid>`, dropped and recreated at session
+   start with autocommit DDL. Two `pytest` runs, or `pytest-xdist` workers, never collide.
+3. **No truncation between tests.** `TRUNCATE … CASCADE` takes an `AccessExclusiveLock` on
+   every table in the cascade set and deadlocked against async fixtures overlapping; instead
+   every test uses UUIDs and unique suffixes, and the database is dropped next session.
+4. **`expire_on_commit=False`.** The test session is bound to a `NullPool` engine; after a
+   commit, an expired attribute would re-open a connection that may be gone.
+
+### In the wild
+
+The header that sets the process up:
+
+```python
+# 📁 backend/tests/conftest.py
+# * APP_ENV=test / TESTING=true select TestSettings (ENVIRONMENT == "test")
+#   and the test_experimentation schema.  ENVIRONMENT itself is deliberately
+#   NOT exported: tests that construct ProdSettings()/DevSettings() directly
+#   must keep their class default, and the settings singleton already resolves
+#   APP_ENV=test to the canonical "test".
+# * Auth runs exactly as the Community Edition ships: AUTH_PROVIDER=local and
+#   the dev-admin bypass OFF (fail-closed).  ...
+os.environ.setdefault("APP_ENV", "test")
+os.environ.setdefault("TESTING", "true")
+# A developer shell may export ENVIRONMENT=development (see .env.example);
+# ENVIRONMENT wins over APP_ENV, so drop it for the test process.
+os.environ.pop("ENVIRONMENT", None)
+
+from fastapi.testclient import TestClient
+...
+from backend.app.main import app
+...
+# Pin the auth mode on the singleton (see the header comment) regardless of
+# what a developer's shell exports.
+settings.AUTH_PROVIDER = "local"
+settings.DEV_AUTH_BYPASS = False
+
+# Each pytest process gets its own database named
+# "experimentation_test_<pid>".
+_PID = os.getpid()
+_TEST_DB_NAME = f"experimentation_test_{_PID}"
+# Honour the same POSTGRES_* variables that the app, CI workflows and
+# scripts/run-backend-tests.sh use, so the compose test profile (port 5433)
+# and GitHub Actions service containers both work without editing this file.
+_DB_USER = os.environ.get("POSTGRES_USER", "postgres")
+_DB_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
+_DB_HOST = os.environ.get("POSTGRES_SERVER") or os.environ.get("POSTGRES_HOST") or "localhost"
+_DB_PORT = os.environ.get("POSTGRES_PORT", "5432")
+```
+
+The session fixture, with its reasoning in the docstring:
+
+```python
+# 📁 backend/tests/conftest.py
+@pytest.fixture(scope="function")
+def db_session(test_db):
+    """Create a fresh database session for a test.
+
+    The session is bound directly to the NullPool engine so that after each
+    commit() the session acquires a fresh DBAPI connection on its next DML.
+
+    expire_on_commit=False prevents SQLAlchemy from expiring all loaded
+    objects after a commit().  Without this, attributes like
+    user.is_superuser trigger a reload SELECT on the next access, which
+    opens a new NullPool connection that may fail if the prior commit
+    already closed the underlying DBAPI connection.
+
+    We do NOT truncate tables in teardown.  TRUNCATE TABLE ... CASCADE holds
+    AccessExclusiveLock on every table in the cascade set.  When pytest
+    runs the teardown of one function-scoped fixture while setting up the
+    next (which can happen when asyncio test fixtures overlap in the event
+    loop), the TRUNCATE and the new test's INSERT deadlock against each
+    other.  Since all test data uses UUID primary keys and unique per-test
+    suffixes, there is no data contamination between tests.  The entire
+    database is dropped and recreated at the start of every pytest session
+    (in test_db), so accumulated rows are discarded after each full run.
+    """
+    Session = sessionmaker(bind=test_db, autocommit=False, autoflush=False, expire_on_commit=False)
+    session = Session()
+
+    # Set schema search path for the initial connection.
+    # The engine-level "connect" event (registered in test_db) re-applies
+    # search_path on every new NullPool connection checkout automatically.
+    session.execute(text("SET search_path TO test_experimentation"))
+
+    try:
+        yield session
+    finally:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        try:
+            session.close()
+        except Exception:
+            pass
+```
+
+The `test_db` fixture (session-scoped) disposes the production engine's pool before dropping
+the database — otherwise `pg_terminate_backend` kills pooled connections and the pool later
+tries to roll them back, producing "server closed the connection unexpectedly" tracebacks
+that cascade through subsequent tests. Read its docstring once; you'll recognise the
+symptom forever.
+
+Async tests, for the async dependencies:
+
+```python
+# 📁 backend/tests/unit/api/test_feature_flag_permissions.py (shape)
+@pytest.mark.asyncio
+async def test_viewer_cannot_update_flag(viewer_user, feature_flag):
+    with pytest.raises(HTTPException) as exc:
+        await deps.can_update_feature_flag(feature_flag=feature_flag, current_user=viewer_user)
+    assert exc.value.status_code == 403
+```
+
+`pytest-asyncio` (0.23) runs `async def` tests marked `@pytest.mark.asyncio` on an event
+loop; sync dependencies are called directly in plain `def` tests. Mixing them — `await` on a
+sync function, or a sync call of an async one — is the error the async/sync rule in
+`CLAUDE.md` exists to prevent.
+
+`monkeypatch` for the seams you _don't_ own — here the Cognito service — and for settings
+on the singleton:
+
+```python
+    monkeypatch.setattr("backend.app.services.auth_service.CognitoAuthService.get_user_with_groups", mock_get_user_with_groups)
+    monkeypatch.setattr(settings, "SAFETY_CHECK_INTERVAL_MINUTES", 1)
+```
+
+`monkeypatch` reverts automatically at test end; `unittest.mock.patch` needs a context
+manager or decorator. Both are fine; `patch.object(SomeClass, "__new__")` is not — it
+permanently breaks the class's constructor slot in CPython, and it caused one of the
+cross-suite pollution bugs the audit found.
+
+> **Watch Out!** `backend/tests/integration/auth/` is a special package: its own conftest
+> selects `AUTH_PROVIDER=cognito` and `moto`'s `mock_cognitoidp`, and its CI job has **no
+> Postgres service**. Any auth test that needs a database goes in `integration/api/`. moto is
+> 4.2.2 — `mock_cognitoidp`, `mock_dynamodb`, not the 4.3+ `mock_aws`.
+
+> **By the Way.** The Lambda functions have their own test suites, each defining
+> `tests.conftest`, so they must run one directory at a time — CI loops over
+> `backend/lambda/{assignment,event_processor,feature_flag_evaluation,shared}` with a
+> separate `pytest` per directory. Running `pytest backend/lambda` in one go collides.
+
+### Try It Yourself
+
+Prove the isolation:
+
+```bash
+source venv/bin/activate && export APP_ENV=test TESTING=true
+# two concurrent sessions, two databases
+(python -m pytest backend/tests/unit/services/test_cuped_service.py -p no:cov -q &) ; python -m pytest backend/tests/unit/services/test_bayesian_service.py -p no:cov -q
+docker compose exec postgres psql -U postgres -c "select datname from pg_database where datname like 'experimentation_test_%'"   # gone after the sessions end
+```
+
+Then write a fixture in the house style — `make_flag(**overrides)` that inserts a
+`FeatureFlag` with a unique key and returns it — and use it in the API test from Hour 22.
+
+### Common mistakes
+
+- **Setting `APP_ENV` after importing the app** in an ad-hoc script — wrong schema.
+- **Fixed keys/names across tests** — collisions on unique indexes because nothing
+  truncates.
+- **Reading attributes after commit** on a hand-made session without
+  `expire_on_commit=False`.
+- **`pytest backend/lambda`** as one run; **DB-backed tests under `integration/auth/`**.
+
+### Key takeaways
+
+- Env before import; `ENVIRONMENT` popped; `AUTH_PROVIDER=local`, bypass off (fail-closed).
+- One database per process; no truncation; unique data; drop at next session.
+- `db_session`: `NullPool` engine, `expire_on_commit=False`, `search_path` set, rollback +
+  close in teardown.
+- `@pytest.mark.asyncio` + `await` for async deps; `monkeypatch` for external seams and
+  settings; never `patch.object(..., "__new__")`.
+
+---
+
+## Hour 24 — Observability and the production checklist: the Experimently FastAPI style guide
+
+### What & why
+
+An API you can't observe is an API you can't operate. Three built-in signals, each with a
+specific consumer, and then the checklist that turns twenty-three hours of conventions into
+something you can review a pull request against.
+
+- **Structured logs** (`structlog`): JSON outside development (for CloudWatch Logs
+  Insights), console in development; every line carries the request id, path and method
+  bound by the outermost middleware.
+- **Prometheus `/metrics`**: HTTP latency histogram and counters, business counters
+  (assignments, events, flag evaluations), rate-limit hits/rejections, scheduler ticks and
+  last-success timestamps.
+- **Health probes**: `/health/live` (process up; touches nothing), `/health/ready`
+  (PostgreSQL answers; Redis reported, fatal only if `REDIS_REQUIRED`), `/health` (alias).
+
+### In the wild
+
+Logging is configured before anything else in `main.py`, and the request-id middleware
+binds a `ContextVar` that a structlog processor injects into every event:
+
+```python
+# 📁 backend/app/main.py
+# LOG_FORMAT=json  -> every line (structlog, stdlib, uvicorn) is one JSON object
+# LOG_FORMAT=console -> coloured console output
+# unset            -> console in development/test, JSON everywhere else
+_log_format: str = "console"
+if _monitoring_imports_ok:
+    _log_format = str(getattr(settings, "LOG_FORMAT", "") or "").lower() or log_format_from_env(
+        default="console" if is_development_or_test() else "json"
+    )
+_json_logs: bool = _log_format == "json"
+if _monitoring_imports_ok:
+    configure_logging(
+        log_level=str(settings.LOG_LEVEL or "INFO").upper(),
+        json_logs=_json_logs,
+        service_name="experimentation-platform",
+    )
+```
+
+```python
+# 📁 backend/app/core/logger.py
+_log_context: contextvars.ContextVar[dict] = contextvars.ContextVar("log_context", default={})
+
+
+def bind_log_context(**kwargs: Any) -> None:
+    """Merge *kwargs* into the current async-task log context."""
+    current = _log_context.get().copy()
+    current.update(kwargs)
+    _log_context.set(current)
+
+
+def _inject_context(logger: Any, method: str, event_dict: dict) -> dict:
+    """structlog processor: inject per-request context into every log event."""
+    event_dict.update(_log_context.get())
+    return event_dict
+```
+
+Metrics are a registry of typed series with label-safe recorders; the middleware normalises
+paths so UUIDs don't explode the label space:
+
+```python
+# 📁 backend/app/core/metrics.py
+http_request_duration_seconds: Histogram = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "endpoint", "status_code"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+feature_flag_evaluations_total: Counter = Counter(
+    "feature_flag_evaluations_total",
+    "Total feature flag evaluations",
+    ["flag_key", "result"],
+)
+```
+
+The probes, with the asymmetry that matters for orchestrators spelled out:
+
+```python
+# 📁 backend/app/core/health.py
+"""
+``GET /health/live``
+    Liveness: the process is up and the event loop answers. Never touches the
+    database or Redis, so a dependency outage does not make orchestrators
+    restart healthy processes. Used by the container ``HEALTHCHECK``.
+
+``GET /health/ready``
+    Readiness: PostgreSQL must answer ``SELECT 1``. Redis is checked and
+    reported but only fails readiness when ``REDIS_REQUIRED=true`` (the
+    application degrades gracefully without Redis: rate limiting falls back to
+    memory, caching is skipped). Disk space below 1 GB is reported as ``low``.
+    Returns 200 when ready, 503 otherwise.
+
+``GET /metrics``
+    Prometheus text exposition. When ``METRICS_TOKEN`` is set the request must
+    carry it (``Authorization: Bearer <token>`` or ``?token=<token>``);
+    when it is not set the endpoint is open in development/test only and
+    returns 403 elsewhere. ``METRICS_ENABLED=false`` disables it (404).
+"""
+
+
+def _safe_error(exc: BaseException) -> str:
+    """First line of the error without credentials (never echo a password)."""
+    text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+    if "password" in text.lower():
+        return f"{exc.__class__.__name__}: authentication failed"
+    return text[:200]
+```
+
+`_safe_error` is the kind of detail a style guide should call out: a probe that echoes a
+DSN with a password into an ALB log is a credential leak, and the platform scrubs it.
+
+### The Experimently FastAPI style guide
+
+Everything this book taught, as review checklist items. If a pull request violates one,
+it's a comment; if it violates several, it's a conversation.
+
+**Structure**
+
+- One `APIRouter` per resource module; mounted in `api/api.py` with a prefix and a tag and a
+  comment naming the epic.
+- Endpoint → service → model. Endpoints parse, authenticate, delegate, serialise. Logic lives
+  in services. Models are tables.
+- Fully qualified imports: `from backend.app.<...> import <...>`. Never `app.`, never
+  relative. New models are imported in `backend/app/models/__init__.py`.
+
+**Requests and responses**
+
+- Inputs are declared (`Path`, `Query`, `Body`, `Depends`) with constraints and descriptions;
+  nothing is parsed by hand except URL-encoded JSON in a query string, which raises the same
+  422.
+- Schemas are Pydantic v2 (`field_validator`, `model_validator`, `ConfigDict`), layered
+  `Base → Create → Update → Response`; response models have `from_attributes=True`; updates
+  use `exclude_unset=True`.
+- Invariants are on the schema (for the message) _and_ in the database (for the guarantee).
+- Refuse with `HTTPException(status, detail, headers)`; `except HTTPException: raise` before
+  any generic `except`; 200 + `reason` for normal negatives, 404 for unknown, 422 for
+  malformed, 423 + `Retry-After` for lockout.
+
+**Dependencies and auth**
+
+- `db: Session = Depends(deps.get_db)` in every endpoint; services receive the session;
+  schedulers and scripts own theirs with `try/finally`.
+- Dashboard endpoints depend on `get_current_active_user` (or `get_current_superuser`); SDK
+  endpoints on `get_api_key`. Never both.
+- Feature-flag and report checks are `async` `Depends`; experiment checks are sync calls.
+  READ before UPDATE/DELETE. Superuser and `ADMIN` are different bits.
+- Security schemes use `auto_error=False`; the dependency decides what "missing" means.
+- Never call `core.security.decode_token` for validation.
+
+**Data**
+
+- `class X(Base, BaseModel)`; schema in every FK string and `__table_args__`; schema-prefixed
+  index names; `back_populates` on both sides; `ondelete` matching the cascade unless
+  commented.
+- `add → flush → commit → refresh` in services; no commits in endpoints; `synchronize_session=False`
+  for bulk deletes; `joinedload` small collections, count large ones.
+- `text()` only when the builder can't; bound values; the schema is the only interpolated
+  identifier; `nosemgrep` + `nosec` with a justification.
+- Migrations: autogenerate, read, minimal, `down_revision` id, nullable/additive, schema
+  helper. Fresh databases use the bootstrap.
+- Conversions match through `services/event_matching.py`. Targeting rules pass through
+  `core/targeting_adapter.py`. No fourth format.
+
+**Beyond requests**
+
+- Long-lived tasks start in the lifespan, skip under test, run ticks via `run_locked_tick`,
+  offload heavy sync work with `asyncio.to_thread`, let `CancelledError` propagate.
+- WebSockets authenticate at the handshake (subprotocol/header/`?token=`), accept-then-close
+  with `4401`, release the auth session, use a session factory per snapshot.
+- Redis is optional everywhere: fallback limiter, disabled cache, readiness unaffected unless
+  `REDIS_REQUIRED`. Cache keys include every input; every `set` has a TTL.
+
+**Configuration**
+
+- One `settings` singleton; canonical `ENVIRONMENT`; validators fail closed in production;
+  `NoDecode` for comma-separated lists; new settings declared after `ENVIRONMENT` if a
+  validator reads it.
+
+**Tests**
+
+- Mock what you don't own; drive what you do. Hot paths have an API test through
+  `TestClient` against a real database; unit tests name their integration twin.
+- Env before import; unique data; `hashed_password` on test users; unit tests delete what
+  they commit; DB-backed auth tests outside `integration/auth/`; Lambda suites one directory
+  at a time; `@pytest.mark.asyncio` for async deps.
+
+**Operations**
+
+- Every log line has a request id; every response echoes `X-Request-ID`.
+- New metrics go in `core/metrics.py` with bounded label cardinality.
+- `/health/live` never touches dependencies; `/health/ready` decides load-balancer
+  membership; errors are scrubbed.
+- A change is done when the PR gate, the release gate and the security scan are green and
+  the review's findings are addressed.
+
+### Try It Yourself
+
+Review a real pull request against the guide. Pick the most recent merged PR
+(`gh pr list --state merged --limit 1`), read its diff, and write down every item above it
+touches — and whether it complied. Then run the three signals against your local API for one
+request:
+
+```bash
+curl -si -H "X-Request-ID: style-guide-001" -H "Authorization: Bearer $TOKEN" $API/experiments/ | grep -i x-request-id
+docker compose logs api | grep style-guide-001 | head -2
+curl -s localhost:8000/metrics | grep -E "^http_request_duration_seconds_count.*experiments" | head -2
+curl -s -o /dev/null -w "live=%{http_code} " localhost:8000/health/live; curl -s -o /dev/null -w "ready=%{http_code}\n" localhost:8000/health/ready
+```
+
+### Key takeaways
+
+- Logs: structlog, JSON outside dev, request id via `ContextVar`; metrics: one registry,
+  normalised labels; probes: live vs ready, scrubbed errors.
+- The style guide is the book: structure, requests/responses, dependencies/auth, data,
+  beyond-requests, configuration, tests, operations.
+- Review against it; ship when the gates are green.
+
+---
+
+## Part VI Workshop
+
+**Q1. Why is a test that mocks `EventService.track_event` insufficient for
+`POST /tracking/track`?**
+It proves the endpoint called _something_, not that the endpoint's `EventCreate` matches
+what the real service accepts. The shape mismatch that broke the tracking API lived exactly
+in that gap. Drive the endpoint through `TestClient` and read the `events` row.
+
+**Q2. What does `with TestClient(app) as c:` do that `TestClient(app)` alone doesn't?**
+Runs the lifespan (startup before, shutdown after). Under the test profile the lifespan
+starts no schedulers; with non-test settings it would.
+
+**Q3. Why does the harness pop `ENVIRONMENT` from the environment?**
+`ENVIRONMENT` wins over `APP_ENV`; a developer's shell exporting `ENVIRONMENT=development`
+would otherwise select `DevSettings` and the `experimentation` schema for the test process.
+
+**Q4. Why no `TRUNCATE` between tests, and what discipline replaces it?**
+`TRUNCATE … CASCADE` takes exclusive locks on every table in the cascade set and deadlocked
+against overlapping async fixtures. Instead: UUID keys, unique per-test suffixes, unit tests
+delete what they commit, and the database is dropped at the next session start.
+
+**Q5. `/health/live` is 200, `/health/ready` is 503. What's wrong and what should the
+orchestrator do?**
+PostgreSQL isn't answering (or Redis with `REDIS_REQUIRED`). Remove the task from the load
+balancer; don't restart it — liveness is fine and a restart wouldn't fix the database.
+
+**Q6. A PR adds `db.commit()` inside an endpoint after calling a service. Style-guide
+comment?**
+Commits belong in services, next to the logic that defines the transaction boundary; the
+endpoint may invalidate caches after the service returns, not commit.
+
+**Quiz.** Name the three signals and the consumer of each.
+→ Structured JSON logs → CloudWatch Logs Insights (and `grep` locally, by request id);
+Prometheus `/metrics` → the scrape/alerting stack (`scheduler_last_success_timestamp`,
+`rate_limit_rejections_total`); health probes → the container `HEALTHCHECK` (live) and the
+load balancer / compose `--wait` (ready).
+
+---
+
+## Exercises
+
+**E6.1 — The twin pair.** For `POST /feature-flags/{id}/deactivate`, write the API test
+(create → activate → deactivate → evaluate returns `reason: inactive` with 200) and the unit
+test (service sets `INACTIVE`, commits once), with the docstring cross-reference.
+
+**E6.2 — A harness bug.** A new test creates a `User(username="tester", email=
+"tester@example.com")` and passes alone but fails in the full run with a unique-constraint
+error. Explain, and fix it in the house style.
+
+**E6.3 — Async or sync?** Write the test for `deps.get_experiment_access` refusing a viewer
+who doesn't own the experiment, and the test for `deps.can_delete_feature_flag` refusing an
+analyst. Mark them correctly.
+
+**E6.4 — A metric.** Add a counter for safety rollbacks (labelled by flag key and trigger
+type) to `core/metrics.py` with a recorder, and say where in the safety scheduler you'd call
+it. What label would you refuse to add, and why?
+
+**E6.5 — Review.** Here is a diff summary; list every style-guide item it violates:
+_"Adds `GET /api/v1/reports/{id}/pdf`: imports `SessionLocal` and opens a session in the
+handler; accepts either a bearer token or an API key; builds the PDF with data from
+`db.execute(text(f"SELECT ... WHERE id = '{id}'"))`; returns the bytes in a dict
+`{"pdf": base64}` with `response_model=Dict[str, Any]`; wraps the body in `try/except
+Exception: return {"error": str(e)}`."_
+
+---
+
+## Solutions
+
+**S6.1**
+
+```python
+# backend/tests/integration/api/test_feature_flags_lifecycle.py
+def test_deactivated_flag_evaluates_inactive(client, api_key_header, db_session):
+    """API twin of tests/unit/services/test_feature_flag_service.py::test_deactivate_sets_inactive."""
+    key = f"lifecycle-{uuid.uuid4().hex[:8]}"
+    created = client.post("/api/v1/feature-flags/", json={"key": key, "name": key, "rollout_percentage": 100}).json()
+    assert client.post(f"/api/v1/feature-flags/{created['id']}/activate").status_code == 200
+    assert client.post(f"/api/v1/feature-flags/{created['id']}/deactivate").status_code == 200
+    resp = client.get(f"/api/v1/feature-flags/evaluate/{key}", params={"user_id": "u"}, headers=api_key_header)
+    assert resp.status_code == 200 and resp.json() == {"key": key, "enabled": False, "config": None, "reason": "inactive"}
+    assert db_session.get(FeatureFlag, uuid.UUID(created["id"])).status == FeatureFlagStatus.INACTIVE
+
+
+# backend/tests/unit/services/test_feature_flag_service.py
+def test_deactivate_sets_inactive():
+    """Unit twin of integration/api/test_feature_flags_lifecycle.py::test_deactivated_flag_evaluates_inactive."""
+    db = MagicMock()
+    flag = MagicMock(status=FeatureFlagStatus.ACTIVE)
+    FeatureFlagService(db).deactivate_feature_flag(flag)
+    assert flag.status == FeatureFlagStatus.INACTIVE
+    db.commit.assert_called_once()
+```
+
+**S6.2** — The session fixture doesn't truncate, so a previous test in the same process (or
+an earlier fixture) already inserted `tester@example.com`; the unique index on `users.email`
+rejects the second. Fix: unique suffixes —
+`suffix = uuid.uuid4().hex[:8]; User(username=f"tester-{suffix}", email=f"tester-{suffix}@example.com", hashed_password="x", ...)`
+— and, if the test commits, delete the row in teardown.
+
+**S6.3**
+
+```python
+def test_experiment_access_refuses_non_owner_viewer():                       # sync
+    viewer = MagicMock(is_superuser=False, role=UserRole.VIEWER, id=uuid.uuid4())
+    experiment = MagicMock(owner_id=uuid.uuid4())
+    with pytest.raises(HTTPException) as exc:
+        deps.get_experiment_access(experiment, viewer)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_can_delete_flag_refuses_analyst():                           # async
+    analyst = MagicMock(is_superuser=False, role=UserRole.ANALYST, id=uuid.uuid4())
+    flag = MagicMock(owner_id=analyst.id)
+    with pytest.raises(HTTPException) as exc:
+        await deps.can_delete_feature_flag(feature_flag=flag, current_user=analyst)
+    assert exc.value.status_code == 403
+```
+
+(The analyst owns the flag, so `get_feature_flag_access` would pass — but `DELETE` by role
+is refused. Called by hand, the chained dependency isn't run; that's fine for the unit.)
+
+**S6.4**
+
+```python
+# core/metrics.py
+safety_rollbacks_total: Counter = Counter(
+    "safety_rollbacks_total", "Automatic and manual safety rollbacks", ["flag_key", "trigger_type"],
+)
+
+def record_safety_rollback(flag_key: str, trigger_type: str) -> None:
+    safety_rollbacks_total.labels(flag_key=flag_key, trigger_type=trigger_type).inc()
+```
+
+Call it in `SafetyScheduler.check_feature_flags_safety` right after `rollback_result.success`
+(and in the manual rollback endpoint with `trigger_type="manual"`). Refuse a `user_id` or
+`reason` label: unbounded cardinality would create a new series per user or per message and
+exhaust the registry — labels must be bounded sets (flag keys, trigger types).
+
+**S6.5** — (1) `SessionLocal()` in a handler — must be `Depends(deps.get_db)`. (2) Accepting
+bearer _or_ API key — one door per endpoint; reports are a dashboard resource →
+`get_current_active_user` (and the `REPORT` permission dependency, async). (3) An
+f-string interpolating `id` into `text()` — SQL injection; bind it (`:id`), and use the
+builder anyway. (4) `response_model=Dict[str, Any]` for a known shape, and base64 in JSON for
+bytes — return a `StreamingResponse`/`Response(media_type="application/pdf")`. (5) `except
+Exception: return {"error": ...}` — swallows `HTTPException`s into 200s with an error body;
+use `except HTTPException: raise` and `HTTPException(500)` for the rest. (6) No test named;
+a hot-ish path needs an API test. Six comments, one conversation.
+
+---
+
+_You've done the twenty-four hours. Take the [Build book](../build-a-platform-in-28-days/README.md)
+next — it uses everything here to explain how the whole platform fits together. ⏱️_
