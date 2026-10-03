@@ -8,8 +8,10 @@ Next.js is the framework around React that gives the dashboard routing, a build,
 and a production artefact. Four hours: files are routes (Hour 10); `_app.tsx`, the shell, and
 how a route's _kind_ decides what wraps it (Hour 11); the client-side auth gate, `useRouter`,
 and dynamic routes (Hour 12); and the environment/base-URL contract plus the static export
-that ships behind nginx (Hour 13). The dashboard uses the **pages router** (`src/pages/`), not
-the app router — deliberately, and this Part explains why.
+that ships behind nginx (Hour 13). The dashboard runs **Next.js 16 with React 19** and uses the
+**pages router** (`src/pages/`), not the app router — deliberately, and this Part explains why.
+Since Next 16, `next build` bundles with **Turbopack** by default;
+`next build --webpack` still selects webpack, and the config keeps both working (below).
 
 ---
 
@@ -18,25 +20,26 @@ the app router — deliberately, and this Part explains why.
 ### What & why
 
 In the pages router, **the filesystem is the routing table**: `src/pages/experiments/index.tsx`
-is `/experiments`, `src/pages/experiments/[id].tsx` is `/experiments/:id`,
-`src/pages/docs/[...slug].tsx` is `/docs/*`. A page is a file with a **default export**
-component; everything else exported from it is just a module export (the tests import
-`ACTIONS_BY_STATUS` and `validateForm` from page files that way).
+is `/experiments`, `src/pages/experiments/[id].tsx` is `/experiments/:id`. A page is a file with
+a **default export** component; everything else exported from it is just a module export (the
+tests import `ACTIONS_BY_STATUS` and `validateForm` from page files that way).
 
-Two special files: `_app.tsx` wraps every page (Hour 11), and `_document.tsx` (absent here)
-would customise the HTML shell. Navigation between pages is client-side via `next/link`
-(`<Link href="/experiments">`), which prefetches and swaps without a full reload;
-`next/router`'s `useRouter()` gives the current path, query and programmatic `push`/`replace`.
+Two special files: `_app.tsx` wraps every page (Hour 11), and `_document.tsx` customises the
+HTML shell that every page is rendered into. The dashboard's `_document.tsx` exists for one
+attribute — `<Html lang="en">`, so a screen reader reads the page in the right language
+(WCAG 2.1 success criterion 3.1.1); titles and meta tags stay in `_app.tsx` and `PageTitle`.
+Navigation between pages is client-side via `next/link` (`<Link href="/experiments">`), which
+prefetches and swaps without a full reload; `next/router`'s `useRouter()` gives the current
+path, query and programmatic `push`/`replace`.
 
 #### Why the pages router, and why a static export
 
 The dashboard is a **client-rendered application**: every page fetches from the API in the
 browser with the user's bearer token. There's no server-side data fetching, no server
 components, no per-request rendering — so the app router's main features aren't used, and
-`output: 'export'` turns the whole thing into static HTML + JS that nginx can serve. The
-one exception, `/docs/[...slug]`, uses `getStaticProps` to render markdown _at build time_
-from the repository's `docs/` folder. Pages router + static export is the simplest thing
-that fits, and simple is what a dashboard for an API should be.
+`output: 'export'` turns the whole thing into static HTML + JS that nginx can serve. No page
+uses `getStaticProps` or `getServerSideProps`. Pages router + static export is the simplest
+thing that fits, and simple is what a dashboard for an API should be.
 
 ### In the wild
 
@@ -45,12 +48,15 @@ The route table, as files:
 ```
 frontend/src/pages/
 ├── _app.tsx                 # wraps every page (providers, shell, auth gate)
+├── _document.tsx            # the HTML shell: <Html lang="en">
 ├── index.tsx                # /
 ├── login.tsx                # /login
 ├── power-calculator.tsx     # /power-calculator (public)
+├── docs/
+│   └── index.tsx            # /docs — a hub of links to the documentation
 ├── experiments/
 │   ├── index.tsx            # /experiments
-│   ├── new.tsx              # /experiments/new
+│   ├── new.tsx              # /experiments/new (guided setup; ?advanced = one page)
 │   └── [id].tsx             # /experiments/:id
 ├── feature-flags/
 │   ├── index.tsx · new.tsx · [id].tsx
@@ -58,11 +64,14 @@ frontend/src/pages/
 │   ├── index.tsx · [id].tsx
 ├── admin/
 │   ├── index.tsx · users.tsx · api-keys.tsx · roles.tsx · safety.tsx · scheduler.tsx · audit.tsx · notifications.tsx
-├── workspaces/
-│   ├── index.tsx · new.tsx · [id]/ · invites/
-└── docs/
-    ├── index.tsx
-    └── [...slug].tsx        # /docs/* — markdown rendered at build time
+│
+│   # module routes: one-line re-exports of @modules/pages/... (see below)
+├── sso/
+│   └── complete.tsx         # /sso/complete — the SSO hand-off
+├── warehouse/
+│   ├── index.tsx · connections/new.tsx · connections/[id].tsx · sources/new.tsx · sources/[id].tsx
+└── workspaces/
+    ├── index.tsx · new.tsx · [id]/ · invites/
 ```
 
 A page: a default export that reads the dynamic segment and hands it to a feature component:
@@ -103,33 +112,80 @@ Thin: the page is routing + a title + one component. (`query.id as string | unde
 the stricter way.) On the first render of a static export, `query` is `{}` until the router
 hydrates — hence the `if (!id)` loading branch, which every dynamic page has.
 
-The build-time page — the one non-client-rendered route:
+#### Module routes: the `@modules/*` seam
+
+Some pages belong to optional **modules** — workspaces, the data warehouse, SSO sign-in,
+custom roles. Experimently ships as one codebase with two build profiles: **core** (the
+dashboard under `frontend/` alone) and **full** (adds the modules' dashboard code under
+`modules/frontend/src/`, beside `frontend/`, not inside it). A core checkout has no `modules/`
+directory at all, yet the route files above must still compile. So a module route is a
+one-line re-export:
 
 ```tsx
-// 📁 frontend/src/pages/docs/[...slug].tsx
-import fs from 'fs';
-import path from 'path';
-import { GetStaticPaths, GetStaticProps } from 'next';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-
-const SLUG_TO_FILE: Record<string, string> = {
-  // Getting Started
-  'quick-start':                   'getting-started/quick-start.md',
-  'concepts':                      'getting-started/concepts.md',
-  ...
-  // SDKs
-  'sdks/javascript':               'sdk/javascript.md',
-  'sdks/python':                   'sdk-guide.md',
-  ...
-};
+// 📁 frontend/src/pages/warehouse/index.tsx
+/**
+ * Module route — warehouse connections and sources (#312, beta).
+ *
+ * Thin re-export so this file compiles in both profiles: `@modules/*` resolves
+ * to `modules/frontend/src/` when the modules tree is present and to
+ * `src/modules-stub/` (a "module not installed" notice) when it is not. See
+ * `next.config.js`.
+ */
+export { default } from '@modules/pages/warehouse/index';
 ```
 
-`getStaticPaths` enumerates the slugs; `getStaticProps` reads `../docs/<file>` with `fs` —
-which only works at build time in Node, never in the browser — and passes the markdown as a
-prop. That's why the dashboard's Docker build context is the repository root: the image
-needs `docs/` next to `frontend/`, and a missing file fails the build rather than shipping
-"Documentation coming soon."
+`frontend/modules-alias.js` owns the rule and every toolchain applies it — `tsconfig.json`
+`paths` (Hour 1), the Next config below, Jest's `moduleNameMapper` (Hour 21) and the
+Dockerfile (Hour 23):
+
+```js
+// 📁 frontend/modules-alias.js
+/** True when the modules tree should be used (the full profile). */
+function modulesTreeAvailable(env = process.env) {
+  if (String(env.EXPERIMENTLY_PROFILE || '').toLowerCase() === 'core') return false;
+  return fs.existsSync(MODULES_DIR);
+}
+
+/** Directories `@modules/*` resolves against, in order. */
+function modulesAliasTargets(env = process.env) {
+  return modulesTreeAvailable(env) ? [MODULES_DIR, MODULES_STUB_DIR] : [MODULES_STUB_DIR];
+}
+```
+
+Full means "`EXPERIMENTLY_PROFILE` is not `core` **and** `modules/frontend/src` exists". With
+the tree present, that import is the real page under `modules/frontend/src/pages/`; without it, it is
+`frontend/src/modules-stub/pages/warehouse/index.tsx`, a notice that the module is not
+installed. The stub tree mirrors every path the core code imports from `@modules/*`, which
+is what lets `tsc -p tsconfig.core.json` and a core build prove the core dashboard stands
+alone. When you add a page, decide first: core page (a normal file under `src/pages/`) or
+module page (the real page under `modules/frontend/src/pages/`, a stub under
+`src/modules-stub/pages/`, and a re-export here).
+
+#### `/docs`: links out, not rendered in
+
+`/docs` used to render the repository's markdown inside the dashboard. It no longer does: the
+markdown renderer and its catch-all route are gone, and `src/pages/docs/index.tsx` is a static
+hub of links. Every link is built by one function:
+
+```tsx
+// 📁 frontend/src/pages/docs/index.tsx
+import { docsUrl } from '@/services/docs';
+...
+      { label: 'Quick Start', href: docsUrl('getting-started/quick-start'), desc: 'Run the stack and create your first experiment' },
+```
+
+```typescript
+// 📁 frontend/src/services/docs.ts
+/** A self-hosted built site, if one is configured. Empty means "use the repository". */
+export const DOCS_SITE = (process.env.NEXT_PUBLIC_DOCS_URL || '').replace(/\/+$/, '');
+```
+
+`docsUrl('getting-started/quick-start')` names a file under the app repository's `docs/`
+(without `.md`). By default it becomes a GitHub URL for that markdown file, which cannot be
+missing for whatever version you run. Set `NEXT_PUBLIC_DOCS_URL` at build time to the origin
+of a built MkDocs site and the links take that site's directory-style URLs instead (the
+marketing build sets it to the published docs site). A Jest guard, `docs-links.test.ts`,
+fails if any `docsUrl('...')` literal names a page that does not exist under `docs/` (Hour 23).
 
 Client-side navigation and programmatic routing:
 
@@ -143,22 +199,55 @@ import Link from 'next/link';
 ```
 
 ```tsx
-// 📁 frontend/src/pages/experiments/new.tsx (shape)
+// 📁 frontend/src/pages/experiments/new.tsx
   const router = useRouter();
   ...
-      const created = await ExperimentsService.create(payload);
-      void router.push(`/experiments/${created.id}`);
+      const created = await ExperimentsService.create(payload, { redirectOn401: false });
+      createdId = created.id;
+  ...
+    const target = `/experiments/${createdId}`;
+    let moved = false;
+    try {
+      moved = (await router.push(target)) !== false;
+    } catch {
+      moved = false;
+    }
+    if (!moved) navigateHard(target);
 ```
 
-`next.config.js` is four lines that decide the artefact:
+`router.push` resolves to `false` when the navigation does not happen; the page then falls
+back to a full page load (`navigateHard`) rather than leaving the user on a form whose
+experiment already exists (Hour 15).
+
+`next.config.js` decides the artefact. Three lines are the original contract; the rest wire
+the modules seam into both bundlers:
 
 ```js
 // 📁 frontend/next.config.js
+const full = modulesTreeAvailable();
+
 module.exports = {
   reactStrictMode: true,
   output: 'export',
   images: {
     unoptimized: true,
+  },
+  typescript: {
+    tsconfigPath: full ? 'tsconfig.json' : 'tsconfig.core.json',
+  },
+  experimental: {
+    externalDir: true,
+  },
+  turbopack: {
+    root: REPO_ROOT,
+    resolveAlias: modulesAliasTurbopack(),
+  },
+  // `next build --webpack`. Kept in step with the Turbopack alias above by
+  // src/tests/modules-alias.test.ts, which asserts both spell the same rule.
+  webpack: (config) => {
+    ...
+      '@modules': modulesAliasTargets(),
+    ...
   },
   // Security headers are applied at the serving layer (nginx/edge/CDN) for
   // static export deployments.
@@ -167,7 +256,17 @@ module.exports = {
 
 `reactStrictMode` (double-invoked effects in dev — Hour 7's cleanup test), `output:
 'export'` (static HTML into `out/`), `images.unoptimized` (no image server in a static
-export), and a comment that says where security headers live instead.
+export), and a comment that says where security headers live instead. Then the seam:
+
+- `typescript.tsconfigPath` points a core build at `tsconfig.core.json`, because Next also
+  derives aliases from `tsconfig.json`'s `paths` and would otherwise quietly resolve
+  `@modules/*` back to the real module.
+- `turbopack.root` is the repository root, because Turbopack resolves nothing above its root
+  and the modules tree is a sibling of `frontend/`; `turbopack.resolveAlias` is the alias in
+  Turbopack's spelling (`'@modules/*'` with `/*` targets).
+- `experimental.externalDir` and the `webpack()` function do the same for
+  `next build --webpack`. The webpack function also adds the profile to webpack's cache key:
+  without it, a full build after a core build reused cached stub pages.
 
 > **Watch Out!** A page file's _default_ export is the page; a _named_ export (like
 > `generateKey` or `ACTIONS_BY_STATUS`) is fine for tests but must not be a React component
@@ -186,21 +285,31 @@ and watch the URL change without a reload (the network tab shows no document req
 rename it to `src/pages/scratch/[name].tsx`, visit `/scratch/hello`, and print `query.name`.
 Delete it after.
 
+Then look at the seam: open `frontend/src/pages/workspaces/index.tsx` and
+`frontend/src/modules-stub/pages/workspaces/index.tsx`, and run
+`EXPERIMENTLY_PROFILE=core npm run dev`. Visit `/workspaces`: you get the stub's "not
+installed" page even if `modules/` is in your checkout. Stop it and run plain `npm run dev`
+in a full checkout to see the real page.
+
 ### Common mistakes
 
 - **Helpers under `src/pages/`** — they become routes.
 - **Reading `query.id` without a loading guard** — it's empty on the first static render.
 - **`<a href>` instead of `<Link>`** for internal navigation — full reload, lost state.
-- **`fs`/`path` in a client component** — only in `getStaticProps`/`getStaticPaths`.
+- **`fs`/`path` in page code** — the export runs in the browser; there is no build-time data
+  route left to put them in.
+- **Importing a module's code by a relative path** (`../../modules/frontend/...`) instead of
+  `@modules/...` — it compiles in a full checkout and breaks the core build.
 
 ### Key takeaways
 
-- `src/pages/**` is the route table; default export = page; `[id]` and `[...slug]` are
-  dynamic; `_app.tsx` wraps all.
+- `src/pages/**` is the route table; default export = page; `[id]` is dynamic; `_app.tsx`
+  wraps all; `_document.tsx` sets `lang="en"`.
 - Pages are thin: route + title + feature component; dynamic pages guard the
   not-yet-hydrated `query`.
-- Client-rendered app + `output: 'export'`; only `/docs/*` renders at build time from
-  `docs/`.
+- Client-rendered app + `output: 'export'`; `/docs` is a link hub built with `docsUrl()`.
+- Module routes are one-line re-exports of `@modules/pages/...`; the alias resolves to
+  `modules/frontend/src/` (full) or `src/modules-stub/` (core), in Turbopack and webpack alike.
 - `<Link>` and `router.push` for navigation; `next dev -p 3100`.
 
 ---
@@ -218,7 +327,7 @@ Three kinds, decided by a pure function of the route pattern:
 
 | Kind        | Shell (`AppShell`) | Auth gate (`RequireAuth`) | Routes                                                  |
 | ----------- | ------------------ | ------------------------- | ------------------------------------------------------- |
-| `bare`      | no                 | no                        | `/login`, `/`                                           |
+| `bare`      | no                 | no                        | `/login`, `/`, `/sso/complete`                          |
 | `open`      | yes                | no                        | `/docs/*`, `/power-calculator`, `/404`, `/500`, `/_error` |
 | `protected` | yes                | yes                       | everything else                                         |
 
@@ -235,8 +344,12 @@ The classifier:
 
 ```typescript
 // 📁 frontend/src/utils/routes.ts
-/** Routes rendered without the application shell. */
-const BARE_ROUTES = new Set<string>(['/login', '/']);
+/**
+ * Routes rendered without the application shell. `/sso/complete` is one so
+ * that it is never `protected`: RequireAuth would bounce an anonymous visitor
+ * to `/login?next=`, carrying the SSO hand-off fragment along (C2b).
+ */
+const BARE_ROUTES = new Set<string>(['/login', '/', '/sso/complete']);
 
 /**
  * Routes inside the shell that do not require a session. The API is still the
@@ -260,7 +373,10 @@ export function routeKind(pathname: string): RouteKind {
 ```
 
 "Protected by default" — a new page is gated unless it's explicitly listed as open. That's
-the fail-closed choice, mirrored from the backend's settings.
+the fail-closed choice, mirrored from the backend's settings. `/sso/complete` shows why the
+exceptions need a reason written beside them: it is where a single sign-on provider hands the
+browser back, by definition before the dashboard has a session, so gating it would send the
+user to `/login` and lose the hand-off.
 
 The app component, composing the wrappers from the kind:
 
@@ -272,6 +388,7 @@ import Head from "next/head";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { AuthProvider } from "@/contexts/AuthContext";
 import { NotificationProvider } from "@/contexts/NotificationContext";
+import { ModulesProvider } from "@/contexts/ModulesContext";
 import { ToastContainer } from "@/components/ToastContainer";
 import { AppShell } from "@/components/AppShell";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -295,12 +412,14 @@ export default function App({ Component, pageProps, router }: AppProps) {
         <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
         <title>Experimently</title>
       </Head>
-      <AuthProvider>
-        <NotificationProvider>
-          {page}
-          <ToastContainer />
-        </NotificationProvider>
-      </AuthProvider>
+      <ModulesProvider>
+        <AuthProvider>
+          <NotificationProvider>
+            {page}
+            <ToastContainer />
+          </NotificationProvider>
+        </AuthProvider>
+      </ModulesProvider>
     </ErrorBoundary>
   );
 }
@@ -308,31 +427,73 @@ export default function App({ Component, pageProps, router }: AppProps) {
 
 Read the nesting from outside in: an `ErrorBoundary` (a class component that catches render
 errors and shows a fallback instead of a blank page), `<Head>` (title/favicon — pages
-override the title with `<PageTitle>`), the auth and notification providers, then the page
+override the title with `<PageTitle>`), the modules, auth and notification providers, then the page
 wrapped by its kind, then the toasts rendered once at the root so they overlay everything.
 `page` is built up by reassignment — a JSX value is just a value.
 
-The shell — nav items with role gating, and the active-link rule:
+The shell — nav items with access gating, and the active-link rule:
 
 ```tsx
-// 📁 frontend/src/components/AppShell.tsx (nav table)
-const NAV_ITEMS: NavItem[] = [
+// 📁 frontend/src/components/AppShell.tsx
+export const NAV_ITEMS: NavItem[] = [
   { label: 'Experiments', href: '/experiments', testId: 'nav-experiments' },
   { label: 'Feature Flags', href: '/feature-flags', testId: 'nav-feature-flags' },
-  { label: 'Admin', href: '/admin', testId: 'nav-admin', roles: ['ADMIN', 'DEVELOPER'] },
+  { label: 'Admin', href: '/admin', testId: 'nav-admin', superuser: true },
   { label: 'Docs', href: '/docs', testId: 'nav-docs' },
 ];
 
 export function isNavActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
+...
+  const visibleNav = NAV_ITEMS.filter((item) => {
+    if (marketing) return item.href === '/docs';
+    if (item.superuser) return user !== null && user.is_superuser === true;
+    if (item.roles) return user !== null && item.roles.includes(user.role);
+    return true;
+  });
 ```
 
-The nav hides "Admin" from analysts and viewers with `hasRole` — a convenience, not a
-control; the `/admin/*` endpoints return 403 regardless. `isNavActive` is exported for its
-test, and it's the same prefix logic as `routeKind`. The shell also renders a skip link
-(`href="#main-content"`) and `aria-current="page"` on the active item — accessibility that
-the Playwright a11y suite checks.
+"Admin" is gated on **`superuser: true`, not on a role**. Every endpoint under
+`/api/v1/admin` requires a superuser account, and `role` and `is_superuser` are independent
+columns on the user: an ADMIN-role user who is not a superuser gets 403 from every admin
+endpoint. An earlier version showed the item to `roles: ['ADMIN', 'DEVELOPER']`; a DEVELOPER
+saw it, clicked, and met a page of 403s. The rule the nav follows is the one the API applies.
+(`marketing` is the public-site build of the same code, Hour 13, which has no API and shows
+only Docs.)
+
+Modules add a second, collapsed group:
+
+```tsx
+// 📁 frontend/src/components/AppShell.tsx
+export const MODULE_NAV_ITEMS: (NavItem & { module: string })[] = [
+  {
+    label: 'Workspaces',
+    href: '/workspaces',
+    testId: 'nav-workspaces',
+    module: MODULES.WORKSPACES,
+  },
+  {
+    // The warehouse API refuses VIEWER every connection and source route, so
+    // the link is not offered to one. A superuser counts as ADMIN there.
+    label: 'Warehouse',
+    href: '/warehouse',
+    testId: 'nav-warehouse',
+    module: MODULES.WAREHOUSE,
+    roles: ['ADMIN', 'DEVELOPER', 'ANALYST'],
+  },
+];
+```
+
+These links appear under a "More" disclosure only when `useModules()` (Hour 9's
+`ModulesProvider`) reports the module installed; in the core profile "More" carries a
+"Modules" link to the guide instead. The primary nav is core chrome and never hard-links a
+route the core profile does not serve.
+
+Nav gating is a convenience, not a control; the endpoints return 403 regardless.
+`isNavActive` is exported for its test, and it's the same prefix logic as `routeKind`. The
+shell also renders a skip link (`href="#main-content"`) and `aria-current="page"` on the
+active item — accessibility that the Playwright a11y suite checks.
 
 `<PageTitle>` — the per-page title, because `<Head>` in `_app` sets only the default:
 
@@ -366,8 +527,11 @@ isn't. Revert both.
 ### Common mistakes
 
 - **Wrapping pages individually** with the shell/gate instead of via the classifier.
-- **Adding a nav item without a `roles` entry** for an admin-only page — the page still 403s
-  on the API, but the link is confusing.
+- **Gating a nav item on a different rule from the API's** — a role list for an area the API
+  gates on `is_superuser`, or no gate at all. The page still 403s on the API, but the user is
+  sent to a dead end.
+- **Putting a module route in `NAV_ITEMS`** — it belongs in `MODULE_NAV_ITEMS`, shown only when
+  the module is installed.
 - **Using `asPath` where `pathname` is meant** (or vice versa).
 - **Providers inside pages** — mount them once in `_app`.
 
@@ -377,7 +541,9 @@ isn't. Revert both.
   by its kind.
 - `routeKind(pathname)` → `bare | open | protected`, protected by default; `AppShell` for
   non-bare, `RequireAuth` for protected.
-- Nav gating by role is UX; the API enforces.
+- Nav gating mirrors the API (Admin: superuser; module links: installed, and a role where the
+  module API wants one) and is UX; the API enforces.
+- `ModulesProvider` is outermost; a failed `/api/v1/modules` probe means "core".
 - `pathname` is the pattern, `asPath` the real path.
 
 ---
@@ -388,8 +554,8 @@ isn't. Revert both.
 
 `RequireAuth` is the client-side gate for protected pages. It reads `useAuth()`'s three-state
 status and does one of four things: show a spinner (`loading`), redirect to
-`/login?next=<current path>` (`anonymous`), show an inline 403 (`wrong role`), or render the
-children. Its comment says the important thing — _"the API is the real enforcement"_ — the
+`/login?next=<current path>` (`anonymous`), show an inline 403 (not a superuser when the page
+asks for one, or the wrong role), or render the children. Its comment says the important thing — _"the API is the real enforcement"_ — the
 gate exists so users see a login page instead of a wall of 401 errors, not to protect data.
 
 `useRouter()` provides `pathname`, `asPath`, `query`, `isReady`, `push`, `replace`. Two
@@ -411,6 +577,12 @@ export interface RequireAuthProps {
   children: ReactNode;
   /** When set, the user must hold one of these roles. */
   roles?: Role[];
+  /**
+   * When true, the user must be a superuser -- the same flag the admin API
+   * enforces. `role` and `is_superuser` are independent columns, so a role
+   * check cannot stand in for it (#84).
+   */
+  superuser?: boolean;
   /** Where the "Go back" link on the 403 view points. Default `/experiments`. */
   fallbackPath?: string;
   /** Custom element rendered while the session is being resolved. */
@@ -424,7 +596,7 @@ export interface RequireAuthProps {
  * - `anonymous`  → `router.replace('/login?next=<current path>')`
  * - wrong role   → inline 403 view (`data-testid="require-auth-forbidden"`)
  */
-export function RequireAuth({ children, roles, fallbackPath = '/experiments', loading }: RequireAuthProps) {
+export function RequireAuth({ children, roles, superuser, fallbackPath = '/experiments', loading }: RequireAuthProps) {
   const { status, user } = useAuth();
   const router = useRouter();
 
@@ -457,20 +629,33 @@ export function RequireAuth({ children, roles, fallbackPath = '/experiments', lo
     );
   }
 
+  // One 403 view, two gates. `requirement` is the only difference, so the
+  // page says which condition the account failed rather than a generic refusal.
+  const forbidden = (requirement: string) => (
+    <div
+      data-testid="require-auth-forbidden"
+      className="flex flex-col items-center justify-center min-h-[40vh] gap-4 px-4 text-center"
+    >
+      <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">403</p>
+      <p className="text-slate-700 text-lg">You do not have permission to access this page.</p>
+      <p className="text-sm text-slate-500">
+        Signed in as <span className="font-medium">{user.email}</span> ({user.role}). This page
+        requires {requirement}.
+      </p>
+      <Link href={fallbackPath} className="text-blue-600 hover:underline" aria-label="Go to Home">
+        Go to Home
+      </Link>
+    </div>
+  );
+
+  // Superuser first: it is what the admin API actually enforces, so failing it
+  // is the more specific answer when a page asks for both.
+  if (superuser && user.is_superuser !== true) {
+    return forbidden('a superuser account');
+  }
+
   if (roles && roles.length > 0 && !roles.includes(user.role)) {
-    return (
-      <div data-testid="require-auth-forbidden" className="flex flex-col items-center justify-center min-h-[40vh] gap-4 px-4 text-center">
-        <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">403</p>
-        <p className="text-slate-700 text-lg">You do not have permission to access this page.</p>
-        <p className="text-sm text-slate-500">
-          Signed in as <span className="font-medium">{user.email}</span> ({user.role}). This page
-          requires {roles.join(' or ')}.
-        </p>
-        <Link href={fallbackPath} className="text-blue-600 hover:underline" aria-label="Go to Home">
-          Go to Home
-        </Link>
-      </div>
-    );
+    return forbidden(roles.join(' or '));
   }
 
   return <>{children}</>;
@@ -507,26 +692,60 @@ A dynamic route reading its parameter the strict way:
   const id = typeof rawId === 'string' ? rawId : undefined;
 ```
 
-And a role-gated page — the `roles` prop closes the loop with the nav's `roles` entries:
+And a gated page. Every admin page wraps itself with a higher-order component that closes
+the loop with the nav's `superuser: true`:
 
 ```tsx
-// (shape used by admin pages)
-<RequireAuth roles={['ADMIN', 'DEVELOPER']}>
-  <AdminUsersPage />
-</RequireAuth>
+// 📁 frontend/src/pages/admin/users.tsx
+export default withAdminGuard(UserManagementPage);
 ```
+
+```tsx
+// 📁 frontend/src/components/admin/withAdminGuard.tsx
+export function withAdminGuard<P extends object>(
+  Component: React.ComponentType<P>,
+  options: AdminGuardOptions = {}
+): React.FC<P> {
+  const { requiredRole, roles, superuser = true, fallbackPath = '/experiments' } = options;
+  ...
+  const GuardedComponent: React.FC<P> = (props) => (
+    <RequireAuth roles={allowed} superuser={superuser} fallbackPath={fallbackPath}>
+      <Component {...props} />
+    </RequireAuth>
+  );
+```
+
+`superuser` defaults to **true**, because every endpoint under `/api/v1/admin` depends on
+`get_current_superuser`. A signed-in ADMIN without the superuser flag sees "This page requires
+a superuser account." — the same answer the API would give, before any request is made. The
+`roles` prop is still there for pages that are gated by role, and a page that asks for both
+reports the superuser failure first, because it is the one the API enforces.
 
 The login page reads `next` back out and navigates after login:
 
 ```tsx
-// 📁 frontend/src/pages/login.tsx (shape)
-  const { login } = useAuth();
-  const router = useRouter();
+// 📁 frontend/src/pages/login.tsx
+export const DEFAULT_AFTER_LOGIN = '/experiments';
+...
+  const { login, status, sessionError } = useAuth();
   ...
-      await login(email, password);
-      const next = safeNextPath(typeof router.query.next === 'string' ? router.query.next : null, '/experiments');
-      void router.replace(next);
+  const nextPath = safeNextPath(firstQueryValue(router.query.next), DEFAULT_AFTER_LOGIN);
+  ...
+      await login(trimmedEmail, password);
+      await router.replace(nextPath);
 ```
+
+`firstQueryValue` takes the first element when `next` was repeated (`string | string[]`, Hour
+4). The login page also does three newer things:
+
+- it shows `sessionError` from the auth context (Hour 9), so a sign-out caused by a 5xx or an
+  unreachable API is explained, not silent;
+- it maps a `400` whose detail is `Invalid host header` to `wrongHostMessage()`, which names
+  the address the dashboard was opened on and the server settings that fix it
+  (`PUBLIC_BASE_URL`, or `ALLOWED_HOSTS` if set);
+- it imports `SsoSignIn` through the `@modules/...` alias — the SSO module's button in
+  the full profile, a stub that renders nothing in core (Hour 10's seam, used for a component
+  rather than a page).
 
 > **Watch Out!** Redirecting during render (`if (anonymous) router.replace(...)` outside an
 > effect) triggers "Cannot update a component while rendering a different component" and
@@ -541,7 +760,8 @@ The login page reads `next` back out and navigates after login:
 Log out, open `/experiments/<some id>`, and watch the URL become
 `/login?next=%2Fexperiments%2F<id>`; log in and confirm you land back on the experiment. Then
 try `/login?next=//example.com` and confirm you land on `/experiments`, not off-site. Finally,
-log in as a `VIEWER` and open `/admin` — the inline 403, not a redirect.
+log in as a `VIEWER` and open `/admin` — the inline 403, not a redirect. Do the same as an
+ADMIN-role user who is not a superuser: the 403 now says "requires a superuser account".
 
 ### Common mistakes
 
@@ -553,7 +773,9 @@ log in as a `VIEWER` and open `/admin` — the inline 403, not a redirect.
 ### Key takeaways
 
 - `RequireAuth`: spinner → redirect (`replace`, after `isReady`, via `safeNextPath`) → inline
-  403 by `roles` → children. UX, not enforcement.
+  403 (`superuser` first, then `roles`) → children. UX, not enforcement.
+- Admin pages are `export default withAdminGuard(Page)`, superuser-only by default, because the
+  admin API is.
 - `useRouter`: `pathname` (pattern), `asPath` (real), `query`, `isReady`, `push`/`replace`.
 - Dynamic routes narrow `query.id` with `typeof`; guard the first render.
 - One `safeNextPath` for every redirect target.
@@ -646,21 +868,43 @@ and a message that names the fix when the API is unreachable:
 
 ```typescript
 // 📁 frontend/src/services/api.ts
-function unreachableMessage(): string {
+export function unreachableMessage(): string {
   const base = apiBase();
-  const where = base || (typeof window !== 'undefined' && window.location ? window.location.origin : 'the API');
-  return `Can't reach the API at ${where}. Is the backend running? See docs → Quick start.`;
+  const where =
+    base || (typeof window !== 'undefined' && window.location ? window.location.origin : 'the API');
+  const message =
+    `Can't reach the API at ${where}. Check that the backend is running and that ` +
+    "this dashboard's origin is listed in CORS_ORIGINS.";
+  return process.env.NODE_ENV === 'development' ? `${message} See docs → Quick start.` : message;
 }
 ```
+
+The browser reports "backend down" and "backend up but no CORS header for this origin" the
+same way (a failed `fetch`), so the message names both causes. The pointer to the quick-start
+guide is added only in development, where the reader is the person running the stack. It is
+exported because the login page and `sessionErrorMessage` (Hour 9) use the same words.
 
 The image, whose header is the deployment contract:
 
 ```dockerfile
 # 📁 frontend/Dockerfile
-# The build context is the REPOSITORY ROOT (like backend/Dockerfile): the
-# in-app documentation pages (/docs/*) are rendered at build time from the
-# markdown under docs/, which lives next to frontend/, not inside it.
+#   docker build -f frontend/Dockerfile -t experimently-web:core .
+#   docker build -f frontend/Dockerfile -t experimently-web:full \
+#       --build-arg EXPERIMENTLY_PROFILE=full .
 #
+# The build context is the REPOSITORY ROOT (like backend/Dockerfile): the
+# modules' dashboard code lives in modules/frontend/, next to frontend/, not
+# inside it. (The documentation is no longer rendered in-app -- the dashboard
+# links to the MkDocs site, so docs/ is not copied.)
+#
+# EXPERIMENTLY_PROFILE selects what goes in:
+#   core (default)  never reads modules/frontend/ — a core checkout, which has
+#                   no modules/ at all, builds unchanged — and the `@modules/*`
+#                   alias resolves to the stub tree (frontend/modules-alias.js).
+#   full            copies modules/frontend/ into the image and builds the
+#                   full-profile dashboard; the build fails if the tree is
+#                   missing.
+...
 # Stage 1 builds the Next.js static export (output: 'export' -> out/) and
 # generates the nginx location blocks for the dynamic routes from
 # .next/routes-manifest.json. Stage 2 serves it with nginx-unprivileged on
@@ -672,11 +916,23 @@ The image, whose header is the deployment contract:
 # absolute URL only when the dashboard is served from a different origin.
 ARG NEXT_PUBLIC_API_URL=""
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+# The documentation site the dashboard links to (frontend/src/services/docs.ts).
+# Empty means the published site; set it for a deployment that hosts its own.
+ARG NEXT_PUBLIC_DOCS_URL=""
+ENV NEXT_PUBLIC_DOCS_URL=${NEXT_PUBLIC_DOCS_URL}
+
 RUN npm run build \
     && test -f .next/routes-manifest.json \
     && node scripts/nginx-routes.mjs --out /app/nginx/routes.conf \
-    && test -d out
+    && test -d out \
+    ...
 ```
+
+(The Dockerfile's comment on `NEXT_PUBLIC_DOCS_URL` says "the published site", but
+`docs.ts`, which decides, falls back to the GitHub repository when it is empty; trust the
+code, Hour 10.) The profile is a build argument with `core` as the default, so a plain
+`docker build` works on a checkout with no `modules/` at all. Hour 23 covers the stages that
+pick the modules tree and the check that the bundle matches the profile.
 
 And the script that makes dynamic routes work on nginx — the part of "static export" that
 isn't obvious:
@@ -703,15 +959,18 @@ The compose service wires the two pieces: an empty build arg, and the upstream f
 # 📁 docker-compose.yml
   frontend:
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: frontend/Dockerfile
       args:
+        EXPERIMENTLY_PROFILE: ${EXPERIMENTLY_PROFILE:-core}
         # Relative: the dashboard calls /api/... on its own origin and nginx
         # proxies to the api container.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
     image: *web-image
     environment:
       API_UPSTREAM: http://api:8000
+      # connect-src of the CSP; add the API origin when NEXT_PUBLIC_API_URL is absolute.
+      CSP_CONNECT_SRC: "${CSP_CONNECT_SRC:-'self' ws: wss:}"
     ports:
       - "${FRONTEND_HOST_PORT:-3000}:8080"
 ```
@@ -721,6 +980,14 @@ The compose service wires the two pieces: an empty build arg, and the upstream f
 > point a built image at a different API origin you rebuild — or keep it same-origin and
 > change nginx's `API_UPSTREAM`, which _is_ runtime. That's the strongest argument for the
 > same-origin design.
+
+> **Did You Know?** One build-time variable decides *which site* the code is.
+> `NEXT_PUBLIC_SITE_MODE` defaults to `platform` (the dashboard a self-hoster runs);
+> `npm run build:marketing` sets it to `marketing` for the public website, which has no API
+> behind it. In that mode the shell shows only Docs and no sign-in button
+> (`frontend/src/utils/site-mode.ts`), and `frontend/scripts/prune-marketing-site.mjs` then deletes the
+> dashboard routes from `out/` — refusing to run unless the mode is `marketing`, and refusing
+> when it matched nothing, so it can never quietly delete the dashboard from a platform build.
 
 > **Did You Know?** The three CORS-related things you'll meet are one design decision seen
 > from three sides: the API's `CORS_ORIGINS` includes 3000/3100/3200/3300 for the dev
@@ -733,13 +1000,14 @@ The compose service wires the two pieces: an empty build arg, and the upstream f
 ```bash
 cd frontend
 NEXT_PUBLIC_API_URL="" npm run build && ls out | head          # the static export
-node scripts/nginx-routes.mjs --check | head -20                 # the generated location blocks
-grep -o 'http://localhost:8000' out/_next/static/chunks/*.js | head -1 || echo "not baked in: production build"
-NEXT_PUBLIC_API_URL="https://api.example.com" npm run build && grep -l "api.example.com" out/_next/static/chunks/*.js | head -1
+node ./scripts/nginx-routes.mjs --check | head -20               # the generated location blocks
+grep -rl 'http://localhost:8000' out/_next/static || echo "not baked in: production build"
+NEXT_PUBLIC_API_URL="https://api.example.com" npm run build && grep -rl "api.example.com" out/_next/static
 ```
 
-Then run the compose stack and prove the proxy: `curl -si localhost:3000/api/v1/health/ready`
-(nginx → api) vs `curl -si localhost:3000/healthz` (nginx's own).
+Then run the compose stack and prove the proxy: `curl -si localhost:3000/health/ready`
+(nginx → api; the API mounts its health probes at the root, not under `/api/v1`) vs
+`curl -si localhost:3000/healthz` (nginx's own).
 
 ### Common mistakes
 
@@ -747,8 +1015,9 @@ Then run the compose stack and prove the proxy: `curl -si localhost:3000/api/v1/
 - **An absolute API URL in the image without adding the dashboard's origin to
   `CORS_ORIGINS`.**
 - **A `try_files … /index.html` fallback** for dynamic routes — the wrong page renders.
-- **Building the dashboard image with `frontend/` as the context** — the docs pages have no
-  markdown and the build fails.
+- **Building the dashboard image with `frontend/` as the context** — the Dockerfile copies
+  `frontend/...` and `modules*/frontend` paths relative to the repository root, so the build
+  fails; and a full build needs `modules/frontend/` beside `frontend/`.
 
 ### Key takeaways
 
@@ -756,7 +1025,9 @@ Then run the compose stack and prove the proxy: `curl -si localhost:3000/api/v1/
   given. `wsBase()` follows.
 - The image is a static export behind nginx-unprivileged on 8080; nginx proxies `/api/`,
   `/ws/`, `/health*` to `API_UPSTREAM`; dynamic routes get generated `location` blocks.
-- `NEXT_PUBLIC_*` is baked at build; the build context is the repo root (for `docs/`).
+- `NEXT_PUBLIC_*` is baked at build; the build context is the repo root (for
+  `modules/frontend/` and `frontend/tsconfig.core.json`); `EXPERIMENTLY_PROFILE` (default
+  `core`) picks the profile.
 - `apiFetch` detects the SPA-shell-for-API misconfiguration and names the fix when
   unreachable.
 
@@ -769,9 +1040,11 @@ the first static render?**
 `/feature-flags/<anything>`; `undefined` (the query is `{}` until the router hydrates), which
 is why every dynamic page has a loading branch.
 
-**Q2. Which routes are `open`, and what does `open` mean?**
-`/docs/*`, `/power-calculator`, `/404`, `/500`, `/_error`: rendered inside the shell but
-without `RequireAuth`. New routes are `protected` by default.
+**Q2. Which routes are `open`, which are `bare`, and what does each mean?**
+`open`: `/docs/*`, `/power-calculator`, `/404`, `/500`, `/_error` — rendered inside the shell
+but without `RequireAuth`. `bare`: `/login`, `/` and `/sso/complete` — no shell and no gate
+(`/sso/complete` must never be gated, or the SSO hand-off is lost on the way to `/login`). New
+routes are `protected` by default.
 
 **Q3. Why does `RequireAuth` wait for `router.isReady` before redirecting?**
 On a static export `asPath` is the route pattern (`/experiments/[id]`) until the router is
@@ -788,8 +1061,15 @@ Same origin: requests go to `/api/v1/...` on the dashboard's host, and nginx pro
 `/api/` to `API_UPSTREAM` (`http://api:8000`). No CORS involved.
 
 **Q6. Why is the dashboard's Docker build context the repository root?**
-`/docs/[...slug].tsx` reads `../docs/*.md` at build time via `getStaticProps`; the markdown
-lives next to `frontend/`, so the context must include both.
+The modules' dashboard code lives in `modules/frontend/`, beside `frontend/`, and a full-profile
+image must copy it; the core stage also needs `frontend/tsconfig.core.json` as a file that is
+always present. (It used to be for `docs/`, which the dashboard rendered at build time; it no
+longer renders docs and does not copy `docs/`.)
+
+**Q7. A DEVELOPER-role user reports that "Admin" is missing from their nav. Bug?**
+No. The Admin item is `superuser: true`, matching the admin API, which requires a superuser
+account for every endpoint. Role and superuser are independent; make the account a superuser
+if it should administer the instance.
 
 **Quiz.** `router.pathname` vs `router.asPath` for `/experiments/3f9a`?
 → `pathname` is `/experiments/[id]` (the pattern); `asPath` is `/experiments/3f9a` (the
@@ -806,8 +1086,10 @@ loading branch, and renders a `RolloutDetail` component. What, if anything, must
 **E3.2 — An open page.** Add `/status` — a public page showing `/health/ready` — and make it
 `open`. Which two files change, and why must the API call use `auth: false`?
 
-**E3.3 — Role gate.** Wrap the admin safety page so only `ADMIN` can see it, with the "Go
-back" link pointing at `/admin`. Show the `RequireAuth` usage and the matching nav entry.
+**E3.3 — Narrow a guard.** The admin safety page is `export default withAdminGuard(SafetyDashboard)`.
+Change it so that only a superuser who **also** holds the `ADMIN` role can see it, with the
+"Go back" link pointing at `/admin`. Show the new export, the `RequireAuth` it renders, and say
+whether the nav entry changes.
 
 **E3.4 — Base URL matrix.** For each deployment — `next dev` with nothing set, the compose
 image, a Vercel-hosted dashboard with the API at `api.example.com` — state `apiBase()`'s
@@ -846,18 +1128,19 @@ elsewhere could trigger the redirect.
 
 ```tsx
 // src/pages/admin/safety.tsx
-export default function SafetyPage() {
-  return (
-    <RequireAuth roles={['ADMIN']} fallbackPath="/admin">
-      <SafetySettingsForm />
-    </RequireAuth>
-  );
-}
-// AppShell NAV_ITEMS: { label: 'Admin', href: '/admin', testId: 'nav-admin', roles: ['ADMIN', 'DEVELOPER'] }
+export default withAdminGuard(SafetyDashboard, { roles: ['ADMIN'], fallbackPath: '/admin' });
+
+// which renders:
+<RequireAuth roles={['ADMIN']} superuser={true} fallbackPath="/admin">
+  <SafetyDashboard />
+</RequireAuth>
 ```
 
-(The nav entry stays broad — developers can see other admin pages — while this page narrows
-to `ADMIN`.)
+`superuser` stays at its default, `true`, and `roles` narrows further. A superuser with the
+DEVELOPER role now sees "This page requires ADMIN."; a non-superuser ADMIN still sees "requires
+a superuser account", because the superuser check runs first. The nav entry does not change:
+`{ label: 'Admin', href: '/admin', testId: 'nav-admin', superuser: true }` opens the area, and
+the other admin pages are still open to every superuser.
 
 **S3.4** — `next dev`, nothing set: `apiBase()` = `http://localhost:8000`, `wsBase()` =
 `ws://localhost:8000`, CORS needs `http://localhost:3100` (it's in the defaults). Compose

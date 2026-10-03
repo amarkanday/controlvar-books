@@ -21,7 +21,15 @@ V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (do
 V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Android (Kotlin) | `sdk/android` | JUnit 5 | not yet (needs the Android SDK) | [android.md](sdk/android.md) |
 V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Flutter / Dart | `sdk/flutter` | `dart test` | not yet (needs the Dart SDK) | [flutter.md](sdk/flutter.md) |
 V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Elixir | `sdk/elixir` | ExUnit | not yet (needs Elixir) | [elixir.md](sdk/elixir.md) |
-V2 | learn-react-nextjs-in-24-hours/part-3-nextjs.md | docs-relative path (docs/sdk/javascript.md), exists at REF | 'sdks/javascript':               'sdk/javascript.md',
 
 # V2: written by the demo seed scripts at run time (seed_shoplab.py), never committed.
 V2 | build-a-platform-in-28-days/week-1-core-loop.md | generated at run time by the demo seed, not a committed file | KEY=$(cat demo/shoplab/.api_key 2>/dev/null || echo "<your key>")
+
+# V2: verbatim lines of real source. `@modules/...` is the dashboard's import alias, not a repository path
+# (it resolves to modules/frontend/src/... or frontend/src/modules-stub/...; both exist at REF).
+V2 | learn-react-nextjs-in-24-hours/part-3-nextjs.md | @modules import alias, not a repo path; modules/frontend/src/pages/warehouse/index.tsx exists at REF | export { default } from '@modules/pages/warehouse/index';
+# V2: frontend/Dockerfile and frontend/package.json run these from frontend/ (WORKDIR /app/frontend); the files are
+# frontend/scripts/nginx-routes.mjs and frontend/scripts/prune-marketing-site.mjs, both present at REF.
+V2 | learn-react-nextjs-in-24-hours/part-3-nextjs.md | path relative to frontend/ (WORKDIR /app/frontend); frontend/scripts/nginx-routes.mjs exists at REF | && node scripts/nginx-routes.mjs --out /app/nginx/routes.conf \
+V2 | learn-react-nextjs-in-24-hours/part-6-production.md | path relative to frontend/ (WORKDIR /app/frontend); frontend/scripts/nginx-routes.mjs exists at REF | && node scripts/nginx-routes.mjs --out /app/nginx/routes.conf \
+V2 | learn-react-nextjs-in-24-hours/part-6-production.md | npm script runs in frontend/; frontend/scripts/prune-marketing-site.mjs exists at REF | "build:marketing": "NEXT_PUBLIC_SITE_MODE=marketing NEXT_PUBLIC_DOCS_URL=https://getexperimently.github.io/experimently next build && NEXT_PUBLIC_SITE_MODE=marketing node scripts/prune-marketing-site.mjs out"

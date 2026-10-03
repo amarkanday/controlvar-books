@@ -127,11 +127,16 @@ nesting" rule the Python book teaches. `{cond && <X/>}` renders `X` only when `c
 truthy; `{a ? <X/> : <Y/>}` picks one. And after the guards, the compiler knows
 `experiment` is not null.
 
-A list with keys — the lifecycle buttons, driven by the status table from Hour 2:
+A list with keys — the lifecycle buttons, driven by the status table from Hour 2 and by the
+user's role:
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
-  const actions = ACTIONS_BY_STATUS[status] ?? [];
+  const statusActions = ACTIONS_BY_STATUS[status] ?? [];
+  const mayChange = canChangeExperiment(user);
+  // Offer only what the API would accept: a role without EXPERIMENT UPDATE is
+  // refused every lifecycle change, including on an experiment it owns.
+  const actions = mayChange ? statusActions : [];
   ...
             {actions.map((action) => (
               <button
@@ -149,6 +154,14 @@ A list with keys — the lifecycle buttons, driven by the status table from Hour
 
 `key={action}` — stable and unique per item. `onClick={() => onActionClick(action)}` — an
 arrow so the handler is _called_ on click, not during render.
+
+`canChangeExperiment(user)` (from `frontend/src/utils/experimentPermissions.ts`) is a plain
+function of the user, not of the experiment: ADMIN and DEVELOPER (or a superuser) may start,
+pause, complete and archive **any** experiment; ANALYST and VIEWER may change none, even one
+they created. It mirrors the API's own check, so the page never offers a button the API would
+refuse. An ANALYST sees the status and a sentence instead of buttons
+(`data-testid="experiment-role-note"`), worded differently when they own the experiment. Hour
+16 comes back to this.
 
 Composition — a page assembling feature components, each with one prop:
 
@@ -175,12 +188,14 @@ A fragment (`<>...</>`) to return siblings without a wrapper element, from the a
         <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
         <title>Experimently</title>
       </Head>
-      <AuthProvider>
-        <NotificationProvider>
-          {page}
-          <ToastContainer />
-        </NotificationProvider>
-      </AuthProvider>
+      <ModulesProvider>
+        <AuthProvider>
+          <NotificationProvider>
+            {page}
+            <ToastContainer />
+          </NotificationProvider>
+        </AuthProvider>
+      </ModulesProvider>
     </ErrorBoundary>
   );
 ```
@@ -283,50 +298,65 @@ would infer `null` forever. Six booleans-or-nulls rather than one big object: ea
 independently, and separate state keeps updates simple.
 
 Immutable updates on arrays of records — add, remove, change one field, set exactly one
-control:
+control. In the new-experiment form these live in a **reducer** (a pure function from the old
+state and an action to the new state; the sidebar below says why), but each case is exactly
+the update you would write in a `setVariants(...)` call:
 
 ```tsx
-// 📁 frontend/src/pages/experiments/new.tsx
-  const handleAddVariant = () => {
-    setVariants([
-      ...variants,
-      { name: `Variant ${variants.length}`, description: '', traffic_allocation: 0, is_control: false },
-    ]);
-  };
-
-  const handleRemoveVariant = (index: number) => {
-    setVariants(variants.filter((_, i) => i !== index));
-  };
-
-  const handleVariantChange = (
-    index: number,
-    field: keyof VariantFormData,
-    value: string | number | boolean,
-  ) => {
-    setVariants(variants.map((v, i) => (i === index ? { ...v, [field]: value } : v)));
-  };
-
-  const handleSetControl = (index: number) => {
-    setVariants(variants.map((v, i) => ({ ...v, is_control: i === index })));
-  };
+// 📁 frontend/src/components/experiments/new/formState.ts
+    case 'addVariant':
+      return {
+        ...state,
+        variants: [
+          ...state.variants,
+          {
+            name: `Variant ${state.variants.length}`,
+            description: '',
+            traffic_allocation: 0,
+            is_control: false,
+          },
+        ],
+      };
+    case 'removeVariant':
+      return { ...state, variants: state.variants.filter((_, i) => i !== action.index) };
+    case 'changeVariant':
+      return {
+        ...state,
+        variants: state.variants.map((v, i) =>
+          i === action.index ? { ...v, [action.field]: action.value } : v,
+        ),
+      };
+    case 'setControl':
+      return {
+        ...state,
+        variants: state.variants.map((v, i) => ({ ...v, is_control: i === action.index })),
+      };
 ```
 
-Spread (`...variants`, `{ ...v, [field]: value }`), `filter`, `map` — never `push`,
-`splice`, or `v.name = ...`. `handleSetControl` is the "exactly one" idiom: map every item,
-setting the flag by index comparison.
+Spread (`...state.variants`, `{ ...v, [action.field]: action.value }`), `filter`, `map` — never
+`push`, `splice`, or `v.name = ...`. `setControl` is the "exactly one" idiom: map every item,
+setting the flag by index comparison. Note the outer `{ ...state, variants: ... }`: the whole
+form is one object, so every case copies it and replaces one field.
 
-Derived state computed during render, memoised because it's used in the JSX and in
-validation:
+Derived state computed during render, by a plain function rather than stored:
 
 ```tsx
-// 📁 frontend/src/pages/experiments/new.tsx
-  const allocationTotal = useMemo(
-    () => variants.reduce((sum, v) => sum + (Number(v.traffic_allocation) || 0), 0),
-    [variants],
-  );
+// 📁 frontend/src/components/experiments/new/formState.ts
+export function allocationTotalOf(variants: VariantFormData[]): number {
+  return variants.reduce((sum, v) => sum + (Number(v.traffic_allocation) || 0), 0);
+}
 ```
 
-(`Number(x) || 0` here is a legitimate `||`: `NaN` from an empty input should become 0.)
+```tsx
+// 📁 frontend/src/components/experiments/new/VariantsEditor.tsx
+export function VariantsEditor({ variants, dispatch }: VariantsEditorProps) {
+  const allocationTotal = allocationTotalOf(variants);
+```
+
+(`Number(x) || 0` here is a legitimate `||`: `NaN` from an empty input should become 0.) The
+sum is cheap, so there is no `useMemo`; it is recomputed on every render, and the same
+function is used by the validator, so the number on screen and the number checked cannot
+differ.
 
 The functional update form — the previous value is the input:
 
@@ -367,21 +397,58 @@ A derived name that a "key edited?" flag protects — state for a user decision,
 computed value:
 
 ```tsx
-// 📁 frontend/src/pages/experiments/new.tsx
-  const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newName = e.target.value;
-    setName(newName);
-    if (!keyEdited) setKey(generateKey(newName));
-  };
-
-  const handleKeyChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setKey(e.target.value);
-    setKeyEdited(true);
-  };
+// 📁 frontend/src/components/experiments/new/formState.ts
+    case 'setName':
+      return {
+        ...state,
+        name: action.name,
+        key: state.keyEdited ? state.key : generateKey(action.name),
+      };
+    case 'setKey':
+      return { ...state, key: action.key, keyEdited: true };
 ```
 
-The key _follows_ the name until the user edits it; `keyEdited` is the one bit of state that
-records the decision.
+The key _follows_ the name until the user edits it; `keyEdited` is the one field of
+`ExperimentFormState` that records the decision. The input only says what happened:
+`onChange={(e) => dispatch({ type: 'setName', name: e.target.value })}`.
+
+#### Sidebar: `useReducer`, when one `useState` per field stops scaling
+
+`/experiments/new` used to hold nine `useState`s and a handler per change. It now holds one:
+
+```tsx
+// 📁 frontend/src/pages/experiments/new.tsx
+  const [state, dispatch] = useReducer(experimentFormReducer, undefined, createInitialFormState);
+```
+
+`useReducer(reducer, initialArg, init)` calls `init(initialArg)` once for the first state,
+then every `dispatch(action)` runs `reducer(state, action)` and re-renders with the result.
+The actions are a **discriminated union** (Hour 4's narrowing, applied to events):
+
+```tsx
+// 📁 frontend/src/components/experiments/new/formState.ts
+export type ExperimentFormAction =
+  | { type: 'setName'; name: string }
+  | { type: 'setKey'; key: string }
+  ...
+  | { type: 'addVariant' }
+  | { type: 'removeVariant'; index: number }
+  ...
+```
+
+Inside `case 'removeVariant':` the compiler knows `action.index` exists; in `case
+'addVariant':` it knows it does not. Three things made the reducer worth it here:
+
+1. **Two views share one state.** The page shows either a step-by-step wizard or a
+   single-page form (Hour 15). Both receive `state` and `dispatch`; switching views keeps
+   every answer because there is only one copy.
+2. **The logic is testable without React.** `formState.ts` imports no React at all; its tests
+   call `experimentFormReducer(state, action)` and compare objects.
+3. **Child components stay dumb.** `VariantsEditor` takes `variants` and `dispatch` and
+   says what happened; it does not know how the state is shaped above it.
+
+Reach for `useReducer` when several fields change together or more than one component
+changes the same state; keep `useState` for independent values like `pendingAction` above.
 
 > **Watch Out!** `useState` initialises once. `useState(props.value)` does _not_ track later
 > changes to `props.value` — that's the "controlled vs uncontrolled" confusion. If the parent
@@ -390,7 +457,7 @@ records the decision.
 > purpose.
 
 > **Did You Know?** State updates inside event handlers are batched (one render), and since
-> React 18 they're batched everywhere, including after `await`. So in `runAction`,
+> React 18 (the dashboard runs React 19) they're batched everywhere, including after `await`. So in `runAction`,
 > `setExperiment(updated)` followed by `setPendingAction(null)` in `finally` is one
 > re-render, not two.
 
@@ -722,7 +789,10 @@ Usage: `const { data: flags, loading, refetch } = useApi(() => FeatureFlagsServi
 The `setData` in the result is for optimistic updates — a toggle can update the row locally
 after the API confirms, without a refetch.
 
-`useForm` — a generic form hook with validators per field and a submit pipeline:
+`useForm` — a generic form hook with validators per field and a submit pipeline. It is a good
+example of a generic hook, but be clear what it is: **no page uses it today** (only its own
+test, `frontend/src/tests/hooks/useForm.test.ts`, imports it). The one big form,
+`/experiments/new`, uses a reducer instead (Hour 6's sidebar, Hour 15).
 
 ```tsx
 // 📁 frontend/src/hooks/useForm.ts
@@ -863,8 +933,9 @@ move `useToggle` inside an `if` and read the lint error.
 - Custom hooks extract stateful logic; they own state and return what callers need.
 - Rules: top level only, from components/hooks only; call order is identity.
 - `useCallback`/`useMemo` for stable identities; `useRef` for mutable non-render state.
-- `useApi` (fetch + loading + error + refetch + setData), `useForm` (values, errors, touched,
-  submit pipeline), `useExperimentStream` (socket) are the house hooks.
+- `useApi` (fetch + loading + error + refetch + setData) and `useExperimentStream` (socket) are
+  the house hooks; `useForm` (values, errors, touched, submit pipeline) is available but unused
+  by any page.
 
 ---
 
@@ -879,9 +950,12 @@ each level's props. `createContext<T | undefined>(undefined)` makes a context; a
 programming error caught at the first render, not a `undefined is not a function` later.
 
 Use context for app-wide concerns that many components need and few change: the current
-user, toasts, a workspace. Don't use it for data one page owns — that's state (Hour 6) or a
-service call. The dashboard has three providers, all mounted once in `_app.tsx`
-(`AuthProvider`, `NotificationProvider`, `WorkspaceProvider` where needed).
+user, toasts, which optional modules this server has. Don't use it for data one page owns —
+that's state (Hour 6) or a service call. `_app.tsx` mounts three providers once, around every
+page: `ModulesProvider` (what `GET /api/v1/modules` says is installed), `AuthProvider` and
+`NotificationProvider`. A fourth, `WorkspaceProvider`, belongs to the optional workspaces
+module (`modules/frontend/src/contexts/WorkspaceContext.tsx`) and is mounted by that module's
+own pages, not by `_app`.
 
 #### Why the auth context never trusts the stored token
 
@@ -911,6 +985,12 @@ export interface AuthContextValue {
   refresh: () => Promise<UserMe | null>;
   /** True when the current user has one of the given roles. */
   hasRole: (...roles: Role[]) => boolean;
+  /**
+   * Why a stored session could not be restored, when the reason was not a
+   * rejected token: a server error or an unreachable API. The login page shows
+   * it, so the redirect there is not silent. `null` otherwise.
+   */
+  sessionError: string | null;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -923,6 +1003,7 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserMe | null>(null);
   const [status, setStatus] = useState<AuthStatus>('loading');
+  const [sessionError, setSessionError] = useState<string | null>(null);
   const mounted = useRef(true);
 
   const applyAnonymous = useCallback(() => {
@@ -941,6 +1022,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (mounted.current) {
         setUser(me);
         setStatus('authenticated');
+        setSessionError(null);
       }
       return me;
     } catch (err) {
@@ -950,7 +1032,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return null;
       }
       // API unreachable or 5xx: keep the token for the next reload but treat
-      // the session as anonymous so protected pages fall back to /login.
+      // the session as anonymous so protected pages fall back to /login, and
+      // say why there.
+      if (mounted.current) setSessionError(sessionErrorMessage(err));
       applyAnonymous();
       return null;
     }
@@ -974,6 +1058,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (mounted.current) {
       setUser(result.user);
       setStatus('authenticated');
+      setSessionError(null);
     }
     return result.user;
   }, []);
@@ -985,14 +1070,20 @@ boolean would force protected pages to redirect during the initial `/auth/me` �
 on the `/auth/me` call because the provider handles a 401 itself; `auth: false` on login
 because there's no token yet.
 
+A 401 and a 5xx end the same way (anonymous, sent to `/login`) but for different reasons, and
+the user deserves to know which. `sessionError` carries the second kind:
+`sessionErrorMessage(err)` turns an unreachable API into `unreachableMessage()` and a 5xx into
+"Signed out because the server returned an error (HTTP 503). Request ID: ...", and the login
+page shows it. A rejected token sets nothing: being asked to sign in again explains itself.
+
 The value is assembled with `useMemo` so consumers don't re-render on every provider
 render, and the hook throws without a provider:
 
 ```tsx
 // 📁 frontend/src/contexts/AuthContext.tsx (shape)
   const value = useMemo<AuthContextValue>(
-    () => ({ user, status, isAuthenticated: status === 'authenticated', login, logout, refresh: loadMe, hasRole }),
-    [user, status, login, logout, loadMe, hasRole],
+    () => ({ user, status, isAuthenticated: status === 'authenticated', login, logout, refresh: loadMe, hasRole, sessionError }),
+    [user, status, login, logout, loadMe, hasRole, sessionError],
   );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
@@ -1002,7 +1093,15 @@ export function useAuth(): AuthContextValue {
   if (!ctx) throw new Error('useAuth must be used within AuthProvider');
   return ctx;
 }
+
+export function useOptionalAuth(): AuthContextValue | null {
+  return useContext(AuthContext) ?? null;
+}
 ```
+
+`useOptionalAuth()` is the escape hatch: it returns `null` instead of throwing, for components
+that must also render where no provider exists (the experiments list and `/experiments/new`
+are rendered bare in some tests). A missing provider is then a value to handle, not a crash.
 
 The toast context — small state, two stable functions, a ref for timers:
 
@@ -1049,27 +1148,41 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
 }
 ```
 
-Consumers read what they need — the nav reads `status` and `hasRole`; a page reads `user`
-to decide if it's the owner:
+Consumers read what they need — the nav reads `status` and `user`; the detail page reads
+`user` to decide which buttons to offer (by role) and how to word the note it shows instead
+(by ownership):
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
   const { user } = useAuth();
   ...
+  const mayChange = canChangeExperiment(user);
+  ...
   const isOwner = user !== null && user.id === experiment.owner_id;
 ```
+
+Ownership labels; it does not grant. Access to experiments and flags is by role (Hour 16).
 
 And the providers are mounted once, in order, around every page:
 
 ```tsx
 // 📁 frontend/src/pages/_app.tsx
-      <AuthProvider>
-        <NotificationProvider>
-          {page}
-          <ToastContainer />
-        </NotificationProvider>
-      </AuthProvider>
+      <ModulesProvider>
+        <AuthProvider>
+          <NotificationProvider>
+            {page}
+            <ToastContainer />
+          </NotificationProvider>
+        </AuthProvider>
+      </ModulesProvider>
 ```
+
+`ModulesProvider` is outermost because nothing in it depends on the user: it asks
+`GET /api/v1/modules` once, caches the answer for five minutes, and **treats any failure as the
+core profile**, so a dashboard that cannot reach its backend never shows module menus it cannot
+back. Its hook, `useModules()`, returns that same core default when there is no provider at
+all — the opposite choice from `useAuth()`, which throws. Both are deliberate: rendering the
+shell without module chrome is always safe, rendering a page without knowing the user is not.
 
 The React SDK's provider shows the memoisation rule for a context whose value is an object —
 recreate only when the primitives that matter change:
@@ -1115,12 +1228,14 @@ Build a `ThemeContext` in a scratch file — provider with `useState<'light' | '
 memoised value `{ theme, toggle }`, a `useTheme()` that throws without a provider — and use it
 from a button. Then call `useTheme()` in a component _outside_ the provider and read the
 thrown message. Finally, open `frontend/src/tests/pages/experiment-detail.test.tsx` and find
-how `mockUseAuth` sets an owner vs a non-owner.
+how `mockUseAuth` signs in an ADMIN vs an ANALYST, and an owner vs a non-owner. Which test
+proves that an ANALYST who owns an experiment still gets no lifecycle button?
 
 ### Common mistakes
 
 - **Context for page-local data.** State or a service call.
-- **A hook that returns `undefined` outside its provider** instead of throwing.
+- **A hook that returns `undefined` outside its provider** instead of throwing — unless, like
+  `useModules()` or `useOptionalAuth()`, a safe default is the documented contract.
 - **Unmemoised object values** on hot providers — every consumer re-renders.
 - **Persisting the user object** instead of re-deriving it from the API.
 
@@ -1129,7 +1244,8 @@ how `mockUseAuth` sets an owner vs a non-owner.
 - `createContext<T | undefined>` + a provider that owns state + a `useX()` that throws without
   a provider.
 - Auth: three states (`loading | authenticated | anonymous`), token-only persistence, user
-  re-derived from `/auth/me`, cross-tab sync, `hasRole`.
+  re-derived from `/auth/me`, cross-tab sync, `hasRole`, and `sessionError` so a failed
+  restore is never a silent sign-out.
 - Notifications: `addToast`/`removeToast` with timers in a ref.
 - Memoise provider values (and the SDK client) on the primitives that matter; tests mock the
   `useX()` hook.
@@ -1164,6 +1280,13 @@ attributes?**
 So an inline `user={{...}}` object in the parent doesn't count as "the user changed" on every
 render — which would re-run every `useExperiment`/`useFeatureFlag` effect and re-assign on
 each keystroke.
+
+**Q7. `/experiments/new` replaced nine `useState`s with one `useReducer`. What does the
+reducer give the page that the `useState`s did not?**
+One copy of the form that two views (the guided wizard and the single-page form) both read
+and dispatch to, so switching views keeps every answer; a pure `experimentFormReducer` that
+tests can call without rendering anything; and child editors that only say what happened
+(`dispatch({ type: 'removeVariant', index })`) without knowing the state's shape.
 
 **Quiz.** Name the two rules of hooks and the lint rule that enforces them.
 → Top level only (no conditions/loops/after returns); from components or custom hooks only.

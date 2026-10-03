@@ -7,11 +7,13 @@
 > never trusts a stored token, forms that mirror server validation, a WebSocket hook with
 > reconnect, charts that render in tests, a rule builder that emits the exact JSON a backend
 > expects. This book is different. Every concept is taught **twice**: once in the abstract,
-> and once with a real snippet pulled from the **Experimently** dashboard (a Next.js 14 pages-
-> router app, ~25,000 lines of strict TypeScript, 550+ Jest tests, Playwright E2E, visual and
+> and once with a real snippet pulled from the **Experimently** dashboard (a Next.js 16
+> pages-router app on React 19, built with Turbopack; strict TypeScript; 640+ Jest tests by the
+> app README's count; Playwright browser journeys that gate every pull request, plus visual and
 > accessibility suites). By Hour 24 you'll be able to _write_ a page in this codebase, not just
-> read one — and you'll have met the `Traffic allocations must sum to 100%` message twice: once
-> in the client's validator and once, verbatim, from the server (Hour 14).
+> read one — and you'll have met the same rule twice in two voices: the client's "Variant
+> allocations must add up to 100%" and the server's "Traffic allocations must sum to 100%"
+> (Hour 15).
 
 ---
 
@@ -42,8 +44,10 @@ same rhythm so you can pace yourself:
 
 Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions).
 
-> **Convention in this book.** Code blocks tagged `// 📁 path/to/file.ts` are real, current
-> Experimently source under `frontend/`. Blocks with no path are illustrative. `// ✅` marks the
+> **Convention in this book.** Code blocks tagged `// 📁 path/to/file.ts` are excerpts of real
+> Experimently source at the reference commit below — mostly under `frontend/`, some under
+> `modules/frontend/`, `backend/` or `demo/`; `...` marks lines left out. Blocks with no path
+> are illustrative. `// ✅` marks the
 > idiom we want; `// ❌` marks the anti-pattern it replaces. Have the dashboard running
 > (`make web` → `http://localhost:3100`) against a local API.
 
@@ -51,7 +55,7 @@ Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions).
 
 ## The Experimently Dashboard Creed (read this first)
 
-Six rules drive almost every decision in `frontend/src`. You'll learn the machinery behind
+Seven rules drive almost every decision in `frontend/src`. You'll learn the machinery behind
 each over the next 24 hours:
 
 1. **The API is the product; the dashboard is its first client.** Pages render what the API
@@ -66,8 +70,12 @@ each over the next 24 hours:
    service; a service is one object whose methods map to routes; `useApi` wraps a fetcher.
    → Hours 10, 14
 5. **Mirror server validation for feedback; show the server's message when they
-   disagree.** → Hour 15
-6. **`data-testid` on anything a test or a scenario runner needs to find.** Tests query by
+   disagree — except where the status alone says what happened, and then say it in the
+   page's own words with the fix.** → Hour 15
+6. **Never more permissive than the API.** Offer what the user's role (or superuser flag, or
+   installed modules) allows, mirror the API's rule exactly, and say why when a control is
+   missing. → Hours 11, 12, 16
+7. **`data-testid` on anything a test or a scenario runner needs to find.** Tests query by
    role and text first, by test id when structure would otherwise leak into the test. →
    Hours 21, 22
 
@@ -100,7 +108,7 @@ each over the next 24 hours:
 ### Part IV — Data & Forms _(Hours 14–17)_ → [`part-4-data-and-forms.md`](./part-4-data-and-forms.md)
 
 - **Hour 14** — The services layer: one object per resource
-- **Hour 15** — Forms: local state, client validation, server messages
+- **Hour 15** — Forms: one reducer, two views, server messages
 - **Hour 16** — Lists, pagination, and lifecycle actions
 - **Hour 17** — WebSockets in React: `useExperimentStream`
 
@@ -113,7 +121,7 @@ each over the next 24 hours:
 ### Part VI — Production _(Hours 21–24)_ → [`part-6-production.md`](./part-6-production.md)
 
 - **Hour 21** — Jest + React Testing Library: pages, hooks, services
-- **Hour 22** — Playwright: E2E, visual regression, accessibility
+- **Hour 22** — Playwright: browser journeys, visual regression, accessibility
 - **Hour 23** — Build, Docker, nginx, and the OpenAPI URL guard
 - **Hour 24** — Putting it together: the Experimently dashboard style guide
 
@@ -121,8 +129,11 @@ each over the next 24 hours:
 
 ## A note on accuracy
 
-The snippets here were lifted from the repository on 2026-09-11. Files move; if a path 404s,
-`git grep` the symbol (e.g. `git grep -n "export function apiFetch" frontend/src`). The
+Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased changes,
+including three breaking ones: #747, #769, #770). Of those, #747 shows up here: targeting
+rules with an unknown key are now refused with a 422 (Hour 19). Files move; if a path 404s,
+`git grep` the symbol in both dashboard trees (e.g.
+`git grep -n "export function apiFetch" -- frontend/src modules/frontend/src`). The
 _patterns_ outlast the line numbers.
 
 _Now turn to [Part I](./part-1-typescript.md) and start the clock. ⏱️_
