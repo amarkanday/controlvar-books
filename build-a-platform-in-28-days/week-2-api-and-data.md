@@ -64,7 +64,7 @@ reason about, and the codebase learned each of them the hard way:
 - **CORS is registered last, so it is the outermost layer.** Every response any inner layer
   returns — a 429 from the rate limiter above all — then carries the `Access-Control-*`
   headers a browser needs before it will let the page read the status. With CORS innermost, a
-  rate-limited login reached the dashboard as "Can't reach the API" (#85). A CORS preflight is
+  rate-limited login reached the dashboard as "Can't reach the API" (fixed in commit `2ca41c38`). A CORS preflight is
   answered by CORS itself and goes no further.
 - **The request-ID layer sits just inside CORS**, so the id is bound into the logging context
   before the other layers log anything, and a 429 still carries `X-Request-ID`.
