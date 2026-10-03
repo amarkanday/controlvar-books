@@ -109,7 +109,7 @@ require a specific order, and the class-level decorators of the standard library
 
 ```python
 # 📁 backend/app/schemas/feature_flag.py
-    @field_validator("key")
+    @field_validator("key", check_fields=False)
     @classmethod
     def validate_key(cls, v: str) -> str:
 ```
@@ -134,7 +134,7 @@ And `pytest`'s marker decorators, which attach metadata the test runner reads:
 
 ```python
 @pytest.mark.asyncio
-async def test_viewer_cannot_update_flag(...):
+async def test_viewer_cannot_create_flag(...):
 ```
 
 > **Watch Out!** A decorator without `@wraps` replaces the function's `__name__` with
@@ -240,8 +240,9 @@ is exactly the contract `with` guarantees. Written as a function with explicit
 
 ### In the wild
 
-The lock — a `@contextmanager` generator with a `try/finally` around the `yield`, defensive
-at both ends:
+The lock — a `@contextmanager` generator with a `try/finally` around the `yield`. The
+defensive work (connect, try the lock, log, close) lives in two helpers, `_acquire` and
+`_release`, so the context manager itself is the bare shape:
 
 ```python
 # 📁 backend/app/core/scheduler_lock.py
@@ -253,49 +254,61 @@ def scheduler_lock(name: str, engine: Optional[Engine] = None) -> Iterator[bool]
     Yields ``True`` when this process acquired the lock (the caller should do
     the tick), ``False`` when another session holds it or the database could
     not be reached (the caller should skip the tick).
+    ...
     """
     engine = engine or _default_engine()
-    conn: Optional[Connection] = None
-    acquired = False
+    conn, acquired = _acquire(engine, name)
     try:
-        try:
-            conn = engine.connect()
-            acquired = try_acquire(conn, name)
-        except Exception as exc:  # pragma: no cover - exercised via unit test with a bad engine
-            logger.warning("scheduler_lock(%s): could not acquire (database unavailable): %s", name, exc)
-            acquired = False
-        if acquired:
-            logger.debug("scheduler_lock(%s): acquired", name)
-        else:
-            logger.debug("scheduler_lock(%s): not acquired; skipping tick", name)
         yield acquired
     finally:
-        if conn is not None:
-            try:
-                if acquired:
-                    release(conn, name)
-                    logger.debug("scheduler_lock(%s): released", name)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("scheduler_lock(%s): release failed: %s", name, exc)
-            finally:
-                conn.close()
+        _release(conn, name, acquired)
 ```
 
-and its use — the block runs under the lock, and everything after the `with` runs after
+`_acquire` returns `(None, False)` instead of raising when the database can't be reached,
+and `_release` closes the connection in its own `finally`. Why split them out? So the same
+two functions can back an **async** version for the schedulers, which run on the event loop:
+
+```python
+# 📁 backend/app/core/scheduler_lock.py
+@asynccontextmanager
+async def async_scheduler_lock(
+    name: str, engine: Optional[Engine] = None
+) -> AsyncIterator[bool]:
+    """
+    Coroutine-friendly :func:`scheduler_lock`.
+
+    Acquire and release run in a worker thread (``asyncio.to_thread``), so an
+    unreachable database or a slow connection pool blocks only that thread,
+    never the event loop serving HTTP requests.
+    """
+    engine = engine or _default_engine()
+    conn, acquired = await asyncio.to_thread(_acquire, engine, name)
+    try:
+        yield acquired
+    finally:
+        await asyncio.to_thread(_release, conn, name, acquired)
+```
+
+`@asynccontextmanager` is `@contextmanager` for `async with`: the body may `await`, and so may
+the cleanup in `finally`. The blocking database calls are pushed to a thread with
+`asyncio.to_thread` (Hour 19), so a database that hangs blocks one worker thread, not every
+request the process is serving.
+
+And its use — the block runs under the lock, and everything after the `async with` runs after
 release:
 
 ```python
 # 📁 backend/app/core/scheduler_tick.py
-    with scheduler_lock(name, engine=engine) as acquired:
+    async with async_scheduler_lock(name, engine=engine) as acquired:
         if not acquired:
             ...
-            return TickOutcome(...)          # return inside the block: __exit__ still runs
+            return TickOutcome(...)          # return inside the block: __aexit__ still runs
 
         try:
             raw = await tick()
             ...
         except asyncio.CancelledError:
-            raise                            # exception inside the block: __exit__ still runs
+            raise                            # exception inside the block: __aexit__ still runs
         ...
 
     completed_at = datetime.now(timezone.utc)   # after release
@@ -350,18 +363,23 @@ def _ensure_schema(schema_name: str) -> None:
         conn.execute(text("COMMIT"))
 ```
 
-The test client as a context manager (running the lifespan), and `pytest.raises` — a context
-manager that _expects_ an exception:
+The test client _can_ be a context manager: `with TestClient(app) as client:` runs the app's
+lifespan (startup and shutdown) around the block. The shared fixture deliberately does not
+use it, so the lifespan — and the schedulers it starts — never run in the unit suite:
 
 ```python
 # 📁 backend/tests/conftest.py
-    with TestClient(app) as test_client:
-        yield test_client
+    # Create test client
+    test_client = TestClient(app)
+
+    yield test_client
 ```
+
+And `pytest.raises` — a context manager that _expects_ an exception:
 
 ```python
     with pytest.raises(HTTPException) as exc:
-        await deps.can_update_feature_flag(feature_flag=flag, current_user=viewer)
+        await deps.can_create_feature_flag(current_user=viewer)
     assert exc.value.status_code == 403
 ```
 
@@ -370,14 +388,15 @@ And `unittest.mock.patch` as a context manager, scoped to a block:
 ```python
 with patch("backend.app.core.permissions.check_permission", return_value=True):
     with patch("backend.app.api.deps.get_current_active_user", return_value=mock_user):
-        response = client.post(f"/api/v1/safety/rollback/{feature_flag_id}")
+        response = client.post(f"/api/v1/safety/feature-flags/{feature_flag_id}/rollback")
 ```
 
 > **Watch Out!** A `@contextmanager` generator must `yield` **exactly once**. Yielding
-> twice raises `RuntimeError: generator didn't stop`; never yielding (an exception before
-> the `yield`) raises `RuntimeError: generator didn't yield`. That second case is why
-> `scheduler_lock` catches the connect failure _before_ the `yield` and yields `False` — an
-> exception there would surface as a confusing generator error instead of a skipped tick.
+> twice raises `RuntimeError: generator didn't stop`; returning without yielding raises
+> `RuntimeError: generator didn't yield`; and an exception raised _before_ the `yield`
+> propagates out of the `with` line itself, before the block runs. That last case is why
+> `scheduler_lock`'s `_acquire` catches the connect failure and returns `False` — otherwise
+> an unreachable database would crash the tick instead of skipping it.
 
 > **Did You Know?** `with a() as x, b() as y:` opens two; Python 3.10 allows parentheses
 > across lines. `contextlib.ExitStack` opens a dynamic number. And `contextlib.suppress(FileNotFoundError)`
@@ -422,10 +441,14 @@ with scheduler_lock("scratch") as a:
         print(a, b)     # True False
 ```
 
+With no database reachable you'll see `False False` and two logged warnings instead — the
+"skip the tick" path, which is exactly what `_acquire` is for.
+
 ### Common mistakes
 
 - **Cleanup outside `finally`** in a `@contextmanager` — skipped when the block raises.
-- **Raising before the `yield`** without handling — "generator didn't yield."
+- **Raising before the `yield`** without handling — the `with` statement itself raises and
+  the block never runs.
 - **Holding a lock across an `await` or a slow call.** Copy under the lock, work outside.
 - **Opening a resource in `__init__`** and hoping someone closes it. Use `with`.
 
@@ -436,6 +459,8 @@ with scheduler_lock("scratch") as a:
   once; `@asynccontextmanager` for `async with`.
 - Locks, connections, transactions, `TestClient`, `pytest.raises`, `patch` — all `with`.
 - `scheduler_lock` yields a boolean so the caller can skip; its `finally` always releases.
+  `async_scheduler_lock` is the same shape for `async with`, with the blocking calls in
+  `asyncio.to_thread`.
 
 ---
 
@@ -637,7 +662,7 @@ convention is "naive means UTC," and `BaseModel.created_at` defaults to
 `datetime.now(timezone.utc)`, which is aware. The rollout scheduler compared a stage's
 `start_date` (naive, from the database) with `current_time` (aware): `TypeError` on the
 first active schedule, every tick, recorded as a failed run that nobody read. No rollout
-ever advanced until PR #65 added one function and used it at every comparison.
+ever advanced until commit `56c49e4f` added one function and used it at every comparison.
 
 > The fix isn't "always use aware" or "always use naive" — the columns are what they are.
 > It's **normalise at the comparison**, and know which kind every value is.
@@ -681,40 +706,77 @@ naive, consistently:
 # 📁 backend/app/services/safety_service.py
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(minutes=timeframe_minutes)
-
-        error_logs = (
-            db.query(ErrorLog)
-            .filter(ErrorLog.feature_flag_id == feature_flag_id, ErrorLog.timestamp.between(start_time, end_time))
-            .all()
+        ...
+        in_window = (
+            ErrorLog.feature_flag_id == feature_flag_id,
+            ErrorLog.timestamp.between(start_time, end_time),
+        )
+        error_count = int(
+            db.query(func.count(ErrorLog.id)).filter(*in_window).scalar() or 0
         )
 ```
 
-The client-error endpoint converting an aware client timestamp to naive UTC before storing,
-and its sibling in the event service going the other way — to an aware ISO string, because
-`events.created_at` is a text column:
+(`in_window` is a tuple of SQL conditions, and `*in_window` unpacks it into `filter`'s
+arguments — Hour 5's unpacking, used to share one filter between several queries.)
+
+The event store goes the other way. `events.created_at` is a **text** column, so every time
+window over events is a _string_ comparison — which orders correctly only if every value is
+UTC and written in one shape. One function produces that shape:
 
 ```python
-# 📁 backend/app/api/v1/endpoints/client_errors.py
-def _naive_utc(value: Optional[datetime]) -> datetime:
-    """Normalise to a naive UTC datetime (the ``error_logs.timestamp`` column is naive)."""
+# 📁 backend/app/models/event.py
+def normalize_event_timestamp(value: Any) -> str:
+    """Return ``value`` as a UTC ISO-8601 string in one canonical format.
     ...
+    Accepts a ``datetime`` or an ISO-8601 string (``Z`` or a numeric offset).
+    Raises ``ValueError`` for anything else, so an unreadable timestamp is
+    refused rather than stored and compared as text.
+    """
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        moment = datetime.fromisoformat(value.strip())
+    else:
+        raise ValueError("event timestamp must be a datetime or an ISO-8601 string")
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).isoformat()
 ```
+
+Label the naive value, convert the aware one, then format: `2026-09-11T14:03:22.118342+00:00`.
+A client that sends `2026-09-11T16:03:22+02:00` or `...Z` is stored as the same instant in the
+same shape. (`fromisoformat` accepts a trailing `Z` since Python 3.11.)
+
+And so that no writer can forget to call it, the column type calls it — a SQLAlchemy
+`TypeDecorator` that runs on every value _bound_ to the column, whether it is being written
+or compared against:
 
 ```python
-# 📁 backend/app/services/event_service.py
-def _to_iso_timestamp(value: Union[str, datetime, None]) -> str:
-    """Serialise a timestamp for the ``events.created_at`` string column."""
-    if value is None or value == "":
-        return datetime.now(timezone.utc).isoformat()
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.isoformat()
-    return str(value)
+# 📁 backend/app/models/event.py
+class UTCTimestampString(TypeDecorator):
+    """A ``String`` column whose bound values are normalised to UTC.
+    ...
+    """
+
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return normalize_event_timestamp(value)
 ```
 
-`2026-09-11T14:03:22.118342+00:00` — always with the offset, so the strings sort correctly
-and parse back to aware values. The daily results code builds aware range bounds from ISO
+`Event.created_at >= boundary` binds `boundary` through this type, so a window edge given as
+an aware `datetime` is compared in the same format as the stored strings. The event service's
+own helper now just delegates (`_to_iso_timestamp` calls `normalize_event_timestamp`).
+
+The client-error endpoint takes the third way out: it does not trust the client's clock at all.
+Rows in `error_logs` are timed by the server on receipt, with
+`datetime.now(timezone.utc).replace(tzinfo=None)` (naive UTC, because that column is naive),
+and a `timestamp` the client sent is kept in the row's metadata as `client_timestamp`.
+
+The daily results code builds aware range bounds from ISO
 strings:
 
 ```python
@@ -723,23 +785,54 @@ strings:
                 date_end = datetime.fromisoformat(f"{date}T23:59:59+00:00")
 ```
 
-A validator that compares with the clock, aware on both sides because Pydantic parses an
-ISO string with an offset into an aware value:
+A validator that compares with the clock — and a schedule that can be written in a local zone.
+`ScheduleConfig` takes an IANA `time_zone` (default `"UTC"`); a date sent _without_ an offset is
+read as wall-clock time in that zone and converted to UTC before anything compares it:
 
 ```python
 # 📁 backend/app/schemas/experiment.py
     @field_validator("start_date")
     @classmethod
     def validate_start_date(cls, v: Optional[datetime]) -> Optional[datetime]:
-        """Validate that start_date is in the future if provided."""
-        if v and v < datetime.now(timezone.utc) - timedelta(minutes=10):  # Allow small buffer
+        """Validate that start_date is in the future if provided.
+
+        A date without an offset is checked in ``validate_dates``, once it has
+        been read in ``time_zone``.
+        """
+        if (
+            v
+            and v.tzinfo is not None
+            and v < datetime.now(timezone.utc) - timedelta(minutes=10)
+        ):  # Allow small buffer
             raise ValueError("Start date must be in the future")
         return v
+    ...
+    @model_validator(mode="after")
+    def validate_dates(self) -> "ScheduleConfig":
+        ...
+        zone = _zone(self.time_zone)
+        naive_start = self.start_date is not None and self.start_date.tzinfo is None
+        for name in ("start_date", "end_date"):
+            value = getattr(self, name)
+            if value is not None and value.tzinfo is None:
+                # Only a field the request carried can be naive, so this
+                # assignment does not mark an omitted field as set.
+                setattr(self, name, value.replace(tzinfo=zone).astimezone(timezone.utc))
+
+        if naive_start and self.start_date < datetime.now(timezone.utc) - timedelta(
+            minutes=10
+        ):  # Allow small buffer
+            raise ValueError("Start date must be in the future")
+        ...
 ```
 
-(A client sending `"2026-09-12T09:00:00"` — no offset — produces a naive `v`, and this
-comparison raises `TypeError` inside the validator. The API's docs say UTC with `Z`; the
-dashboard sends it that way. It's a latent version of the same bug.)
+Three time ideas in one schema: the field validator compares only values that are already
+aware (`v.tzinfo is not None`); the model validator (which runs after every field is parsed)
+_labels_ a naive date with a `zoneinfo.ZoneInfo` zone and _converts_ it to UTC; and only then
+compares it with the clock. `_zone("UTC")` returns `timezone.utc`, so the default works even
+on a machine with no zone database. (An earlier version compared a possibly naive `v` with
+an aware "now" directly — a client sending `"2026-09-12T09:00:00"` got a `TypeError` inside
+the validator, the rollout bug in miniature. The time-zone field was the fix.)
 
 Reproducibility buckets by calendar day — `date` vs `datetime`, and UTC conversion before
 taking the date:
@@ -779,8 +872,9 @@ Monotonic time for durations and windows — never wall-clock, which can jump:
 
 > **Did You Know?** ISO-8601 strings with offsets sort lexicographically in time order
 > _as long as they're all UTC with the same precision_ — which is why `events.created_at`
-> as a string column works at all, and why `_to_iso_timestamp` insists on `+00:00`. A
-> single `Z`-suffixed or offset-shifted value would break the ordering.
+> as a string column works at all, and why `normalize_event_timestamp` insists on `+00:00`.
+> A single `Z`-suffixed or offset-shifted value would break the ordering — which is why the
+> normalisation moved into the column type, where no writer can skip it.
 
 ### Try It Yourself
 
@@ -879,9 +973,12 @@ first variant in `order` with a positive weight, reusing the tolerant parsing id
 naive datetime, an aware datetime, or an ISO string, and return the requested kind; test
 with `"2026-09-11T14:00:00+02:00"`.
 
-**E4.5 — Find the latent bug.** `ScheduleConfig.validate_start_date` compares `v` with
-`datetime.now(timezone.utc)`. Describe the input that makes it raise `TypeError`, and write
-the one-line change that makes the validator robust to it.
+**E4.5 — The fixed bug.** An earlier `ScheduleConfig.validate_start_date` compared `v` with
+`datetime.now(timezone.utc)` unconditionally. Describe the input that made it raise
+`TypeError`, name the two changes the current `ScheduleConfig` makes so it can't, and write
+`to_utc(value: datetime, zone_name: str) -> datetime` that reads a naive value in an IANA
+zone and converts it to aware UTC (an aware value keeps its instant). Check it with
+`datetime(2030, 9, 12, 9, 0)` in `"America/Los_Angeles"`.
 
 ---
 
@@ -977,10 +1074,27 @@ to_naive_utc("2026-09-11T14:00:00+02:00")   # 2026-09-11 12:00:00        — con
 ```
 
 **S4.5** — An ISO string with no offset (`"2026-09-12T09:00:00"`) parses to a naive `v`;
-`v < datetime.now(timezone.utc)` then raises `TypeError` inside the validator, which Pydantic
-reports as a validation error with a confusing message. Fix: normalise first —
-`if v and _as_utc(v) < datetime.now(timezone.utc) - timedelta(minutes=10):` — reusing (or
-copying) the rollout scheduler's helper, so a naive input is treated as UTC by convention.
+`v < datetime.now(timezone.utc)` then raised `TypeError` — not a `ValueError`, so Pydantic did
+not turn it into a tidy validation error. The current schema (1) has the field validator
+compare only aware values (`v.tzinfo is not None`), and (2) adds a `time_zone` field and a
+`model_validator(mode="after")` that reads naive dates in that zone, converts them to UTC,
+and only then compares with the clock.
+
+```python
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+def to_utc(value: datetime, zone_name: str) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo(zone_name))   # label: wall-clock time there
+    return value.astimezone(timezone.utc)                    # convert
+
+to_utc(datetime(2030, 9, 12, 9, 0), "America/Los_Angeles")
+# datetime.datetime(2030, 9, 12, 16, 0, tzinfo=datetime.timezone.utc)
+```
+
+Same label-then-convert pair as `_as_utc`, with the zone as a parameter instead of "UTC by
+convention."
 
 ---
 

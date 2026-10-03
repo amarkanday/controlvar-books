@@ -7,7 +7,8 @@
 > type hints, dataclasses, generators, context managers, `async`, threads, hashing, testing.
 > This book is different. Every concept is taught **twice**: once in the abstract, and once
 > with a real snippet pulled from the **Experimently** backend (an A/B-testing and
-> feature-flag platform, ~66,000 lines of typed Python 3.11, 5,800+ tests). By Hour 24 you
+> feature-flag platform: about 70,000 lines of type-hinted Python 3.11 in `backend/app`, some
+> 16,000 tests). By Hour 24 you
 > won't just _know_ Python — you'll know how a disciplined team uses it to run a service
 > where a single naive `datetime` once stopped every rollout in production (you'll meet that
 > bug in Hour 17), and where a method that didn't exist silently ran for months (Hour 1).
@@ -53,8 +54,10 @@ Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lo
 Six rules drive almost every Python decision in this repo. You'll learn the machinery behind
 each over the next 24 hours; keep them in view as your North Star:
 
-1. **Python 3.11, type hints on every signature.** Not decoration — `mypy` runs in CI, and
-   the hints are how Pydantic and FastAPI know what a request means. → Hour 12
+1. **Python 3.11, type hints on every signature.** Not decoration — the hints are how
+   Pydantic and FastAPI know what a request means, and what `mypy` reads when you run it.
+   (`mypy` is configured in `pyproject.toml` but no CI gate runs it; ruff and the tests are
+   what CI enforces.) → Hours 12, 24
 2. **Fully qualified imports, always.** `from backend.app.models.metrics.metric import RawMetric`
    — never `from app.…`, never relative. Two spellings of one module produce two classes and
    a runtime error. → Hour 9
@@ -118,8 +121,12 @@ each over the next 24 hours; keep them in view as your North Star:
 
 ## A note on accuracy
 
-The snippets here were lifted from the repository on 2026-09-11. Files move; if a path 404s,
-`git grep` the symbol (e.g. `git grep -n "def _hash_user_to_variant"`). The _patterns_
-outlast the line numbers.
+Verified against getexperimently/experimently at `2fe9da1e` (2026-10-03; 0.17.0 plus
+unreleased changes). Snippets tagged `# 📁` were re-checked against that commit; where a
+snippet leaves lines out it says so with `...`. Counts were measured there: lines with
+`wc -l` over `backend/app` (69,840; `modules/backend/app` adds 21,532), tests with
+`pytest --collect-only -q` (16,302: 13,227 under `backend/tests`, 3,075 under
+`modules/backend/tests`). Files move; if a path 404s, `git grep` the symbol (e.g.
+`git grep -n "def _hash_user_to_variant"`). The _patterns_ outlast the line numbers.
 
 _Now turn to [Part I](./part-1-getting-started.md) and start the clock. ⏱️_
