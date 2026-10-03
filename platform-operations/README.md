@@ -4,16 +4,23 @@
 
 > **Preface.** This is a **specialization** book. The core four books teach you how
 > Experimently is built; this one teaches you how it _runs_ — on your laptop, in a Docker
-> Compose stack a customer can self-host, and on AWS behind an ALB with blue/green deploys —
-> and how you know it's healthy, what you look at when it isn't, and how a change gets from
-> a pull request to production without anyone holding their breath. Every piece of it is real:
-> the `docker-compose.yml` with its profiles and seeds, the two Dockerfiles and the entrypoint
-> that waits for Postgres and bootstraps the schema, fourteen CDK stacks, the structured-log
-> and Prometheus wiring, the five background schedulers and their advisory locks, the CI
-> gates, the production deploy workflow with its canary and its migration task, and the
-> rollback runbook. Read this if you'll be on call, if you'll deploy, if you'll set up a
+> Compose stack or a Helm release a customer can self-host, and on AWS behind an ALB with
+> blue/green deploys — and how you know it's healthy, what you look at when it isn't, and
+> how a change gets from a pull request to production without anyone holding their breath.
+> Every piece of it is real: the development `docker-compose.yml` with its profiles and seeds,
+> the production compose file and the Helm chart that run the published images, the two
+> Dockerfiles with their `core` and `full` targets, the entrypoint that checks its
+> configuration, waits for Postgres and bootstraps the schema (everywhere but AWS, where a
+> one-shot migration task is the only schema writer), nine CDK stacks (twelve with the
+> optional modules), the structured-log and Prometheus wiring, the five background schedulers
+> and their advisory locks, the CI gates, release-please and the signed release images, the
+> one `Deploy` workflow with its canary and its migration task, and the `Rollback` workflow
+> and runbook. Read this if you'll be on call, if you'll deploy, if you'll set up a
 > customer's self-hosted instance, or if you'll touch anything under `infrastructure/`,
-> `.github/workflows/` or `backend/app/core/health.py`.
+> `charts/`, `deploy/compose/`, `.github/workflows/` or `backend/app/core/health.py`.
+>
+> Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
+> changes, including three breaking ones: #747, #769, #770).
 
 ---
 
@@ -49,14 +56,14 @@ account.
 
 ### Part I — The Local and Self-Hosted Stack _(Hours 1–3)_ → [`part-1-local-stack.md`](./part-1-local-stack.md)
 
-- **Hour 1** — Docker Compose: services, profiles, health, and the `.env` contract
-- **Hour 2** — The images: two multi-stage Dockerfiles and the nginx single-origin trick
-- **Hour 3** — The entrypoint: wait, bootstrap, seed, hand over — and the Makefile
+- **Hour 1** — Docker Compose: services, profiles, health, and the `.env` contract; the production compose file and the Helm chart
+- **Hour 2** — The images: two multi-stage Dockerfiles (`core` and `full`) and the nginx single-origin trick
+- **Hour 3** — The entrypoint: check, wait, bootstrap, seed, hand over — and the Makefile
 
 ### Part II — AWS _(Hours 4–6)_ → [`part-2-aws.md`](./part-2-aws.md)
 
-- **Hour 4** — The CDK app: fourteen stacks and the order they depend on
-- **Hour 5** — Serving traffic: Fargate, ALB, blue/green with CodeDeploy, auto-scaling, secrets
+- **Hour 4** — The CDK app: nine stacks (twelve with the modules) and the order they depend on
+- **Hour 5** — Serving traffic: two services, one load balancer, blue/green for the API
 - **Hour 6** — Data services: Aurora, ElastiCache, DynamoDB, Kinesis → Firehose → S3 → Glue, OpenSearch
 
 ### Part III — Observability _(Hours 7–9)_ → [`part-3-observability.md`](./part-3-observability.md)
@@ -68,8 +75,8 @@ account.
 ### Part IV — Release Engineering _(Hours 10–12)_ → [`part-4-release-engineering.md`](./part-4-release-engineering.md)
 
 - **Hour 10** — CI: the PR QA gate, the release gate, security scans, and what "required" means
-- **Hour 11** — Deploying to production: tags, the release-gate check, the migration task, the canary
-- **Hour 12** — Rollback, secrets and drills: the decision tree, the two rollback methods, `/prod/experimentation/*`
+- **Hour 11** — From merge to production: release-please, signed images, and the Deploy workflow
+- **Hour 12** — Rollback, secrets and backups: the decision tree, what rolls back by itself, the Rollback workflow
 
 ---
 

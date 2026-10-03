@@ -114,8 +114,9 @@ The switch lives in `main.py` and reads `LOG_FORMAT`:
 # LOG_FORMAT=console -> coloured console output
 ```
 
-with compose defaulting to `console` and the Fargate task definition's environment leaving
-it to the production default — JSON. A production line looks like:
+with compose defaulting to `console` (`LOG_FORMAT: ${LOG_FORMAT:-console}`) and the Fargate
+task definition not setting it at all. Unset, `LOG_FORMAT` is `None`, which means JSON in
+staging and production and console everywhere else. A production line looks like:
 
 ```json
 {"event": "Assigned user u-123 to variant 7c1… in experiment 3f2a…", "service": "experimentation-platform", "logger": "backend.app.services.assignment_service", "level": "info", "timestamp": "2026-09-11T14:02:07.312Z", "request_id": "5e0b4c2a-…", "path": "/api/v1/tracking/assign", "method": "POST"}
@@ -216,7 +217,9 @@ Routes (all unauthenticated, none in the OpenAPI schema):
     reported but only fails readiness when ``REDIS_REQUIRED=true`` (the
     application degrades gracefully without Redis: rate limiting falls back to
     memory, caching is skipped). Disk space below 1 GB is reported as ``low``.
-    Returns 200 when ready, 503 otherwise.
+    The profile the process runs (``core`` or ``full``) is reported as
+    ``profile`` and in ``checks.modules``, and never gates readiness. Returns
+    200 when ready, 503 otherwise.
 
 ``GET /health``
     Alias of ``/health/ready`` kept for the existing ALB/ECS/CDK wiring.
@@ -239,15 +242,24 @@ def readiness_payload() -> tuple[Dict[str, Any], int]:
         "database": check_database(),
         "redis": check_redis(),
         "disk": check_disk(),
+        "modules": check_modules(),
     }
 
+    # The modules check is deliberately not part of ``ready``: see
+    # :func:`check_modules`.
     ready = checks["database"]["status"] == "healthy"
     if checks["redis"]["status"] != "healthy" and redis_required():
         ready = False
     if checks["disk"]["status"] == "unhealthy":
         ready = False
 
-    body: Dict[str, Any] = {"status": "healthy" if ready else "unhealthy", "timestamp": _timestamp()}
+    body: Dict[str, Any] = {
+        "status": "healthy" if ready else "unhealthy",
+        "timestamp": _timestamp(),
+        # Which profile is serving, in every environment: an operator reading
+        # a production probe should not have to call a route to find out.
+        "profile": checks["modules"]["profile"],
+    }
 
     if not is_production():
         # Details (errors, latencies, environment) only outside production.
@@ -260,9 +272,18 @@ def readiness_payload() -> tuple[Dict[str, Any], int]:
     return body, (200 if ready else 503)
 ```
 
+The fourth check, `modules`, reports which build profile is serving (`core`, or `full` when
+the optional modules registered) and whether a found `modules` package failed to install.
+It is **reported, never gated**: a degraded profile still serves every core route, and
+outside development and test the API refuses to start in that state anyway. The top-level
+`profile` field is in the body in every environment, production included, so "which build
+is this?" is one unauthenticated `curl` away.
+
 The database check uses a session from the _application pool_ — so it fails when the pool
 is exhausted, which is a real "can't serve" condition, not just when Postgres is down. The
-Redis check uses a one-second connect timeout so a hung Redis can't make readiness itself
+Redis check builds its client with the same factory the rest of the application uses, so it
+honours `REDIS_SSL` (on AWS the ElastiCache group requires TLS) exactly as the real
+connections do, and it uses one-second timeouts so a hung Redis can't make readiness itself
 hang past the ALB's timeout:
 
 ```python
@@ -270,17 +291,17 @@ hang past the ALB's timeout:
 def check_redis() -> Dict[str, Any]:
     """``PING`` Redis using the connection settings."""
     try:
-        import redis as redis_lib
+        from backend.app.core.redis_client import create_redis_client
 
         t0 = time.perf_counter()
-        client = redis_lib.Redis(
-            host=str(settings.REDIS_HOST),
-            port=int(settings.REDIS_PORT),
-            password=settings.REDIS_PASSWORD or None,
-            db=int(settings.REDIS_DB or 0),
-            socket_connect_timeout=1,
-            socket_timeout=1,
-        )
+        client = create_redis_client(socket_connect_timeout=1, socket_timeout=1)
+        try:
+            client.ping()
+        finally:
+            try:
+                client.close()
+            except Exception:  # pragma: no cover - best effort
+                pass
 ```
 
 Where each probe is consumed — the contract table:
@@ -304,7 +325,9 @@ def metrics_access(request: Request) -> Optional[JSONResponse]:
     expected = metrics_token()
     if expected:
         presented = _presented_token(request)
-        if not presented or not hmac.compare_digest(presented, expected):
+        if not presented or not hmac.compare_digest(
+            presented.encode("utf-8"), expected.encode("utf-8")
+        ):
             return JSONResponse({"detail": "Invalid or missing metrics token"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
         return None
 
@@ -314,7 +337,10 @@ def metrics_access(request: Request) -> Optional[JSONResponse]:
     return JSONResponse({"detail": "The /metrics endpoint requires METRICS_TOKEN outside development"}, status_code=403)
 ```
 
-Fail closed: no token in production means 403, not open. The same rule the config
+Fail closed: no token in production means 403, not open. The comparison is on **bytes**:
+Starlette decodes headers as latin-1, and `hmac.compare_digest` raises `TypeError` on a
+non-ASCII `str`, so comparing strings would turn a junk header into a 500 from an
+unauthenticated endpoint instead of a 401. The same rule the config
 validators apply to `SECRET_KEY` and `DEV_AUTH_BYPASS` (Build book Day 9).
 
 What's exposed — the metric registry, with the platform-specific counters that make the
@@ -360,7 +386,10 @@ small cardinality.
 
 **What to graph.** The platform ships two CloudWatch dashboards
 (`infrastructure/cloudwatch/*.json`, deployed by `deploy-dashboards.sh`) and a CDK one in
-the monitoring stack. The four graphs an on-call engineer actually looks at, in order:
+the monitoring stack. Be aware that the CDK dashboard's widgets still graph API Gateway,
+Lambda and DynamoDB metrics from the original architecture that nothing deployed publishes
+today, so those panels stay empty; the alarms (Hour 9) were cleaned up, the dashboards were
+not. The four graphs an on-call engineer actually looks at, in order:
 
 1. `http_requests_total` by status, rate over 1 min — the 5xx line is the pager.
 2. `http_request_duration_seconds` p99 by endpoint — `/tracking/assign` and
@@ -368,15 +397,20 @@ the monitoring stack. The four graphs an on-call engineer actually looks at, in 
 3. `scheduler_last_success_timestamp{name}` — `time() − value` per scheduler; > 2 × the
    scheduler's interval means a stuck or crash-looping loop (Hour 9).
 4. `rate_limit_rejections_total` rate — a spike is either an abusive client or an SDK
-   misconfiguration (usually a server-side SDK with the cache disabled).
+   misconfiguration (usually a server-side SDK with the cache disabled). The limits it
+   counts are per client IP: SDK paths share `SDK_RATE_LIMIT_PER_MINUTE` (6,000/min by
+   default), exports share 10/min, auth endpoints have strict per-route limits, and
+   everything else gets 300/min (`resolve_rate_limit()` in
+   `backend/app/middleware/rate_limiter.py`).
 
 > **Watch Out!** `/health` is the alias the ALB uses, and it's _readiness_. If you ever
 > change the ALB target group to `/health/live` "to stop flapping during a DB blip," you
 > will route traffic to tasks that can't serve it. The flapping is the system working.
 > Fix the blip, or raise `unhealthy_threshold_count`; don't lie to the load balancer.
 
-> **Did You Know?** `check_disk` reports `low` under 1 GB and `unhealthy` when the disk is
-> full — and full disks are the classic way a healthy-looking process stops writing logs
+> **Did You Know?** `check_disk` reports `low` under 1 GB of free space (and `unhealthy`
+> only when it cannot read the disk at all) — `low` does not fail readiness, it is a
+> warning in the body. Full disks are the classic way a healthy-looking process stops writing logs
 > and audit rows. Fargate ephemeral storage is 20 GB by default and the image writes little,
 > but a self-hosted VM with Postgres on the same disk is exactly where this check has earned
 > its keep.
@@ -403,8 +437,10 @@ Then hit `/api/v1/experiments/<uuid>` a few times and confirm the metric label i
 - Liveness (`/health/live`, no dependencies) for the container runtime; readiness
   (`/health/ready` = `/health`, DB required, Redis if `REDIS_REQUIRED`, disk) for the ALB
   and compose; details redacted in production.
-- `/metrics` fails closed: token required outside development (`hmac.compare_digest`),
-  `METRICS_ENABLED=false` → 404.
+- `/metrics` fails closed: token required outside development (`hmac.compare_digest` on
+  bytes), `METRICS_ENABLED=false` → 404.
+- Readiness also reports `profile` (`core`/`full`) and a `modules` check, in every
+  environment; neither gates readiness.
 - Labels are normalised (`{id}`, bucketed event types) to keep cardinality bounded.
 - Graph 5xx rate, hot-path p99, scheduler staleness, rate-limit rejections.
 
@@ -420,8 +456,9 @@ rates → rollback), bandit (recompute weights). They are the only work that hap
 request, which makes them both the most important thing to monitor and the easiest to lose
 track of: a stuck scheduler produces no errors, just an absence.
 
-Three guarantees, from one shared runner. **Single runner per tick**: with three Fargate
-tasks (Hour 5), each tick must run once, not three times — a PostgreSQL advisory lock keyed
+Three guarantees, from one shared runner. **Single runner per tick**: with several API
+tasks (two in staging, three in production, Hour 5), each tick must run once, not once per
+task — a PostgreSQL advisory lock keyed
 by the scheduler's name decides who. **Run history**: every executed tick is persisted, so
 "when did the safety monitor last succeed?" is a query, not a guess. **Prometheus signal**:
 the three scheduler metrics from Hour 8. On top of those sit the health endpoint, the
@@ -552,33 +589,103 @@ applied here too — a naive timestamp read back from the database compared with
 `now()` would raise.) `GET /api/v1/scheduler/health` returns all five; the admin UI renders
 it, and it's the thing to check first when "experiments aren't starting on schedule."
 
-**Alarms.** The monitoring stack wires CloudWatch alarms to an SNS topic with an email
-subscription; the ones that exist today are the original architecture's (API Gateway 5xx,
-assignment Lambda errors, DynamoDB throttling) — the ECS/ALB-era alarms are the gap you'd
-fill first:
+**Alarms.** Every CloudWatch alarm the stacks create publishes to one SNS topic,
+`experimentation-alerts-<env>`, and that topic has exactly one email subscriber: the address
+in **`ALARM_EMAIL`**, read by `app.py` at synth time and never written in code:
+
+```python
+# 📁 infrastructure/cdk/stacks/alarm_email.py
+#: The environments that refuse to synthesise without ``ALARM_EMAIL``.
+ALARM_EMAIL_REQUIRED = frozenset({"staging", "prod"})
+
+#: The documentation domains (RFC 2606). Mail to them goes nowhere.
+EXAMPLE_DOMAINS = ("example.com", "example.net", "example.org")
+
+
+def resolve_alarm_email(value: str | None, env_name: str) -> str | None:
+    """The address to subscribe, ``None`` for no subscription, or ``ValueError``."""
+    if value is None or not value.strip():
+        if env_name in ALARM_EMAIL_REQUIRED:
+            raise _refuse(env_name, f"is required in {env_name} and is not set")
+        return None
+```
+
+In staging and prod, synth refuses to run without it; in dev and demo, no value means no
+subscription at all rather than a placeholder that mails nobody. Any value given is checked
+with plain string rules (one `@`, a dotted domain, no whitespace, at most 254 characters),
+and an address at `example.com`, `example.net` or `example.org` is refused — the topic's
+only subscriber used to be the literal `alerts@example.com`, so every alarm, automatic
+rollbacks included, told nobody. One step no code can do for you: **SNS mails the address a
+confirmation link, and until the recipient confirms it no alarm reaches them.** Confirming
+the subscription is part of standing up an environment, not an afterthought.
+
+The monitoring stack's own alarms watch the data services, each built from a metric a
+deployed resource actually publishes:
 
 ```python
 # 📁 infrastructure/cdk/stacks/monitoring_stack.py
-        self.alerts_topic = sns.Topic(self, "AlertsTopic", ...)
-        ...sns_subscriptions.EmailSubscription("alerts@example.com")
-        ...
-        api_5xx_alarm = cloudwatch.Alarm(
+        aurora_cpu_alarm = cloudwatch.Alarm(
             self,
-            "Api5xxAlarm",
-            metric=cloudwatch.Metric(namespace="AWS/ApiGateway", metric_name="5XXError", dimensions_map={"ApiName": "ExperimentationApi"}, statistic="Sum", period=Duration.minutes(1)),
-            evaluation_periods=1,
-            threshold=5,
+            "AuroraCpuAlarm",
+            metric=cloudwatch.Metric(
+                namespace="AWS/RDS",
+                metric_name="CPUUtilization",
+                dimensions_map={
+                    "DBClusterIdentifier": aurora_cluster_identifier,
+                    "Role": "WRITER",
+                },
+                statistic="Average",
+                period=Duration.minutes(5),
+            ),
+            evaluation_periods=3,
+            threshold=80,
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-            alarm_description="API Gateway is returning 5XX errors",
-            alarm_name="ExperimentationApi5xxErrors",
+            treat_missing_data=cloudwatch.TreatMissingData.BREACHING,
+            alarm_name="AuroraHighCPU" + suffix,
         )
-        api_5xx_alarm.add_alarm_action(cloudwatch_actions.SnsAction(self.alerts_topic))
+
+        aurora_cpu_alarm.add_alarm_action(
+            cloudwatch_actions.SnsAction(self.alerts_topic)
+        )
 ```
 
-The alarms the rollback runbook's decision tree (Hour 12) actually keys on — ALB 5xx rate >
-5%, p99 > 5 s, unhealthy host count — belong on `AWS/ApplicationELB` and `AWS/ECS` metrics,
-plus a `scheduler_last_success_timestamp` staleness alarm if the Prometheus metrics are
-shipped to CloudWatch. Exercise E3.4 is writing them.
+Missing data is **breaching**: a writer that publishes no CPU metric is not a healthy one.
+The same shape gives one `RedisHighCPU-00N-<env>` alarm per Redis node (engine CPU ≥ 80%),
+and, in a full-profile deployment only, `KinesisProcessingDelay-<env>` on the events
+stream's iterator age (≥ 5 minutes). The alarms that used to live here — API Gateway 5xx,
+assignment-Lambda errors, DynamoDB throttling on a literal table name — watched resources
+nothing deploys and sat in `INSUFFICIENT_DATA` for ever; they were removed.
+
+The alarms that matter most for the API are in the Fargate stack, on the load balancer's
+metrics, because that is where the API's traffic is:
+
+| Alarm | Fires when | What it does |
+|---|---|---|
+| `experimentation-api-5xx-blue-<env>`, `…-green-<env>` | in a minute, ≥ 5 target 5xx **and** ≥ 5% of that target group's requests; 2 of 3 minutes | emails the topic **and** is in the CodeDeploy deployment group: while either is in ALARM, a deployment stops and rolls back (Part IV) |
+| `experimentation-api-healthy-blue-<env>`, `…-green-<env>` | that target group has had no healthy target for 3 minutes | nothing on its own — between deployments the idle colour is empty, so one of the two is always in ALARM by design |
+| `experimentation-api-no-healthy-task-<env>` (composite) | **both** healthy alarms are in ALARM | emails: every API request is being answered 503 by the load balancer |
+| `experimentation-api-error-logs-<env>` | ≥ 10 log lines containing `ERROR` from the API's tasks in 5 minutes | emails |
+
+```python
+# 📁 infrastructure/cdk/stacks/fargate_service_stack.py
+API_5XX_EXPRESSION = "IF(FILL(e,0) >= 5, FILL(e,0)/r, 0)"
+API_5XX_RATE_THRESHOLD = 0.05
+```
+
+Three details make these honest. The 5xx alarms count **target** 5xx only
+(`HTTPCode_Target_5XX_Count`): the load balancer's own 502/503/504 have no target-group
+dimension, which is exactly why the no-healthy-task composite exists — with no task behind
+it, the ALB answers 503 itself and the 5xx alarms see nothing. An idle target group's
+missing data is not breaching, so it never pages. And one alarm per colour, because
+CodeDeploy swaps blue and green on every deployment: an alarm on one group would watch the
+wrong one half the time. The thresholds are starting values, to be measured against real
+traffic; and how the alarms behave during the hour after a traffic shift, or when one is
+already in ALARM before a shift is approved, is the intended design but has not yet been
+observed in a real account.
+
+Mapped to the rollback runbook's decision tree (Hour 12): the 5xx-rate box is the 5xx
+alarms, "crash loops" is the no-healthy-task composite. What is still **not** alarmed:
+p99 latency (`TargetResponseTime`) and scheduler staleness — Exercise E3.4.
 
 **Notifications** are the platform telling _people_ what it did. `NotificationService`
 fans out to Slack (Block Kit), email (SendGrid, SMTP fallback) and webhooks, logs every
@@ -614,12 +721,21 @@ Slack post must never fail a safety rollback. The StreamPulse rollout story (Bui
 Day 21) is the demo of this loop end to end: rollout advances → Slack; error rate spikes →
 safety rollback → Slack.
 
-> **Watch Out!** `is_running` is "activity in the last 30 minutes." The safety and rollout
-> schedulers default to 15-minute cadences (and the demo sets them to 1), so a healthy
-> scheduler is always "running"; but the metrics scheduler's cadence is longer — check its
-> interval before reading `is_running: false` as an incident. The Prometheus gauge
+> **Watch Out!** `is_running` is "activity in the last 30 minutes." The default cadences
+> are `SAFETY_CHECK_INTERVAL_MINUTES=5`, `BANDIT_UPDATE_INTERVAL_MINUTES=5`,
+> `ROLLOUT_CHECK_INTERVAL_MINUTES=15` and `EXPERIMENT_SCHEDULER_INTERVAL_MINUTES=15` (the
+> metrics scheduler also runs every 15), and the demo sets safety and rollout to 1 — so a
+> healthy scheduler is always "running". Raise any interval above 30 and `is_running: false`
+> becomes normal between ticks. `EXPERIMENT_SCHEDULER_INTERVAL_MINUTES` refuses a value below
+> 1, because 0 would make the loop spin without sleeping. The Prometheus gauge
 > (`time() − scheduler_last_success_timestamp`) with a per-scheduler threshold is the
 > precise version.
+
+> **Did You Know?** The experiment scheduler activates and completes each due experiment
+> inside its own savepoint (`db.begin_nested()`). One row the database refuses is rolled back
+> on its own, counted in `items_failed`, and the rest of the tick still goes through — the
+> run is recorded as `partial` when others succeeded. Before that, one bad experiment undid the whole
+> tick, and every other experiment due that minute waited for the next one.
 
 > **By the Way** — `settings.is_test` skips the schedulers entirely in the test profile
 > (Build book Day 8). That's why an integration test never sees a scheduler tick, why
@@ -640,8 +756,11 @@ curl -s -H 'Authorization: Bearer s3cret' localhost:8000/metrics | grep schedule
 docker compose exec postgres psql -U postgres -d experimentation -c "SELECT pg_advisory_lock(hashtext('experimently.scheduler.safety')); SELECT pg_sleep(120);" &
 ```
 
-Then enable Slack with a test token (`SLACK_ENABLED=true SLACK_BOT_TOKEN=...`) and call
-`POST /api/v1/scheduler/notify/test` (superuser) to see a delivery-log row appear.
+Then set `NOTIFICATION_WEBHOOK_URL` to a request bin and call
+`POST /api/v1/scheduler/notify/test` as a superuser: it posts a test event to that webhook
+and answers `{"status": "sent" | "failed" | "skipped", ...}` (`skipped` when no webhook URL
+is configured). It tests the webhook channel only; Slack and email are exercised by a real
+safety rollback or rollout advance.
 
 ### Key takeaways
 
@@ -650,8 +769,12 @@ Then enable Slack with a test token (`SLACK_ENABLED=true SLACK_BOT_TOKEN=...`) a
   / partial / failed` to `scheduler_runs`, three Prometheus metrics, re-raise on error.
 - `GET /api/v1/scheduler/health`: running (30-minute window), last status, consecutive
   failures; the staleness gauge is the precise signal.
-- CloudWatch alarms → SNS exist for the original Lambda/API-Gateway surface; ALB/ECS/
-  scheduler alarms are the ones to add.
+- Every alarm goes to `experimentation-alerts-<env>`, whose one subscriber is
+  `ALARM_EMAIL` — required in staging and prod, placeholder domains refused, and silent
+  until the recipient confirms the SNS subscription.
+- Alarms that exist: Aurora writer CPU, Redis CPU per node, Kinesis lag (full profile), the
+  API's per-colour 5xx alarms (which also roll a deployment back), the no-healthy-task
+  composite, and the ERROR-log alarm. Still to add: p99 latency and scheduler staleness.
 - Notifications (Slack/email/webhook) are opt-in, logged, and never allowed to fail the
   action they announce.
 
@@ -686,6 +809,12 @@ the lock mid-tick and lets a second replica start the same work.
 Yes — notifications are best-effort and logged; check `notification_delivery_log` for the
 `failed` row and its `error_message` (usually `SLACK_ENABLED` false or a bad token).
 
+**Q7. Staging was deployed, an alarm fired, and nobody got an email. Name two causes.**
+`ALARM_EMAIL`'s SNS subscription was never confirmed (SNS sends nothing to an unconfirmed
+address), or the alarm was one of the per-colour `experimentation-api-healthy-*` alarms,
+which have no action by design — only the `no-healthy-task` composite emails. (An unset
+`ALARM_EMAIL` is not a cause in staging: synth refuses to run without it.)
+
 **Quiz.** Which one line in `metrics.py` prevents a per-experiment time series for HTTP
 requests, and which counter deliberately _does_ have one?
 → `normalize_path` (`/{id}`) in the middleware for `http_requests_total`;
@@ -709,10 +838,14 @@ rate over 1 h."
 where the distributed rate limiter protects a public SDK endpoint behind an ALB with 3–10
 tasks; state what breaks in each failure mode.
 
-**E3.4 — The missing alarms.** Write CDK for three alarms on the Fargate/ALB surface —
-`HTTPCode_Target_5XX_Count` ≥ 5% of `RequestCount` over 2 minutes, `TargetResponseTime` p99
-> 5 s, `UnHealthyHostCount` ≥ 1 for 3 periods — wired to the existing SNS topic; plus a
-staleness alarm expression on `scheduler_last_success_timestamp` if shipped to CloudWatch.
+**E3.4 — The alarms still missing.** The Fargate stack already alarms on the API's 5xx
+rate per target group, on no healthy task, and on ERROR log lines (Hour 9). Add what the
+rollback runbook's decision tree still has no alarm for: `TargetResponseTime` p99 > 5 s for
+3 of 5 minutes, on **each** target group (say why one alarm on the load balancer as a whole
+would not do), wired to the existing topic with an ALARM action only; and a scheduler
+staleness alarm on `scheduler_last_success_timestamp{name="safety"}` if the Prometheus
+metrics are shipped to CloudWatch. State whether either belongs in the CodeDeploy
+deployment group's `alarms=` and why.
 
 **E3.5 — Scheduler post-mortem.** Given a `scheduler_runs` extract showing `safety` with
 `failed` × 6 consecutive and `error = "database unavailable"` over 90 minutes while
@@ -749,24 +882,49 @@ no targets, and the platform is down until failover completes (~30–60 s) — f
 no availability. For a public SDK endpoint the first is almost always right; pair it with
 an alarm on Redis health so the degraded window is known.
 
-**S3.4** — sketch:
+**S3.4** — sketch, inside the Fargate stack's loop over the colours, built by hand like the
+5xx alarms (the target group that is not live is attached to no load balancer, so
+`tg.metrics.*` refuses it at synth):
 
 ```python
-alb_5xx = cloudwatch.MathExpression(expression="100 * e / r", using_metrics={"e": alb.metric_http_code_target(elbv2.HttpCodeTarget.TARGET_5XX_COUNT, period=Duration.minutes(1)), "r": alb.metric_request_count(period=Duration.minutes(1))})
-cloudwatch.Alarm(self, "Alb5xxRate", metric=alb_5xx, threshold=5, evaluation_periods=2, comparison_operator=GREATER_THAN_THRESHOLD).add_alarm_action(SnsAction(topic))
-cloudwatch.Alarm(self, "AlbP99", metric=alb.metric_target_response_time(statistic="p99", period=Duration.minutes(1)), threshold=5, evaluation_periods=2, ...)
-cloudwatch.Alarm(self, "Unhealthy", metric=blue_tg.metric_unhealthy_host_count(period=Duration.minutes(1)), threshold=1, evaluation_periods=3, ...)
+latency = cloudwatch.Metric(
+    namespace="AWS/ApplicationELB",
+    metric_name="TargetResponseTime",
+    dimensions_map={"LoadBalancer": self.alb.load_balancer_full_name, "TargetGroup": target_group.target_group_full_name},
+    statistic="p99",
+    period=Duration.seconds(60),
+)
+p99 = cloudwatch.Alarm(
+    self, f"ApiP99{colour.capitalize()}",
+    alarm_name=f"experimentation-api-p99-{colour}-{env_name}",
+    metric=latency, threshold=5, evaluation_periods=5, datapoints_to_alarm=3,
+    comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+    treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,  # the idle colour has no data
+)
+p99.add_alarm_action(cloudwatch_actions.SnsAction(alarm_topic))
 ```
 
-Staleness: `MathExpression("TIME() - s", using_metrics={"s": scheduler_last_success_timestamp{name="safety"}})` with threshold 2 × the safety interval.
+Per colour for the same reason as the 5xx alarms: during a canary the replacement group
+carries 10% of the traffic, and a whole-ALB p99 would dilute a slow release in the old
+release's numbers. Missing data must be NOT_BREACHING or the idle colour would alarm all the
+time. Staleness: a `MathExpression` of `TIME() - s` on the shipped gauge with a threshold of
+2 × the safety interval (10 minutes at the default 5).
+
+Whether to add them to the deployment group: every alarm in `alarms=` is polled for the
+whole deployment and **stops and rolls back** any deploy while it is in ALARM, and the
+deploy workflow refuses to start while one is firing. A p99 alarm there would make latency
+a rollback criterion — defensible, but only after its threshold has been measured against
+real traffic. The staleness alarm must not go there: a stuck scheduler is not evidence that
+the new API release is bad.
 
 **S3.5** — the safety monitor didn't run for 90 minutes: any flag whose error rate crossed
 its threshold in that window was _not_ rolled back (check `error_logs` against
 `feature_flag_safety_configs` for the window and do it by hand); experiments started/ended
 on schedule (experiment scheduler succeeded — the lock connection and the tick's own
 session are separate, and this failure was inside the safety tick's queries). The alarm
-should have been `time() − scheduler_last_success_timestamp{name="safety"} > 30 min`, which
-would have fired after two missed ticks, not after someone noticed.
+should have been `time() − scheduler_last_success_timestamp{name="safety"} > 10 min` (2 × the
+default 5-minute interval), which would have fired after two missed ticks, not after someone
+noticed — and nothing the stacks create today watches that, which is why E3.4 adds it.
 
 ---
 
