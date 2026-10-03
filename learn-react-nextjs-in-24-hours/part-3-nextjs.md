@@ -580,7 +580,7 @@ export interface RequireAuthProps {
   /**
    * When true, the user must be a superuser -- the same flag the admin API
    * enforces. `role` and `is_superuser` are independent columns, so a role
-   * check cannot stand in for it (#84).
+   * check cannot stand in for it ...
    */
   superuser?: boolean;
   /** Where the "Go back" link on the 403 view points. Default `/experiments`. */
