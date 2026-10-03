@@ -397,7 +397,7 @@ What a release publishes, for version `X.Y.Z`:
   (anonymous pull works); a final release also moves the floating `:core` and `:full` tags;
 - each image scanned for stored credentials with trivy (two passes) before it is pushed,
   then signed with cosign keyless and given an SPDX SBOM attestation;
-- the Helm chart as a signed `experimently-X.Y.Z.tgz` release asset. Today the chart is a
+- the Helm chart as `experimently-X.Y.Z.tgz` on the GitHub release. Today the chart is a `.tgz`
   release asset only; the project has decided it will ALSO be an OCI package at
   `oci://ghcr.io/getexperimently/charts/experimently`; the first push and making it public
   are founder-only and not done;

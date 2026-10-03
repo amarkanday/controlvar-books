@@ -325,7 +325,7 @@ The third way to self-host is the Helm chart in `charts/experimently` (values `p
 `values.schema.json`). The app's `docs/self-hosting/kubernetes.md` is the install guide, and the
 `chart-kind` CI job runs its command blocks as written on a kind cluster. The one operational
 difference from compose: the chart runs the bootstrap in an **init container**, not in the serving
-container (Hour 3). Today the chart is a signed `.tgz` release asset only; the project has decided
+container (Hour 3). Today the chart is a `.tgz` release asset only; the project has decided
 it will ALSO be an OCI package at `oci://ghcr.io/getexperimently/charts/experimently`; the first push and
 making it public are founder-only and not done.
 
