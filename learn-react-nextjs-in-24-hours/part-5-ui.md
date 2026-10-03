@@ -7,7 +7,8 @@
 Three hours on what the user sees. Tailwind — utility classes as the design system, and the
 few tokens the dashboard adds (Hour 18); the targeting rule builder — the most complex piece
 of client state, shaped exactly like the JSON the backend expects (Hour 19); and charts with
-Recharts, including the mocking trick that lets 550 Jest tests run without a canvas (Hour 20).
+Recharts, including the mocking trick that lets hundreds of Jest tests render charts without
+a canvas (Hour 20).
 
 ---
 
@@ -46,6 +47,10 @@ module.exports = {
     './src/pages/**/*.{js,ts,jsx,tsx,mdx}',
     './src/components/**/*.{js,ts,jsx,tsx,mdx}',
     './src/app/**/*.{js,ts,jsx,tsx,mdx}',
+    // The modules' dashboard code (the `@modules/*` alias; absent from a core
+    // tree, where the glob matches nothing). Without it a class used only by
+    // a module page is never generated.
+    '../modules/frontend/src/**/*.{js,ts,jsx,tsx}',
   ],
   theme: {
     extend: {
@@ -70,8 +75,12 @@ module.exports = {
 
 `extend` adds to Tailwind's defaults rather than replacing them; `primary` is a blue scale
 (mostly used as `blue-600` in practice — the dashboard leans on the default palette:
-`slate` for chrome, `blue` for primary actions, `green`/`red`/`amber` for status). The
-`typography` plugin provides `prose` classes for the markdown docs pages.
+`slate` for chrome, `blue` for primary actions, `green`/`red`/`amber` for status). The fourth
+`content` glob reaches outside `frontend/` into the modules tree: Tailwind generates only the
+classes it finds in scanned files, so without it a class used only by a module page would
+silently not exist. The `typography` plugin (`prose` classes) is still loaded, as a
+devDependency, but nothing uses it any more: it served the in-app markdown docs pages, which
+are gone (Hour 10).
 
 Conditional class composition, one concern per line:
 
@@ -89,15 +98,27 @@ Line 1 is layout, line 2 is focus (keyboard users get a ring; mouse users don't 
 `focus-visible`), line 3 is the disabled state, line 4 is the on/off colour. A `data-state`
 attribute carries the state for tests.
 
-Named class constants for a form page, and a colour table typed by the status union:
+Named class constants shared by a form's field components, and a colour table typed by the
+status union:
 
 ```tsx
-// 📁 frontend/src/pages/experiments/new.tsx
-const inputClass =
+// 📁 frontend/src/components/experiments/new/fieldStyles.ts
+/** Input classes shared by the new-experiment field components. */
+export const inputClass =
   'w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400';
-const smallInputClass =
+export const smallInputClass =
   'rounded border border-slate-300 px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400';
+/**
+ * Inputs new to guided setup: a slate-500 border (4.8:1 on white, above the
+ * 3:1 a control boundary needs) and a blue-600 focus ring.
+ */
+export const wizardInputClass =
+  'w-full rounded-lg border border-slate-500 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600';
 ```
+
+The constants moved out of the page when the form was split into field components (Hour 15),
+so every component that renders an input imports the same strings. `wizardInputClass` shows
+a contrast decision written down next to the value it justifies.
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
@@ -155,7 +176,9 @@ dashed border and centred text — a pattern reused for every "nothing here yet"
 > renders text for screen readers only (`<span className="sr-only">Loading…</span>`),
 > `role="status"`/`aria-live="polite"` announce the spinner, `role="switch"`/`aria-checked`
 > make the toggle a real switch, `aria-current="page"` marks the active nav item, and the
-> shell's first element is a skip link. The nightly axe audit checks these on ten pages.
+> shell's first element is a skip link. The nightly Playwright accessibility suite runs axe
+> on five pages (`/login`, `/`, `/experiments`, `/feature-flags`, `/admin`) plus keyboard,
+> label, contrast and alt-text checks.
 
 ### Try It Yourself
 
@@ -174,7 +197,8 @@ literal and watch the colour vanish in `npm run build`'s output.
 
 ### Key takeaways
 
-- Utilities in the element; tokens in `tailwind.config.js` (`primary`, Inter, `typography`).
+- Utilities in the element; tokens in `tailwind.config.js` (`primary`, Inter); `content`
+  must include the modules tree.
 - Arrays-joined class lists, named constants per page, complete class names only.
 - `data-state`/`data-is-control` for tests; `sr-only`, roles and `aria-*` for a11y.
 - Mobile-first responsive prefixes; skeletons with `animate-pulse`.
@@ -198,7 +222,8 @@ tractable:
 2. **Controlled all the way down.** `TargetingRuleBuilder` takes `value` and `onChange`;
    it renders `RuleGroupCard`s that take a group and `onChange`; they render
    `ConditionRow`s that take a condition and `onChange`. Every edit is an immutable update
-   bubbled to the page, which holds the one copy of the tree in `useState`.
+   bubbled to the page, which holds the one copy of the tree (on `/experiments/new`, in the
+   form's reducer: `onChange={(rules) => dispatch({ type: 'setRules', rules })}`).
 3. **Operators are derived from attribute type.** `OPERATORS_BY_TYPE` maps `string | number
    | boolean | array | semver` to allowed operators; changing the attribute re-validates the
    operator; changing to a no-value operator clears the value.
@@ -247,18 +272,36 @@ export const OPERATORS_BY_TYPE: Record<string, OperatorType[]> = {
 ```
 
 That `OperatorType` union is the same list as the backend adapter's `_SIMPLE_OPERATOR_MAP` +
-`_SEMVER_OPERATOR_MAP` (Build book, Day 16). Add an operator on one side without the other
-and the flag falls back to its global rollout — the mirror discipline again, with a real
-failure mode.
+`_SEMVER_OPERATOR_MAP` (Build book, Day 16). Add an operator to the dashboard without the
+backend and every save that uses it is refused with a 422 (`unknown operator`) — the mirror
+discipline again, with a real failure mode.
 
 The root component — derives a display total, updates immutably, delegates to cards:
 
 ```tsx
 // 📁 frontend/src/components/targeting/TargetingRuleBuilder.tsx
-export function TargetingRuleBuilder({ value, onChange, readOnly = false, className = '' }: TargetingRuleBuilderProps) {
+interface TargetingRuleBuilderProps {
+  value: TargetingRules | null;
+  onChange: (rules: TargetingRules) => void;
+  readOnly?: boolean;
+  className?: string;
+  /** Which operators the condition dropdowns offer; see `OperatorOptions`. */
+  operatorOptions?: OperatorOptions;
+}
+
+export function TargetingRuleBuilder({
+  value,
+  onChange,
+  readOnly = false,
+  className = '',
+  operatorOptions,
+}: TargetingRuleBuilderProps) {
   const rules = value ?? createEmptyRules();
 
-  const totalConditions = rules.groups.reduce((sum, group) => sum + group.conditions.length, 0);
+  const totalConditions = rules.groups.reduce(
+    (sum, group) => sum + group.conditions.length,
+    0
+  );
 
   const handleRootLogicalOperatorChange = (op: LogicalOperator) => {
     onChange({ ...rules, logical_operator: op });
@@ -280,7 +323,12 @@ export function TargetingRuleBuilder({ value, onChange, readOnly = false, classN
 ```
 
 Every handler is `onChange({ ...rules, ... })` — spread the tree, replace one branch. The
-page's `setRules` receives the new tree; nothing is mutated.
+page receives the new tree; nothing is mutated. `operatorOptions` is passed down to every
+`ConditionRow`, and it is the one way pages differ: the flag pages pass
+`FLAG_OPERATOR_OPTIONS` (`{ semverOnCustomAttributes: true }`), so a custom attribute such as
+`app_version` also offers the `semver_*` operators; the experiment pages pass nothing. The
+root AND/OR toggle is a `role="group"` with an `aria-label`, and its two buttons carry
+`aria-pressed`, so a screen reader hears which one is on.
 
 The leaf — a controlled row whose operator list depends on the attribute and whose value
 input depends on the operator:
@@ -290,14 +338,21 @@ input depends on the operator:
 const NO_VALUE_OPERATORS: OperatorType[] = ['is_null', 'is_not_null'];
 const MULTI_VALUE_OPERATORS: OperatorType[] = ['in', 'not_in'];
 
-export function ConditionRow({ condition, onChange, onRemove, readOnly = false }: ConditionRowProps) {
-  const availableOperators = getOperatorsForAttribute(condition.attribute);
+export function ConditionRow({
+  condition,
+  onChange,
+  onRemove,
+  readOnly = false,
+  label = 'Condition',
+  operatorOptions,
+}: ConditionRowProps) {
+  const availableOperators = getOperatorsForAttribute(condition.attribute, operatorOptions);
   const showValueInput = !NO_VALUE_OPERATORS.includes(condition.operator);
   const isMultiValue = MULTI_VALUE_OPERATORS.includes(condition.operator);
 
   const handleAttributeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newAttribute = e.target.value;
-    const newOperators = getOperatorsForAttribute(newAttribute);
+    const newOperators = getOperatorsForAttribute(newAttribute, operatorOptions);
     // If current operator is not in new operator list, reset to first available
     const newOperator = newOperators.includes(condition.operator)
       ? condition.operator
@@ -316,7 +371,9 @@ Read `handleAttributeChange`: changing `country` (string) to `app.version` (semv
 whether the current operator (`equals`) is valid for the new type; it isn't, so the operator
 resets to `semver_eq`. The invariant "operator is valid for attribute type" is maintained by
 the handler, not by a validator after the fact. `e.target.value as OperatorType` is a
-justified assertion — the `<select>`'s options are built from `OperatorType` values.
+justified assertion — the `<select>`'s options are built from `OperatorType` values. `label`
+("Group 1, condition 2") only builds accessible names: the attribute input is announced as
+"Group 1, condition 2 attribute", not as one of a dozen identical "attribute" fields.
 
 Attribute suggestions via a `<datalist>` — native autocomplete without a library:
 
@@ -326,6 +383,7 @@ Attribute suggestions via a `<datalist>` — native autocomplete without a libra
   ...
       <input
         data-testid="condition-attribute"
+        aria-label={`${label} attribute`}
         type="text"
         list={datalistId}
         value={condition.attribute}
@@ -338,7 +396,7 @@ Attribute suggestions via a `<datalist>` — native autocomplete without a libra
 // 📁 frontend/src/types/targeting.ts
 export const COMMON_ATTRIBUTES: AttributeSuggestion[] = [
   { value: 'user.country', label: 'User Country', type: 'string', examples: ['US', 'UK', 'DE'] },
-  { value: 'user.plan', label: 'User Plan', type: 'string', examples: ['free', 'pro', 'enterprise'] },
+  { value: 'user.plan', label: 'User Plan', type: 'string', examples: ['free', 'pro', 'business'] },
   { value: 'app.version', label: 'App Version', type: 'semver', examples: ['1.0.0', '2.3.1'] },
   ...
 ];
@@ -403,16 +461,45 @@ function generateId(): string {
 }
 ```
 
-> **Watch Out!** The `id` fields exist for React `key`s and stable `datalist` ids; they must
-> never reach the API (the backend ignores unknown keys today, but the contract is the three
-> documented fields). `rulesToJson` strips them — use it, or `rules as unknown as
-> Record<string, unknown>` as the experiment form does only because the backend tolerates
-> extras. Prefer `rulesToJson`.
+> **Watch Out!** The `id` fields exist for React `key`s and stable `datalist` ids. The API
+> **refuses unknown keys** in targeting rules, at every level, with a 422 (`unknown key`; a
+> change made after 0.17.0), and it accepts `id` on groups and conditions only because a
+> stored rule may carry one. That is why the experiment form's `rules as unknown as
+> Record<string, unknown>` still passes — and why any *other* client-only field you add to a
+> condition would make every save fail. `rulesToJson` sends exactly the documented fields;
+> prefer it. (The API also caps rules at 10 levels of nesting and 1,000 nodes in total.)
 
 > **Did You Know?** "No targeting rules — all users will match" in the empty state is
 > literally the backend's semantics: an experiment or flag with `targeting_rules: null`
 > skips the eligibility check, and a rule group with no conditions evaluates to `True`.
 > The builder's copy was written from the rules engine's docstring.
+
+#### Reading stored rules safely
+
+Creating rules is the easy half. A detail page must also *show* rules it did not write — set
+through the API, by an SDK script, or in the native `{"rules": [...]}` shape — and it must not
+offer to edit what the builder cannot represent, because saving would silently drop the parts
+it does not understand. So the experiment page asks first:
+
+```typescript
+// 📁 frontend/src/utils/experimentTargeting.ts
+export function isEditableTargeting(value: Stored, options: OperatorOptions = {}): boolean {
+  if (isNoRules(value)) return true;
+  if (!isPlainObject(value) || !keysWithin(value, TOP_KEYS)) return false;
+  ...
+}
+```
+
+Editable means "no rules", or the dashboard shape with only the keys the builder keeps, AND/OR
+logic only, and operators and values the builder offers for that attribute — with the same
+`OperatorOptions` the dropdown gets, so the check and the dropdown cannot disagree. Anything
+else is shown read-only as JSON, and the only change offered is to replace it. On save,
+`targetingPayload(rules, stored)` sends `rulesToJson`'s output (or `{}` for no rules) and
+carries the stored rule's top-level `id` back unchanged, because the server uses it to decide
+who a partial rollout admits. The experiment page (`TargetingSection`) allows editing only
+while the experiment is a draft or paused, and only for a role that may change it (Hour 16);
+the flag pages do the same with `isEditableFlagTargeting` in `frontend/src/utils/flagTargeting.ts`
+and send rules only when they changed.
 
 ### Try It Yourself
 
@@ -432,13 +519,16 @@ operator reset from `semver_gte` to `equals`.
   ids.
 - **Letting an invalid attribute/operator pair persist** — reset in the handler.
 - **`Math.random()`/`crypto` ids** that break in tests or SSR.
-- **Adding an operator to the union without the backend's map** (or vice versa).
+- **Adding an operator to the union without the backend's map** (or vice versa) — a 422.
+- **Offering to edit stored rules the builder cannot represent** — check
+  `isEditableTargeting` and show the rest read-only.
 
 ### Key takeaways
 
 - The tree state _is_ the dashboard rule shape; ids are client-only and stripped by
   `rulesToJson`.
-- Controlled all the way down; every edit is a spread-and-replace bubbled to one `useState`.
+- Controlled all the way down; every edit is a spread-and-replace bubbled to the page's one
+  copy of the tree.
 - Operators derive from attribute type (`OPERATORS_BY_TYPE`); handlers maintain the
   invariant; no-value operators clear the value.
 - The operator union mirrors the backend adapter's map — keep them in sync.
@@ -582,11 +672,17 @@ and the mapping that turns it on for every test:
 ```js
 // 📁 frontend/jest.config.js
   moduleNameMapper: {
+    // `@modules/…` first: it is the more specific pattern of the two.
+    '^@modules/(.*)$': moduleTargets,
     '^@/(.*)$': '<rootDir>/src/$1',
     '\\.(css|less|scss|png|jpg|jpeg|gif|svg)$': 'identity-obj-proxy',
     '^recharts$': '<rootDir>/src/__mocks__/recharts.tsx',
   },
 ```
+
+(The first entry is the modules seam from Hour 10, spelled for Jest: `moduleTargets` is an
+array — the modules tree, then the stub tree — and Jest uses the first that resolves. Hour 21
+has the rest of the file.)
 
 A test then reads structure, not pixels:
 
@@ -598,30 +694,72 @@ expect(bars).toHaveLength(3);
 expect(bars.filter((b) => b.getAttribute('data-is-control') === 'true')).toHaveLength(1);
 ```
 
-The results dashboard assembles the charts under tabs and loads three endpoints in
-parallel:
+The results dashboard assembles the charts under tabs. It loads the results and the daily
+series in parallel, and the sample size **on its own**:
 
 ```tsx
 // 📁 frontend/src/components/results/ResultsDashboard/ResultsDashboard.tsx
+  const fetchSampleSize = useCallback(async (overrides: SampleSizeOverrides = {}) => {
+    // Only the latest request may write state, so a slow answer for an
+    // earlier experiment never lands on this one.
+    const request = ++sampleSizeRequest.current;
+    setSampleSizeOverrides(overrides);
+    setSampleSizeLoading(true);
+    setSampleSizeError(null);
+    try {
+      ...
+      if (request !== sampleSizeRequest.current) return;
+      setSampleSize(s);
+    } catch (e) {
+      if (request !== sampleSizeRequest.current) return;
+      setSampleSize(null);
+      setSampleSizeError(e instanceof Error ? e.message : 'Request failed');
+    } finally {
+      if (request === sampleSizeRequest.current) setSampleSizeLoading(false);
+    }
+  }, [experimentId]);
+
   const fetchAll = useCallback(async () => {
     setLoading(true);
     setError(null);
+    // Started alongside the results, but never awaited with them. A reload
+    // starts from the server's inputs again: nothing typed on the tab is kept.
+    setSampleSize(null);
+    void fetchSampleSize();
     try {
-      const [r, d, s] = await Promise.all([
+      const [r, d] = await Promise.all([
         ResultsService.getResults(experimentId),
         ResultsService.getDailyResults(experimentId),
-        ResultsService.getSampleSize(experimentId),
       ]);
       setResults(r);
+      setDaily(d);
 ```
 
-`Promise.all` — three requests in flight at once, one `await`; a single failure rejects the
-whole thing into the `catch`. (`Promise.allSettled` would let the page render the parts that
-succeeded; a trade the dashboard hasn't needed yet.)
+`Promise.all` — two requests in flight at once, one `await`; a single failure rejects the
+whole thing into the `catch`, and the page shows its error with a "Try again". The sample size
+used to be the third member of that `Promise.all`; one failing sample-size call then blanked
+the whole results page. Now it is started alongside but never awaited with the others, and it
+has its own loading, error and "Try again" on the Sample Size tab, where the user can also
+change the inputs (`SampleSizeOverrides`, Hour 14) and recalculate.
+
+`sampleSizeRequest` is a **request counter in a ref**: every call takes the next number, and
+only the call whose number is still the latest may write state. It is the same problem as Hour
+7's cancelled flag — a slow, superseded answer overwriting a newer one — solved for a function
+called on demand rather than an effect. A ref, not state, because changing it must not
+re-render.
+
+The primary-metric chart's heading also depends on the metric's type (`primaryMetricHeading`):
+"Conversion Rates — Checkout" for a conversion metric, "… — mean" for a numeric one, so a
+revenue metric is never headed as a conversion rate.
 
 > **Watch Out!** `ResponsiveContainer` measures its parent, so the parent needs a real height
 > (`h-72`). Without it the chart renders at zero height and looks "broken" — a CSS bug that
 > presents as a charting bug. Every chart wrapper in the codebase sets a height class.
+
+> **Did You Know?** The mock must export every Recharts component any page imports. The power
+> calculator (`/power-calculator`, an open route; the maths is in `src/utils/power.ts`) uses
+> `ReferenceDot`, and until the mock exported one the page rendered `undefined` under Jest —
+> "Element type is invalid" — which nothing caught because no test rendered that page.
 
 > **Did You Know?** The `Tooltip formatter` typing changed in recharts 3.10 (the Dependabot
 > upgrade PR notes "Fix Tooltip formatter typing for recharts 3.10"); the `(v as number)`
@@ -653,7 +791,8 @@ test to see why the mock exists.
   testability; format at the edge.
 - `moduleNameMapper` swaps Recharts for `src/__mocks__/recharts.tsx` in Jest; tests read
   `data-testid`/`data-*` on the stubs.
-- Heights on containers; hex colours; `Promise.all` for parallel loads.
+- Heights on containers; hex colours; `Promise.all` for loads that succeed or fail together,
+  a separate load (with a request counter) for a part that may fail alone.
 
 ---
 
@@ -668,8 +807,10 @@ Shows the ring only for keyboard focus (Tab), not for mouse clicks — the acces
 
 **Q3. Why are `id`s on `TargetingCondition` and `TargetingRuleGroup`, and where do they go
 on save?**
-They're React `key`s and `datalist` ids for the builder; `rulesToJson` strips them so the
-API receives exactly `{attribute, operator, value}` per condition.
+They're React `key`s and `datalist` ids for the builder; `rulesToJson` (and, on the detail
+pages, `targetingPayload`) strips them so the API receives exactly `{attribute, operator,
+value}` per condition. The API refuses unknown keys with a 422; it tolerates `id` only
+because stored rules may carry one.
 
 **Q4. A user changes a condition's attribute from `user.country` to `app.version`. What
 happens to its operator, and where?**
@@ -685,6 +826,13 @@ It renders SVG from layout measurements jsdom can't provide; `jest.config.js` ma
 **Q6. Why one `<Bar>` per variant instead of one `<Bar>` over the whole dataset?**
 So tests can query individual bars (`getAllByTestId('variant-bar')`) and read
 `data-is-control`/`data-fill` per variant; one `Bar` would render one stub.
+
+**Q7. Why does the results dashboard load the sample size outside its `Promise.all`, and
+what is `sampleSizeRequest` for?**
+So a failing sample-size call shows an error on its own tab instead of blanking the page.
+`sampleSizeRequest` is a counter in a ref: each call takes the next number and only the latest
+may write state, so a slow answer to an earlier request (or for a previous experiment) never
+overwrites a newer one.
 
 **Quiz.** Which of these are safe Tailwind class expressions: `on ? 'bg-green-600' :
 'bg-slate-300'`, `` `text-${size}` ``, `ACTION_META[action].className`?
@@ -711,9 +859,10 @@ change the attribute to `app.version`, assert `onChange` was called with `operat
 (required vs current) with `data-testid="sample-bar"`, and the Jest assertion that the
 current bar's `data-fill` is red below 80% and green at/above 100%.
 
-**E5.5 — Parallel loads.** Rewrite `fetchAll` with `Promise.allSettled` so the overview
-renders when results succeed but daily data fails, showing an inline error for the trend tab
-only.
+**E5.5 — Parallel loads.** The sample size already loads on its own, so its failure is shown
+on its tab alone. Do the same for the daily series: rewrite `fetchAll`'s `Promise.all` with
+`Promise.allSettled` so the overview renders when results succeed but daily data fails,
+showing an inline error for the trend tab only.
 
 ---
 
@@ -746,8 +895,9 @@ export function StatusBadge({ status }: { status: ExperimentStatus }) {
 value, so no change to `noValueOperators`). Backend: `backend/app/core/targeting_adapter.py`'s
 `_SIMPLE_OPERATOR_MAP` must map `"not_regex"` to an engine operator — and since the engine
 has no `NOT_MATCH_REGEX`, `schemas/targeting_rule.py::OperatorType` and
-`rules_engine.apply_operator` need it too. Without the backend change the whole rule set is
-uninterpretable and the flag falls back to its global rollout.
+`rules_engine.apply_operator` need it too. Without the backend change every save that uses
+`not_regex` is refused with a 422 (`unknown operator`), which the form shows at the rule
+("Group 1, Condition 1: unknown operator").
 
 **S5.3**
 
@@ -790,19 +940,19 @@ expect(bars[1]).toHaveAttribute('data-fill', '#dc2626');   // for current/requir
   const fetchAll = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const [r, d, s] = await Promise.allSettled([
+    setSampleSize(null);
+    void fetchSampleSize();          // unchanged: loads and fails on its own
+    const [r, d] = await Promise.allSettled([
       ResultsService.getResults(experimentId),
       ResultsService.getDailyResults(experimentId),
-      ResultsService.getSampleSize(experimentId),
     ]);
     if (r.status === 'fulfilled') setResults(r.value); else setError(r.reason instanceof Error ? r.reason.message : 'Failed to load results');
     if (d.status === 'fulfilled') { setDaily(d.value); setDailyError(null); } else setDailyError(d.reason instanceof Error ? d.reason.message : 'Trend data unavailable');
-    if (s.status === 'fulfilled') setSampleSize(s.value);
     setLoading(false);
-  }, [experimentId]);
+  }, [experimentId, fetchSampleSize]);
 ```
 
-The trend tab renders `dailyError` inline (`data-testid="trend-error"`) while the overview
+(The sequential-results lookup that follows a successful `r` is unchanged.) The trend tab renders `dailyError` inline (`data-testid="trend-error"`) while the overview
 uses `results` as before.
 
 ---

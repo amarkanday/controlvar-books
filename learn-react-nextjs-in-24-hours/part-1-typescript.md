@@ -90,20 +90,47 @@ by a URL guard (Hour 23). When the backend adds a field, someone adds it here.
     "target": "es5",
     "strict": true,
     "noEmit": true,
-    "jsx": "preserve",
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "jsx": "react-jsx",
     "baseUrl": ".",
-    "paths": { "@/*": ["./src/*"] },
+    "paths": {
+      "@/*": ["./src/*"],
+      "@modules/*": ["../modules/frontend/src/*", "./src/modules-stub/*"],
+      ...
+    },
     ...
-  }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx",
+              "../modules/frontend/src/**/*.ts", "../modules/frontend/src/**/*.tsx"]
 }
 ```
 
 `"strict": true` — no implicit `any`, `null` and `undefined` are distinct types, and the
 checks that make types trustworthy. `"noEmit": true` — TypeScript only _checks_; Next.js's
-compiler does the emitting. `"paths"` gives the `@/` alias you'll see in every import
-(`import { apiFetch } from '@/services/api'`). And `"target": "es5"` is why `ApiError` calls
-`Object.setPrototypeOf(this, ApiError.prototype)` — subclassing `Error` needs that fix-up
-when compiled to ES5.
+compiler (SWC, driven by Turbopack) does the emitting. `"paths"` gives the `@/` alias you'll
+see in every import (`import { apiFetch } from '@/services/api'`). And `"target": "es5"` is
+why `ApiError` calls `Object.setPrototypeOf(this, ApiError.prototype)` — subclassing `Error`
+needs that fix-up when compiled to ES5.
+
+Three settings are there because of the stack, not taste:
+
+- **`"jsx": "react-jsx"` and `"moduleResolution": "bundler"`** are what Next 16 requires. If
+  either is missing, `next build` rewrites the file on every build ("The following mandatory
+  changes were made to your tsconfig.json"), so they are committed as Next wants them.
+  `react-jsx` is the automatic JSX runtime: a component file no longer needs
+  `import React` just to use JSX.
+- **`"@modules/*"`** is the seam between the core dashboard and the optional modules
+  (workspaces, warehouse, SSO, custom roles). It lists two targets: the real module code under
+  `modules/frontend/src/` first, a stub tree under `frontend/src/modules-stub/` second. Hour 10
+  shows the pages that use it.
+- The real `paths` block also routes `react`, `react/*`, `next`, `next/*` and
+  `@testing-library/*` to the dashboard's own `node_modules`, because code in the modules tree sits
+  outside the package and would otherwise find no `node_modules` above it.
+
+A second file, `frontend/tsconfig.core.json`, extends this one and points `@modules/*` at the
+stub tree **alone** (and excludes `../modules`). `npx tsc --noEmit -p tsconfig.core.json` is
+how CI proves the core dashboard type-checks with the modules deleted.
 
 ### A second way to feel the gap
 
@@ -317,11 +344,13 @@ export interface SegmentVariantResult {
 > shapes (records, props), `type` for unions, tuples and aliases — matches what each can do.
 > Don't convert one to the other in review without a reason.
 
-> **Did You Know?** The backend's `ExperimentStatus` values are lower-case (`"active"`) and
-> `FeatureFlagStatus` values are upper-case (`"ACTIVE"`) — a historical mismatch the backend
-> papers over. The dashboard's literal unions encode each exactly as the API sends it, which
-> is why you'll see `'ACTIVE' | 'INACTIVE' | 'ARCHIVED'` for flags and `'active' | ...` for
-> experiments. The compiler catches a mixed-up casing at the first comparison.
+> **Did You Know?** The backend stores `FeatureFlagStatus` upper-case (`"ACTIVE"`, the
+> database enum) but the API's JSON lower-cases it: the flag list schema declares
+> `status: Literal["active", "inactive", "archived"]`. So the dashboard's union in
+> `frontend/src/services/featureFlags.ts` is `'active' | 'inactive' | 'archived'`, the same
+> casing as `ExperimentStatus`. Encode what the API *sends*, not what the database stores — and
+> because one older response shape still reaches the dashboard, `isFlagOn()` lower-cases
+> before comparing rather than trusting the casing.
 
 ### Try It Yourself
 
@@ -413,7 +442,8 @@ export async function apiFetch<T = unknown>(
   }
 
   const status = response.status ?? 0;
-  const detail = await readErrorDetail(response);
+  const { detail, json: bodyIsJson } = await readErrorDetail(response);
+  const requestId = readRequestId(response);
 
   if (status === 401 && auth) {
     clearToken();
@@ -422,11 +452,28 @@ export async function apiFetch<T = unknown>(
     }
   }
 
-  const message = detail !== undefined ? messageForDetail(status, detail) : response.statusText || messageForDetail(status, undefined);
+  let message: string;
+  if (status >= 500 && !bodyIsJson) {
+    message = serverErrorMessage(status, requestId);
+  } else {
+    message =
+      detail !== undefined
+        ? messageForDetail(status, detail)
+        : response.statusText || messageForDetail(status, undefined);
+    ...
+  }
 
-  throw new ApiError({ status, detail, message });
+  throw new ApiError({ status, detail, message, requestId });
 }
 ```
+
+Two details in the error half are about the people reading the message, not the compiler.
+`readErrorDetail` returns `{ detail, json }`, so `apiFetch` knows whether the body was JSON at
+all; a 5xx whose body is not JSON (a proxy's HTML page) gets `serverErrorMessage(status,
+requestId)` instead of a garbled `statusText`. And `readRequestId` reads the `X-Request-ID`
+response header: a 5xx message carries `Request ID: ...`, which an administrator searches the
+API log for. `ApiError` keeps it as `requestId`, and its `isServerError` getter is
+`status >= 500`.
 
 Typed call sites — the service supplies `T`:
 
@@ -436,10 +483,14 @@ Typed call sites — the service supplies `T`:
     return apiFetch<Experiment>(`${BASE}/${id}`);
   },
 
-  async create(data: CreateExperimentRequest): Promise<Experiment> {
-    return apiFetch<Experiment>(BASE, { method: 'POST', json: data });
+  async create(data: CreateExperimentRequest, options: CreateOptions = {}): Promise<Experiment> {
+    return apiFetch<Experiment>(BASE, { method: 'POST', json: data, ...options });
   },
 ```
+
+(`options` is `CreateOptions`, `{ redirectOn401?: boolean }`: `/experiments/new` passes
+`{ redirectOn401: false }` so an expired session does not throw away a half-filled form —
+Hour 15.)
 
 `unknown` at the error edge, narrowed step by step:
 
@@ -535,7 +586,7 @@ export function useForm<T extends Record<string, unknown>>(options: UseFormOptio
 ```
 
 > **Watch Out!** `as` is not a conversion; it's you telling the compiler to believe you.
-> `(parsed as { detail: unknown }).detail` in `readErrorDetail` is preceded by
+> `(parsed as { detail: unknown }).detail` in `readErrorDetail` is guarded by
 > `'detail' in (parsed as object)` — the check makes the assertion honest. An `as` with no
 > check nearby is a review comment.
 
@@ -634,7 +685,7 @@ Narrowing a caught error and reading a field only the narrowed type has:
       const status = isApiError(err) ? err.status : 0;
       setLoadError({
         status,
-        message: err instanceof Error ? err.message : String(err),
+        message: err instanceof Error ? err.message : 'Failed to load experiment',
       });
 ```
 
@@ -702,7 +753,8 @@ Hour 19).
 
 > **Did You Know?** `strictNullChecks` is why `key: string | null` forces `experiment.key ??
 > experiment.id` before use, and why the dashboard's key-generation helper runs on the client
-> as the user types: `generateKey(name)` in `pages/experiments/new.tsx` mirrors the server's
+> as the user types: `generateKey(name)` in `components/experiments/new/formState.ts` (re-exported
+> from `pages/experiments/new.tsx`) mirrors the server's
 > `ExperimentService.generate_key` (minus the random suffix) so the field is never null in a
 > request the dashboard builds.
 
@@ -781,6 +833,14 @@ The page branches on `status` (`ACTIONS_BY_STATUS`), so it must be exact; it onl
 After a check that proves the shape — `'detail' in (parsed as object)` then
 `(parsed as { detail: unknown }).detail` — and at the API-contract edge (`(await
 r.json()) as T`, the caller's promise). Never to silence the compiler.
+
+**Q7. Why does `tsconfig.json` list two targets for `@modules/*`, and what does
+`tsconfig.core.json` change?**
+The first target is the real module code (`../modules/frontend/src/*`), the second the stub
+tree (`./src/modules-stub/*`); the first that contains the file wins, so a full checkout gets
+the module and a module it does not carry falls back to the stub. `tsconfig.core.json` keeps
+only the stub target and excludes `../modules`, so a core type-check cannot quietly resolve
+to module code that a core build will not have.
 
 **Quiz.** `const id = typeof rawId === 'string' ? rawId : undefined;` — what types can
 `router.query.id` be, and which does this exclude?

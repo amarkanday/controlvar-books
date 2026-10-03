@@ -6,7 +6,8 @@
 
 The last four hours are about trusting and shipping the dashboard: unit and page tests with
 Jest and React Testing Library, and the mocking shapes the codebase standardises on (Hour 21);
-Playwright for the three browser suites — E2E, visual regression, accessibility (Hour 22);
+Playwright for the browser journeys that gate every pull request, plus the nightly visual and
+accessibility suites (Hour 22);
 the build, the image, nginx, and the URL guard that keeps every service path honest against
 the live OpenAPI spec (Hour 23); and the style guide that collects the whole book (Hour 24).
 
@@ -16,7 +17,8 @@ the live OpenAPI spec (Hour 23); and the style guide that collects the whole boo
 
 ### What & why
 
-The dashboard's 550+ tests run in **Jest** with **jsdom** (a DOM in Node) and **React
+The dashboard's tests — "640+ dashboard tests" by the app README's count — run in **Jest**
+with **jsdom** (a DOM in Node) and **React
 Testing Library** (RTL), whose philosophy shapes every test here: _test what the user sees
 and does_. Render a component, find elements the way a user would (by role, by text, by
 label — by test id only when nothing semantic exists), interact with `fireEvent`/`userEvent`,
@@ -201,22 +203,57 @@ The config, and the setup file that registers `jest-dom`'s matchers:
 
 ```js
 // 📁 frontend/jest.config.js
+const full = modulesTreeAvailable();
+const moduleTargets = full
+  ? [path.join(MODULES_DIR, '$1'), path.join(MODULES_STUB_DIR, '$1')]
+  : [path.join(MODULES_STUB_DIR, '$1')];
+
 module.exports = {
   testEnvironment: 'jsdom',
   setupFilesAfterEnv: ['<rootDir>/jest.setup.ts'],
+  roots: full ? ['<rootDir>', MODULES_DIR] : ['<rootDir>'],
+  modulePaths: ['<rootDir>/node_modules'],
   transform: {
-    '^.+\\.(ts|tsx)$': ['ts-jest', { tsconfig: { jsx: 'react-jsx', module: 'commonjs' } }],
+    '^.+\\.(ts|tsx)$': ['ts-jest', {
+      tsconfig: {
+        jsx: 'react-jsx',
+        module: 'commonjs',
+      },
+    }],
   },
   moduleNameMapper: {
+    // `@modules/…` first: it is the more specific pattern of the two.
+    '^@modules/(.*)$': moduleTargets,
     '^@/(.*)$': '<rootDir>/src/$1',
     '\\.(css|less|scss|png|jpg|jpeg|gif|svg)$': 'identity-obj-proxy',
     '^recharts$': '<rootDir>/src/__mocks__/recharts.tsx',
   },
   testMatch: ['**/*.test.ts', '**/*.test.tsx'],
-  testPathIgnorePatterns: ['/node_modules/', '/.next/', '/out/'],
-  collectCoverageFrom: ['src/components/**/*.{ts,tsx}', 'src/services/**/*.{ts,tsx}', 'src/hooks/**/*.{ts,tsx}', 'src/contexts/**/*.{ts,tsx}', '!src/**/*.d.ts'],
+  testPathIgnorePatterns: [
+    '/node_modules/',
+    '/.next/',
+    '/out/',
+    ...
+  ],
+  ...
+  collectCoverageFrom: [
+    'src/components/**/*.{ts,tsx}',
+    'src/services/**/*.{ts,tsx}',
+    'src/hooks/**/*.{ts,tsx}',
+    'src/contexts/**/*.{ts,tsx}',
+    '!src/**/*.d.ts',
+  ],
 };
 ```
+
+The top half is the modules seam (Hour 10) applied to Jest. `full` comes from the same
+`modulesTreeAvailable()` the Next config uses. In a full run, `roots` adds the modules tree, so
+the module tests that live beside the module code are collected, and an `@modules/...` import
+maps to the modules tree first and the stub second. In a core run (`modules/` deleted, or
+`EXPERIMENTLY_PROFILE=core npx jest`) only the stub is reachable and the modules tree is
+ignored. `modulePaths` lets files outside the package find `react` in the dashboard's own
+`node_modules`.
+One known limit is written into the file: coverage does not include the modules tree.
 
 ```ts
 // 📁 frontend/jest.setup.ts
@@ -224,7 +261,8 @@ import '@testing-library/jest-dom';
 ```
 
 The commands: `npm test` (`jest --watchAll=false`), `npx jest <path> -t "<name>"` for one,
-`npm run test:coverage` for numbers (87.6% lines at the last audit).
+`npm run test:coverage` for numbers (the report covers `frontend/src` only, by the limit
+above; this book quotes no percentage).
 
 > **Watch Out!** `jest.mock(...)` calls are **hoisted** above imports by the transformer, so
 > they must not reference variables declared with `const` above them in a way that runs at
@@ -266,25 +304,33 @@ cd frontend && npx jest src/tests/pages/feature-flag-detail.test.tsx --watchAll=
 
 ---
 
-## Hour 22 — Playwright: E2E, visual regression, accessibility
+## Hour 22 — Playwright: browser journeys, visual regression, accessibility
 
 ### What & why
 
 Jest proves components behave with a mocked API. **Playwright** proves the whole thing
 works in a real browser against a real backend: log in through the real `/login`, create an
-experiment through the real form, start it, read results, archive it. The dashboard has three
-Playwright suites under `frontend/tests/e2e/`:
+experiment through the real guided setup, start it, read results, archive it. The specs live
+under `frontend/tests/e2e/`, and `playwright.config.ts` sorts them into three **projects** by
+file name:
 
-- **E2E specs** (`experiment-lifecycle`, `feature-flag`, `admin-panel`, `auth`, `rbac`) —
-  click paths, serial, asserting on `data-testid`s.
-- **Visual regression** (`visual-regression.spec.ts`) — screenshots compared to committed
-  snapshots; a layout change fails until snapshots are updated on purpose.
-- **Accessibility** (`accessibility.spec.ts`) — `@axe-core/playwright` scans ten pages for
-  WCAG 2.1 AA violations and fails on critical/serious ones.
+- **`journeys`** — the five `*.journey.spec.ts` click paths: `login`, `experiment-lifecycle`,
+  `feature-flag`, `admin-panel`, `rbac`. Serial, asserting on `data-testid`s. These are the
+  **required `Browser E2E` check on every pull request**: CI builds the static export, starts a
+  real seeded backend and runs `npx playwright test --project=journeys`. A journey that fails
+  twice (one retry absorbs network jitter) fails the PR.
+- **`sso`** — `sso-sign-in.sso.spec.ts`, signing in with single sign-on from the dashboard. It
+  needs its own API process and a fake identity provider, which the same `Browser E2E` job
+  starts as extra steps.
+- **`extended`** — everything else: visual regression (`visual-regression.spec.ts`,
+  screenshots compared to committed snapshots) and accessibility (`accessibility.spec.ts`,
+  `@axe-core/playwright` scans of five pages that fail on critical or serious WCAG 2.1 AA
+  violations). These run **nightly**, not in the PR gate: screenshots and full-page audits are
+  slower and noisier than a click path.
 
-They run **nightly**, not in the PR gate, because they need a seeded backend, a browser and
-minutes rather than seconds. The `scenario-runner` agent in `.claude/agents/` uses the same
-Playwright config to walk scenarios.
+The split is the point: the journeys are few, fail-hard and fast enough to block a merge; the
+rest are broad and informative. The `scenario-runner` agent in `.claude/agents/` drives the
+same dashboard to walk scenarios.
 
 #### Page objects and fixtures
 
@@ -295,28 +341,66 @@ one page object changes, not thirty specs.
 
 ### In the wild
 
-The config — base URL from the environment, serial, one worker, artefacts on failure:
+The config — projects by file name, serial, one worker, artefacts on failure, and a web
+server chosen for you:
 
 ```typescript
 // 📁 frontend/playwright.config.ts
-const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3100";
-const HEADLESS = process.env.PLAYWRIGHT_HEADLESS !== "false";
+import { API_URL, BASE_URL, IS_EXTERNAL_BASE_URL, PORT } from "./tests/e2e/env";
+...
+const use = {
+  baseURL: BASE_URL,
+  headless: HEADLESS,
+  screenshot: "only-on-failure" as const,
+  video: "retain-on-failure" as const,
+  trace: "retain-on-failure" as const,
+  actionTimeout: 15_000,
+  navigationTimeout: 30_000,
+};
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  fullyParallel: false,       // scenarios share state — run sequentially
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // Journeys walk one backend through real state transitions; serialise them.
+  fullyParallel: false,
   workers: 1,
-  reporter: [["html", { outputFolder: "playwright-report", open: "never" }], ["list"]],
+  forbidOnly: !!process.env.CI,
+  // One retry absorbs network jitter in CI; a journey that fails twice fails the PR.
+  retries: process.env.CI ? 1 : 0,
+  ...
+  projects: [
+    {
+      name: "journeys",
+      testMatch: /\.journey\.spec\.ts$/,
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "sso",
+      testMatch: /\.sso\.spec\.ts$/,
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "extended",
+      testMatch: /\.spec\.ts$/,
+      testIgnore: [/\.journey\.spec\.ts$/, /\.sso\.spec\.ts$/],
+      use: { ...devices["Desktop Chrome"] },
+    },
+  ],
 
-  use: {
-    baseURL: BASE_URL,
-    headless: HEADLESS,
-    screenshot: "only-on-failure",
-    video: "retain-on-failure",
-    trace: "on-first-retry",
+  webServer,
+  outputDir: "playwright-results",
+});
 ```
+
+`BASE_URL`, `API_URL` and `PORT` come from `tests/e2e/env.ts`, shared with the auth fixture
+(which builds its own browser contexts and so cannot read the config's `baseURL`). The
+defaults match the local stack — dashboard on 3100, API on 8000 — and four environment
+variables change them: `PLAYWRIGHT_BASE_URL`, `PLAYWRIGHT_API_URL`, `PLAYWRIGHT_PORT` and
+`PLAYWRIGHT_WEB_SERVER`. The last picks the web server, `auto` by default: reuse a dashboard
+already answering on the base URL; otherwise, if the dashboard's `out/` holds a static export, serve it
+with `tests/e2e/static-server.mjs`, which proxies `/api` the way nginx does in the image (so
+the browser sends no CORS preflight); otherwise run `npm run dev`. `trace: "retain-on-failure"`
+keeps a trace for every failing test, not only for retries — in CI the first failure is the
+one you most want to read.
 
 The auth fixture — real credentials from the demo seed, real login, no bypass:
 
@@ -331,59 +415,85 @@ The auth fixture — real credentials from the demo seed, real login, no bypass:
  * so that `/login` is a real login.
  */
 export const TEST_USERS = {
-  admin: { username: "admin@demo.com", password: "Demo1234!", role: "ADMIN" },
-  developer: { username: "dev@demo.com", password: "Demo1234!", role: "DEVELOPER" },
-  analyst: { username: "analyst@demo.com", password: "Demo1234!", role: "ANALYST" },
-  viewer: { username: "viewer@demo.com", password: "Demo1234!", role: "VIEWER" },
+  admin: {
+    username: "admin@demo.com",
+    password: "Demo1234!",
+    role: "ADMIN",
+    roleLabel: "Admin",
+  },
+  developer: {
+    username: "dev@demo.com",
+    ...
+  },
+  ...
 } as const;
 
 /**
  * Log in through the real `/login` page and wait until the app has navigated
  * away from it. Fails loudly if the credentials are rejected — there is no
- * "dev mode skips login" tolerance any more.
+ * "dev mode skips login" tolerance. ...
 ```
 
-A spec — serial, timestamped data so reruns don't collide, page objects, assertions on test
-ids and on the _absence_ of things (no raw UUIDs in the list):
+A journey — serial, timestamped data so reruns don't collide, page objects, assertions on
+test ids and on the _absence_ of things (no raw UUIDs in the list):
 
 ```typescript
-// 📁 frontend/tests/e2e/experiment-lifecycle.spec.ts
+// 📁 frontend/tests/e2e/experiment-lifecycle.journey.spec.ts
 /**
- * CE click-path: list → create → detail → start → pause → start → complete →
- * results → archive. Runs against a real backend (`AUTH_PROVIDER=local`) with
- * the demo admin; every step asserts on `data-testid`s from
- * `src/pages/experiments/`.
+ * Journey 2 — experiment lifecycle.
+ *
+ * The core click-path an evaluator walks in their first ten minutes:
+ * list → guided setup at `/experiments/new` → detail → start → pause → resume → complete →
+ * results → archive. It runs against a real backend with the demo admin, and
+ * every step asserts on `data-testid`s rendered by `src/pages/experiments/`
+ * and `src/pages/results/`.
+ *
+ * Serial: the tests share one experiment, created by the third test. A failure
+ * stops the chain rather than letting later steps pass vacuously.
  */
-test.describe("Experiment Lifecycle", () => {
+test.describe("Journey: experiment lifecycle", () => {
   test.describe.configure({ mode: "serial" });
 
   const STAMP = Date.now();
   const EXPERIMENT_NAME = `E2E Lifecycle ${STAMP}`;
-  const EXPERIMENT_KEY = `e2e-lifecycle-${STAMP}`;
+  const EXPERIMENT_KEY = `e2e_lifecycle_${STAMP}`;
   let experimentId = "";
 
-  test("list page renders a table or the first-run checklist", async ({ adminPage }) => {
+  test("the list renders the seeded experiments", async ({ adminPage }) => {
     const experiments = new ExperimentsPage(adminPage);
     await experiments.goto();
 
     await expect(experiments.createButton).toBeVisible();
+    await expect(experiments.createButton).toHaveAttribute("href", "/experiments/new");
     await expect(experiments.listError).toHaveCount(0);
+    ...
+    await expect(experiments.experimentList).not.toContainText(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}/,
+    );
+    ...
+  });
 
-    const hasRows = (await experiments.experimentList.count()) > 0;
-    if (hasRows) {
-      await expect(experiments.experimentRows.first()).toBeVisible();
-      // Type column is filled from `experiment_type` and no owner UUID is shown.
-      const firstType = experiments.experimentRows.first().getByTestId("experiment-type-cell");
-      await expect(firstType).not.toHaveText("");
-      await expect(experiments.experimentList).not.toContainText(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}/);
-    } else {
-      await expect(experiments.firstRunChecklist).toBeVisible();
-      ...
+  test("guided setup refuses an allocation that does not add up to 100%", async ({ adminPage }) => {
+    const experiments = new ExperimentsPage(adminPage);
+    await experiments.gotoGuided();
+    ...
+    await experiments.variantAllocationInputs.nth(1).fill("30");
+    await experiments.nextButton.click();
+
+    await expect(experiments.stepError).toContainText("add up to 100%");
+    await expect(adminPage).toHaveURL(/\/experiments\/new\?step=variants$/);
 ```
 
+The second test is Hour 15 from the outside: Next is refused on the Variants step, the
+message is the client mirror's ("add up to 100%"), and the URL still says `?step=variants`.
+The page object (`tests/e2e/pages/experiments.page.ts`) owns the wizard's test ids —
+`wizard-next`, `wizard-back`, `step-error`, `wizard-step-heading` and the rest — so a renamed
+id changes one file.
+
 `test.describe.configure({ mode: "serial" })` — the tests share `experimentId`, so they run
-in order and stop at the first failure. `Date.now()` in names — the same "unique data, no
-truncation" discipline as the backend's test harness.
+in order and stop at the first failure. `Date.now()` in names and keys — the same "unique
+data, no truncation" discipline as the backend's test harness. (The key uses underscores,
+like `generateKey`'s output.)
 
 The accessibility suite — dynamic import so a missing dependency skips rather than crashes:
 
@@ -410,11 +520,13 @@ async function getAxeBuilder() {
 Running them:
 
 ```bash
+./demo/setup-local.sh                                              # from the repo root: a seeded backend + the dashboard on :3100
 cd frontend
-./demo/setup-local.sh 2>/dev/null || (make dev & make web &)     # a seeded backend + the dev server on :3100
 npx playwright install                                             # once
-npm run test:e2e                                                   # all E2E
-npm run test:e2e:headed                                            # watch it
+npx playwright test --project=journeys                             # the PR gate's journeys
+npx playwright test --project=journeys experiment-lifecycle        # one journey
+npm run test:e2e:headed                                            # everything, watching the browser
+npm run test:e2e:ui                                                # Playwright's UI mode
 npm run test:visual                                                # compare screenshots
 npm run test:visual:update                                         # accept new snapshots (review the diff!)
 npm run test:a11y                                                  # axe audits
@@ -433,18 +545,20 @@ npx playwright show-report
 
 ### Try It Yourself
 
-Add a step to `experiment-lifecycle.spec.ts` (in a scratch copy): after "start", open the
-results page via the page object and assert `getByTestId('results-dashboard')` (or the
-loading skeleton's test id, then the dashboard) is visible. Run just that spec headed:
+Add a step to `experiment-lifecycle.journey.spec.ts` (in a scratch copy): after "start", open
+the results page via the page object and assert `getByTestId('results-dashboard')` (or the
+loading skeleton's test id, then the dashboard) is visible. Run just that journey headed:
 
 ```bash
-npx playwright test experiment-lifecycle --headed
+npx playwright test --project=journeys experiment-lifecycle --headed
 ```
 
 ### Common mistakes
 
 - **Selectors in specs** instead of page objects.
 - **Fixed names** across runs — collisions on unique keys.
+- **A slow or flaky check in the `journeys` project** — it blocks every pull request; broad
+  scans belong in `extended`.
 - **`getByRole('alert')` on pages with the route announcer.**
 - **Blindly updating visual snapshots.**
 
@@ -452,9 +566,10 @@ npx playwright test experiment-lifecycle --headed
 
 - Playwright: real browser, real backend, real login via fixtures; serial specs with
   timestamped data; page objects own selectors.
-- Three suites — E2E, visual regression (committed snapshots), accessibility (axe, WCAG 2.1
-  AA) — run nightly.
-- `PLAYWRIGHT_BASE_URL` (3100 default), artefacts on failure, HTML report.
+- Three projects: `journeys` (five `*.journey.spec.ts`) and `sso` are the required `Browser E2E`
+  PR check; `extended` (visual regression, accessibility) runs nightly.
+- `tests/e2e/env.ts` holds `BASE_URL` (3100 default) and `API_URL`; `PLAYWRIGHT_WEB_SERVER`
+  picks reuse, static export or dev server; traces kept on failure; HTML report.
 
 ---
 
@@ -469,10 +584,12 @@ and nothing noticed until a user clicked."
 
 The **URL guard** (`tests/services/url-literals.test.ts`) scans the source for every string
 starting with `/api/v1/`, normalises dynamic segments, and checks each against
-`src/tests/fixtures/openapi.json` — a dump of the backend's live OpenAPI document. A service
-path the backend doesn't serve fails the Jest suite. The fixture is regenerated with `npm run
-openapi:dump` (which runs `python -m backend.scripts.dump_openapi` from the repository root);
-`make openapi` does the same.
+`src/tests/fixtures/openapi.json` — a dump of the backend's OpenAPI document, taken from a
+full-profile build. A service path the backend doesn't serve fails the Jest suite. The fixture
+is regenerated with `npm run openapi:dump` (which runs `python -m backend.scripts.dump_openapi
+--profile full` from the repository root); `make openapi` does that and also rewrites the two
+published API snapshots, `docs/api/openapi-v1.stable.json` (core) and
+`docs/api/openapi-v1.full.json`.
 
 ### In the wild
 
@@ -483,23 +600,47 @@ The guard's contract:
 /**
  * Guard: every `/api/v1/...` URL the dashboard calls must exist on the backend.
  *
- * Scans `src/**` (services, components, pages, hooks, contexts — everything but
- * tests and mocks) for string and template literals starting with `/api/v1/`,
- * expands `${CONST}` prefixes declared as `const X = '/api/v1/...'` in the same
- * file, normalises `${expr}` / `{name}` segments to `{param}` and checks each
- * against the paths (and, when the call names one, the HTTP method) in
- * `src/tests/fixtures/openapi.json`.
+ * Scans the dashboard sources (services, components, pages, hooks, contexts —
+ * everything but tests and mocks) for string and template literals starting
+ * with `/api/v1/`, expands `${CONST}` prefixes declared as
+ * `const X = '/api/v1/...'` in the same file, normalises `${expr}` / `{name}`
+ * segments to `{param}` and checks each against the paths (and, when the call
+ * names one, the HTTP method) in `src/tests/fixtures/openapi.json`.
  *
  * Regenerate the fixture after changing backend routes:
  *   npm run openapi:dump   (= python -m backend.scripts.dump_openapi from the repo root)
+ *
+ * ## Profiles
+ *
+ * The dump is taken from a full-profile build and carries 59 paths that only
+ * the modules serve. A core backend serves the rest, so the rule "every URL
+ * literal exists in the dump" needs a profile, not a single document. Rather
+ * than keeping two dumps in sync, one dump is kept and
+ * `openapi.module-paths.json` names the modules' subset:
+ *
+ *   EXPERIMENTLY_PROFILE=core  →  those 59 paths are removed from the
+ *                                 document, and only the core tree
+ *                                 (`frontend/src`, minus anything the manifest
+ *                                 still lists there) is scanned.
+ *   anything else (default)    →  the whole document, and both trees:
+ *                                 `frontend/src` and `modules/frontend/src`.
+ ...
  */
-const SRC_ROOT = path.resolve(__dirname, '..', '..');
-const FIXTURE = path.join(SRC_ROOT, 'tests', 'fixtures', 'openapi.json');
-const EXCLUDED_DIRS = new Set(['tests', '__mocks__', 'node_modules']);
-...
-function segmentMatches(openapiSeg: string, frontendSeg: string): boolean {
-  if (openapiSeg.startsWith('{') && openapiSeg.endsWith('}')) return true;
 ```
+
+The profile matters here too. In a full run the guard scans both `frontend/src` and
+`modules/frontend/src` against the whole document; in a core run it removes the modules'
+paths from the document and scans only the core tree, so a core page that calls a module
+endpoint fails. (The comment's count of module paths is a snapshot; the list itself is
+`openapi.module-paths.json`.)
+
+A sibling guard does the same for documentation links. `src/tests/services/docs-links.test.ts`
+scans the sources for every `docsUrl('...')` literal (Hour 10) and fails if it does not name a
+file under the app repository's `docs/`. A rename in `docs/` that would leave the dashboard
+pointing at a 404 fails the dashboard's test suite — and, because a pull request that changes
+only `docs/` runs no Node, a Python twin of the same rule runs on those
+(`backend/tests/unit/docs/test_dashboard_docs_links.py`). Same shape as the URL guard: scan
+the literals, resolve each, assert the target is real.
 
 It understands the codebase's own idiom — `const BASE = '/api/v1/experiments'` then
 `` `${BASE}/${id}/start` `` — and matches `${id}` against the spec's `{experiment_id}`. That's
@@ -514,49 +655,102 @@ The scripts:
     "dev": "next dev -p 3100",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "cd .. && eslint --config frontend/eslint.config.mjs --no-error-on-unmatched-pattern --max-warnings 0 frontend/src modules/frontend/src",
     "test": "jest --watchAll=false",
     "test:coverage": "jest --watchAll=false --coverage",
     "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:ui": "playwright test --ui",
     "test:visual": "playwright test visual-regression",
     "test:visual:update": "playwright test visual-regression --update-snapshots",
     "test:a11y": "playwright test accessibility",
-    "openapi:dump": "cd .. && python -m backend.scripts.dump_openapi frontend/src/tests/fixtures/openapi.json"
+    "openapi:dump": "cd .. && python -m backend.scripts.dump_openapi --profile full frontend/src/tests/fixtures/openapi.json",
+    "build:marketing": "NEXT_PUBLIC_SITE_MODE=marketing NEXT_PUBLIC_DOCS_URL=https://getexperimently.github.io/experimently next build && NEXT_PUBLIC_SITE_MODE=marketing node scripts/prune-marketing-site.mjs out"
   },
 ```
 
-`next build` type-checks (`tsc --noEmit` semantics), lints, and writes the static export to
-`out/` because of `output: 'export'`. The CI frontend job runs `npm ci`, `npm test`, `npm run
-build` — a page that doesn't compile can't merge.
+Next 16 removed `next lint`, so `lint` runs ESLint 9 directly with the **flat config** in
+`frontend/eslint.config.mjs` (one exported array of config objects, no `.eslintrc`). It runs
+from the repository root so it can lint `modules/frontend/src` too, and `--max-warnings 0`
+makes a warning fail it. `build:marketing` is the public-site build from Hour 13.
 
-The image — two stages, the routes script, nginx-unprivileged:
+`next build` type-checks and writes the static export to `out/` because of `output: 'export'`;
+it no longer lints. CI splits the work:
+
+- the **`lint`** job runs `npm run lint` and `npx tsc --noEmit`;
+- the **`Frontend Tests`** job runs `npm ci`, `npm test` and `npm run build` — and then the same
+  three things **as the core profile**: `npx tsc --noEmit -p tsconfig.core.json`,
+  `EXPERIMENTLY_PROFILE=core npx jest`, and `EXPERIMENTLY_PROFILE=core npm run build`, failing if
+  the core bundle mentions a module route. Without those steps every check would resolve
+  `@modules/*` to the real modules first, and a core page that leaned on module code would ship
+  through a green CI.
+
+A page that doesn't compile, lint or pass in either profile can't merge.
+
+The image — a stage that picks the modules tree by profile, a build stage with assertions,
+and nginx-unprivileged:
 
 ```dockerfile
 # 📁 frontend/Dockerfile
 ARG NODE_VERSION=22
+ARG EXPERIMENTLY_PROFILE=core
+
+FROM node:${NODE_VERSION}-alpine AS modules-tree-full
+COPY frontend/tsconfig.core.json modules*/frontend /modules/frontend/
+RUN rm -f /modules/frontend/tsconfig.core.json
+
+FROM node:${NODE_VERSION}-alpine AS modules-tree-core
+RUN mkdir -p /modules/frontend
+...
+FROM modules-tree-${EXPERIMENTLY_PROFILE} AS modules-tree
+
 FROM node:${NODE_VERSION}-alpine AS builder
+
+ARG EXPERIMENTLY_PROFILE
 WORKDIR /app/frontend
-ENV NEXT_TELEMETRY_DISABLED=1 \
-    CI=true
-# Full install: next build needs typescript, tailwindcss, postcss,
-# autoprefixer, all of which are devDependencies.
+...
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
+
 COPY frontend/ ./
-# src/pages/docs/[...slug].tsx reads ../docs relative to the frontend dir.
-COPY docs/ /app/docs/
-ARG NEXT_PUBLIC_API_URL=""
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+# modules-alias.js looks for ../modules/frontend/src relative to the frontend dir.
+COPY --from=modules-tree /modules/frontend/ /app/modules/frontend/
+...
 RUN npm run build \
     && test -f .next/routes-manifest.json \
     && node scripts/nginx-routes.mjs --out /app/nginx/routes.conf \
     && test -d out \
-    # The docs pages must have found the markdown; a placeholder means the
-    # docs/ copy above is missing.
+    ...
+    && if [ "$EXPERIMENTLY_PROFILE" = "core" ]; then \
+         ! grep -rlE '/api/v1/workspaces|/api/v1/rbac/' out/_next/static >/dev/null \
+         && grep -rl 'Separate teams into workspaces' out/_next/static >/dev/null; \
+       else \
+         test -d /app/modules/frontend/src \
+         && grep -rlE '/api/v1/rbac/' out/_next/static >/dev/null; \
+       fi
+
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
+...
+LABEL ... \
+      io.experimently.profile="${EXPERIMENTLY_PROFILE}"
+...
+USER root
+RUN apk upgrade --no-cache
 ```
 
-Every `&& test ...` is an assertion: the manifest exists, the routes were generated, the
-export exists, the docs rendered. A build that half-succeeds fails.
+`FROM modules-tree-${EXPERIMENTLY_PROFILE}` picks a stage by name, because `COPY` has no
+conditional: a core build gets an empty directory and never reads `modules/` (a core checkout
+has none). The odd `modules*/frontend` glob paired with an always-present file keeps the full
+stage harmless on builders that build every stage.
+
+Every `&& test ...` is an assertion: the manifest exists, the routes were generated, the export
+exists, and **the bundle matches the profile**. A core bundle must not mention a module API
+path and must contain the stub page's own text; a full bundle must contain a module path. The
+positive half matters as much as the negative: without it, a page that vanished entirely would
+also pass "contains no module path". (It greps for a string, not a chunk filename, because
+Turbopack emits flat content-hashed chunks.) The runtime stage takes Alpine's security fixes at
+build time (`apk upgrade`) and labels the image with its profile. A build that half-succeeds
+fails.
 
 The compose wiring and the PR-gate docker smoke that boots it, logs in and mints a key
 (Build book, Day 24). Node is pinned to 22 in `.nvmrc`, the Dockerfile and CI together.
@@ -593,14 +787,18 @@ docker build -f frontend/Dockerfile -t experimently-web:scratch . && docker run 
 - **Assembling API paths dynamically** (`'/api/v1/' + resource + '/' + id`) — invisible to
   the guard.
 - **Editing `package.json` without `npm install`** — CI's `npm ci` fails.
-- **Building with `frontend/` as the Docker context.**
+- **Building with `frontend/` as the Docker context** — the Dockerfile's paths are relative to
+  the repository root.
+- **Testing only the full profile** — run `tsc -p tsconfig.core.json` and
+  `EXPERIMENTLY_PROFILE=core npx jest` before claiming a core page works.
 - **Forgetting `npm run openapi:dump`** after a backend route change — the guard fails until
   the fixture catches up.
 
 ### Key takeaways
 
-- Ship = `tsc` + Jest + `next build` (static export) + Docker (root context, nginx, routes
-  script) + docker smoke.
+- Ship = ESLint (flat config) + `tsc` + Jest + `next build` (static export), each also as the
+  core profile, + Docker (root context, profile stage, nginx, routes script, bundle-matches-
+  profile assertion) + docker smoke.
 - The URL guard checks every `/api/v1/` literal against the OpenAPI fixture; write paths as
   `BASE` + template literals; regenerate with `npm run openapi:dump`.
 - Lock file in sync; Node 22 everywhere; build assertions in the Dockerfile.
@@ -612,8 +810,9 @@ docker build -f frontend/Dockerfile -t experimently-web:scratch . && docker run 
 ### What & why
 
 Twenty-three hours of conventions as a review checklist. The mechanical half is enforced —
-`strict` TypeScript, `next lint` (ESLint with the React hooks rules), Jest, the URL guard,
-`next build`; the judgement half is below.
+`strict` TypeScript, ESLint 9's flat config with the React hooks rules (`npm run lint`), Jest
+in both profiles, the URL and docs-link guards, `next build`, and the Playwright journeys; the
+judgement half is below.
 
 ### The style guide
 
@@ -637,8 +836,11 @@ Twenty-three hours of conventions as a review checklist. The mechanical half is 
   async loaders; subscriptions add/remove in effect/cleanup; guard `window` for SSR.
 - Hooks at the top level only; `useCallback`/`useMemo` for stable identities;
   `eslint-disable` for `exhaustive-deps` only with a comment.
-- Context via `createContext<T | undefined>` + provider + a `useX()` that throws; memoise
-  values on hot providers; tests mock the hook.
+- Context via `createContext<T | undefined>` + provider + a `useX()` that throws (or returns a
+  documented safe default, like `useModules()`); memoise values on hot providers; tests mock
+  the hook.
+- `useReducer` over a pure state module when several fields change together or more than one
+  view edits the same state.
 
 **Next.js**
 
@@ -648,6 +850,10 @@ Twenty-three hours of conventions as a review checklist. The mechanical half is 
   is UX, the API enforces; redirects via `replace` after `isReady` through `safeNextPath`.
 - `apiBase()`/`wsBase()` for every URL; same-origin in the image; `NEXT_PUBLIC_*` is
   build-time.
+- Core or module? A core page is a file under `src/pages/`; a module page lives under
+  `modules/frontend/src/pages/`, has a stub under `src/modules-stub/pages/`, and is a one-line
+  `@modules/...` re-export in `src/pages/`. Module nav goes in `MODULE_NAV_ITEMS`.
+- Docs are links built with `docsUrl()`, never rendered in-app.
 
 **Data**
 
@@ -657,10 +863,21 @@ Twenty-three hours of conventions as a review checklist. The mechanical half is 
   with mirror interfaces; no React, no state; `|| undefined` to drop empty optionals.
 - `useApi(fetcher, [deps])` for reads; lifecycle actions set pending state, use inline
   confirmation, and adopt the server's response as new state.
-- Forms: controlled inputs, a `validateForm` that mirrors the server (exported for tests),
-  annotated payloads, `e.preventDefault()`, `isSubmitting`, server messages verbatim.
+- Forms: controlled inputs over one reducer, a `validateForm` that mirrors the server (exported
+  for tests), annotated payloads, `e.preventDefault()`, a ref-guarded `isSubmitting`; failures
+  mapped by status (`describeCreateError`), server messages shown otherwise; never a 401
+  redirect that throws away answers.
 - The rule builder's state is the API shape; `rulesToJson` strips client ids; operator
   unions mirror the backend adapter.
+
+**Access**
+
+- The UI is never more permissive than the API. Experiments and flags are by role, not
+  ownership (`canCreateExperiment`, `canChangeExperiment`); the admin area is superuser-only
+  (`withAdminGuard`, nav `superuser: true`); module links show only when the module is
+  installed.
+- A hidden or refused control says why on screen (`experiment-role-note`,
+  `create-not-allowed`, the 403 view's "requires ...").
 
 **UI**
 
@@ -676,14 +893,17 @@ Twenty-three hours of conventions as a review checklist. The mechanical half is 
   `jest-dom` matchers.
 - Pages mock `apiFetch` with `routedApi` (misses throw), `useRouter`, `useAuth`, `next/head`;
   hooks and services mock `global.fetch`/`WebSocket`; `mockReset` in `beforeEach`.
-- Playwright nightly: fixtures log in for real; page objects own selectors; timestamped
-  data; serial specs; snapshots updated only with a reviewed diff.
+- Playwright: the `journeys` project is the required `Browser E2E` PR check, `extended`
+  (visual, accessibility) runs nightly; fixtures log in for real; page objects own selectors;
+  timestamped data; serial specs; snapshots updated only with a reviewed diff.
 - The URL guard passes; `npm run openapi:dump` after backend route changes.
 
 **Shipping**
 
-- `npm test` and `npm run build` green; lock file in sync; Node 22; the image builds from the
-  repo root with the docs; docker smoke passes.
+- `npm run lint`, `npx tsc --noEmit`, `npm test` and `npm run build` green, and the core-profile
+  trio (`tsc -p tsconfig.core.json`, `EXPERIMENTLY_PROFILE=core` Jest and build); lock file in
+  sync; Node 22; the image builds from the repo root for the profile it claims; docker smoke
+  passes.
 
 ### Try It Yourself
 
@@ -693,6 +913,7 @@ whether it complied. Then run the whole local gate once:
 
 ```bash
 cd frontend && npx tsc --noEmit && npm run lint && npm test && npm run build
+npx tsc --noEmit -p tsconfig.core.json && EXPERIMENTLY_PROFILE=core npx jest --watchAll=false
 ```
 
 ### Key takeaways
@@ -734,6 +955,16 @@ the fixture by hand).
 It installs exactly the lock file and fails if `package.json` and the lock disagree —
 catching a forgotten `npm install` instead of silently resolving new versions.
 
+**Q7. Which Playwright tests can block a merge, and which cannot?**
+The `journeys` project (the five `*.journey.spec.ts` files) and the `sso` project run in the
+required `Browser E2E` check on every pull request. The `extended` project — visual regression
+and accessibility — runs nightly and reports; it does not gate a merge.
+
+**Q8. Why does CI build and test the dashboard a second time with `EXPERIMENTLY_PROFILE=core`?**
+Every other step resolves `@modules/*` to the real modules first, so a core page that imports
+module-only code would compile and pass. The core pass resolves only to the stub tree, which
+is what a core build actually has.
+
 **Quiz.** Which two Playwright suites should never be "fixed" by updating an artefact
 without looking, and what's the artefact?
 → Visual regression (committed screenshots — review the diff) and accessibility (there's no
@@ -748,9 +979,10 @@ with a fetcher resolving after 50 ms, asserts `loading` then `data`, then calls 
 asserts the fetcher was called twice.
 
 **E6.2 — A routed page test.** Write the test for `/experiments/new` submitting a valid
-form: install `routedApi` with `POST /api/v1/experiments/` returning `{ id: 'exp-9' }`, fill
-the name, submit, assert the POST body's `variants` sum to 100 and that
-`mockRouter.push` was called with `/experiments/exp-9`.
+single-page form: set up the router mock so the page renders the form at all, install
+`routedApi` with `POST /api/v1/experiments` returning `{ id: 'exp-9' }`, fill the name,
+submit, and assert the POST body's `variants` sum to 100, that the create was sent with
+`redirectOn401: false`, and that `mockRouter.push` was called with `/experiments/exp-9`.
 
 **E6.3 — A page object.** Sketch `FlagsPage` for Playwright with locators for the create
 button, the rows, a row's toggle (`role="switch"`), and a `toggleFirst()` action.
@@ -797,21 +1029,38 @@ it('loads, then refetches', async () => {
 **S6.2**
 
 ```tsx
+// The page renders only a loading marker until the router is ready, and the
+// form exists only in the `?advanced` view; the default view is the wizard.
+const mockRouter = makeRouter({
+  pathname: '/experiments/new',
+  asPath: '/experiments/new?advanced',
+  query: { advanced: '' },        // makeRouter defaults isReady: true and push resolving true
+});
+jest.mock('next/router', () => ({ useRouter: () => mockRouter }));
+
 it('creates an experiment and navigates to it', async () => {
   let body: CreateExperimentRequest | undefined;
   mockedApiFetch.mockImplementation(routedApi([
     { method: 'POST', path: '/api/v1/experiments', handler: (_p, o) => { body = o.json as CreateExperimentRequest; return { id: 'exp-9' }; } },
   ]) as unknown as typeof apiFetch);
   render(<NewExperimentPage />);
-  fireEvent.change(screen.getByLabelText(/name/i), { target: { value: 'Hero test' } });
+  fireEvent.change(screen.getByTestId('experiment-name'), { target: { value: 'Hero test' } });
   fireEvent.submit(screen.getByTestId('new-experiment-form'));
   await waitFor(() => expect(mockRouter.push).toHaveBeenCalledWith('/experiments/exp-9'));
   expect(body!.variants.reduce((s, v) => s + v.traffic_allocation, 0)).toBe(100);
+  expect(mockedApiFetch.mock.calls[0][1]).toEqual(expect.objectContaining({ redirectOn401: false }));
 });
 ```
 
-(The route path is `/api/v1/experiments` because `routedApi` strips only the query string;
-match the literal the service uses — `BASE` without a trailing slash.)
+Three things the old version of this test (a single-page form at `/experiments/new`) did
+not need. **`isReady: true`**: without it the page renders only `new-experiment-loading`.
+**`query: { advanced: '' }`**: without it the page renders the guided wizard, which has no
+`<form>` and no `new-experiment-form`. **A `push` that resolves**: the page awaits
+`router.push` and falls back to a hard navigation when it returns `false`; `makeRouter`'s
+`push` resolves `true`. The route path is `/api/v1/experiments` because `routedApi` strips
+only the query string; match the literal the service uses — `BASE` without a trailing slash.
+The real tests are `src/tests/pages/experiment-new*.test.tsx` (one file per view and concern)
+and, for the pure parts, `src/tests/components/experiment-form-state.test.ts`.
 
 **S6.3**
 
