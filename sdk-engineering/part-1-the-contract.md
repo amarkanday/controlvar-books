@@ -6,10 +6,10 @@
 
 Before a line of client code, the agreement. This Part is the contract every Experimently SDK
 implements: the four endpoints and the one rule that governs them (Hour 1); the hash that
-every SDK still exports and the golden vectors that pin it, together with the story of why
-it's no longer used to decide anything (Hour 2); and the semantics that make fifteen
-implementations behave as one — what's cached, what fans out, and what happens when the
-network is gone (Hour 3).
+every SDK exports and the golden vectors that pin it, together with the story of how the
+server came to use that same hash for experiment assignment (Hour 2); and the semantics that
+make sixteen implementations behave as one — what's cached, what fans out, what happens when
+the network is gone, and when an SDK may answer a flag itself (Hour 3).
 
 ---
 
@@ -24,27 +24,44 @@ authenticated with an API key, addressing experiments and flags by their public 
 
 | Purpose | Method and path | Body / query | Response |
 |---|---|---|---|
-| Assign a user (sticky) | `POST /api/v1/tracking/assign` | `{experiment_key, user_id, context?}` | `{experiment_key, user_id, variant_id, variant_name, is_control, configuration, assigned, reason?}` |
+| Assign a user (sticky) | `POST /api/v1/tracking/assign` | `{experiment_key, user_id, context?}` | `{experiment_key, user_id, variant_id, variant_name, is_control, configuration, assigned, reason}` |
 | Evaluate a flag | `GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…&context=<url-encoded JSON>` | — | `{key, enabled, config, reason}` |
 | Track one event | `POST /api/v1/tracking/track` | `{event_type, event_name?, user_id, experiment_key? \| feature_flag_key?, value?, metadata?, timestamp?}` | stored event |
 | Track up to 100 | `POST /api/v1/tracking/batch` | `{events: [...]}` | `{success_count, failure_count, errors}` |
 
-(Two more exist — `GET /feature-flags/user/{user_id}` for all of a user's flags and `GET
-/tracking/assignments/{user_id}` for a user's assignments — but they're reads for debugging
-and dashboards, not part of the hot path.)
+`assigned` and `reason` are always sent by a current server: an enrolled user gets
+`assigned: true, reason: "assigned"`; only servers that predate the fields omit them.
 
-The **one rule**: _the server decides_. An SDK never buckets a user itself. It asks, caches
-the answer, and reports events. Three reasons, in order of importance:
+More endpoints exist, all under the same API key:
 
-1. **Correctness of the science.** Assignment is `md5("{user_id}:{experiment.id}") % 100`
-   against the variants' cumulative allocation — but only after the sticky-row check, the
-   global holdout, the mutual exclusion group and the targeting gate (Build book Day 4). A
-   client that hashes locally can reproduce the arithmetic but not the gates, and it can't
-   know about a paused experiment, a changed allocation, or a bandit's current weights. Two
-   clients disagreeing about a user's variant is an SRM you'll never find.
+- `POST /api/v1/feature-flags/evaluate/{flag_key}` — the same evaluation with the context in
+  the body instead of the query string.
+- `GET /api/v1/feature-flags/user/{user_id}` (all of a user's flags) and `GET
+  /api/v1/tracking/assignments/{user_id}` (a user's assignments) — reads for debugging and
+  dashboards, not part of the hot path.
+- `POST /api/v1/tracking/errors` and `POST /api/v1/tracking/errors/batch` — client error
+  reports, the numerator of the safety monitor's error rate. No SDK has a method for them
+  yet; an application posts them itself.
+- `GET /api/v1/sdk/ruleset` and `POST /api/v1/tracking/evaluations` (both beta) — the
+  server side of local evaluation (Hour 3). They require a key with the `sdk:ruleset` scope.
+
+The **one rule**: _the server decides_. An SDK never makes a decision the server would make
+differently. By default it asks, caches the answer, and reports events. The JavaScript and
+Python SDKs have an opt-in local mode (Hour 3) for server-side code: it answers **flags**
+in-process only when it can reproduce the server's answer exactly from the server's own
+ruleset, and asks the server otherwise. **Experiments are always assigned by the server.**
+Three reasons, in order of importance:
+
+1. **Correctness of the science.** Assignment hashes `"{user_id}:{experiment.key}"` with the
+   golden-vector function from Hour 2 and walks the variants' cumulative allocation — but only
+   after the sticky-row check, the global holdout, the mutual exclusion group and the
+   targeting gate (Build book Day 4). A client that hashes locally can reproduce the
+   arithmetic but not the gates, and it can't know about a paused experiment, a changed
+   allocation, or a bandit's current weights. Two clients disagreeing about a user's variant
+   is an SRM you'll never find.
 2. **One place to fix bugs.** When the `0% conversions` bug was traced to events being
    matched on `event_type` (Build book Day 1), the fix was one file on the server. Had the
-   matching logic lived in fifteen SDKs, it would have been fifteen releases.
+   matching logic lived in sixteen SDKs, it would have been sixteen releases.
 3. **Configuration is data, not code.** The dashboard's rule editor writes targeting rules;
    the server's `targeting_adapter` evaluates them in three shapes; the SDK sends `context`
    and reads `reason`. Adding an operator to the rules engine changes nothing client-side.
@@ -129,10 +146,14 @@ def _evaluate_flag_by_key(db: Session, flag_key: str, user_id: str, context: Opt
     }
 ```
 
-`record_flag_evaluation` is the line that makes the safety monitor's denominator (Build book
-Day 18): every SDK evaluation increments the count that client-reported errors are divided
-by. An SDK that cached forever would starve the safety monitor of its baseline — one more
-reason the cache has a TTL (Hour 3).
+`record_flag_evaluation` here only increments a Prometheus counter. The safety monitor's
+denominator (Build book Day 18) is elsewhere: `FeatureFlagService.evaluate_flag_detailed`
+writes a `flag_evaluation` metric row for every server-side evaluation, and the safety
+monitor sums those rows and divides the client-reported errors by the total. Evaluations an
+SDK answers locally never reach this endpoint, so the SDK reports their counts to
+`POST /api/v1/tracking/evaluations` instead (Hour 3); the monitor sums both. An SDK that
+cached forever would starve the safety monitor of its baseline — one more reason the cache
+has a TTL.
 
 The API key dependency — hashed lookup, user must be active:
 
@@ -150,6 +171,13 @@ def get_api_key(db: Session = Depends(get_db), api_key_header: str = Depends(API
     if not api_key or not api_key.is_valid:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key", headers={"WWW-Authenticate": "APIKey"})
 ```
+
+A valid key is enough for the four endpoints. The two local-evaluation routes also require
+the key to carry the **`sdk:ruleset`** scope. Only a user who can change feature flags
+(ADMIN or DEVELOPER) can create such a key, and the owner's role is checked again on every
+request: a key without the scope, or one whose owner has since become an ANALYST or VIEWER,
+gets 403. The ruleset contains every flag's targeting rules and the values written in them,
+which is why the key belongs on a server and never in a browser or an app.
 
 And the tracking side of the contract — the event is resolved to a `variant_id` **at write
 time** from the user's assignment row, so the SDK never sends a variant:
@@ -180,7 +208,8 @@ cache, a bug, a malicious caller); the server's own assignment row can't be.
 
 > **By the Way** — the contract's rate limit is per IP and shared across the SDK paths:
 > `SDK_RATE_LIMIT_PER_MINUTE` (default 6,000/min) covers `/tracking/*`,
-> `/feature-flags/evaluate/*` and `/feature-flags/user/*`. A server-side SDK behind a single
+> `/feature-flags/evaluate/*`, `/feature-flags/user/*` and `/sdk/*` (the ruleset that a fleet
+> of servers behind one NAT polls). A server-side SDK behind a single
 > NAT can hit it; that's what the 429 handling in Hour 3 is for, and what the cache is for
 > before that.
 
@@ -192,8 +221,9 @@ cache, a bug, a malicious caller); the server's own assignment row can't be.
 
 ### Try It Yourself
 
-With the stack up and a key from `python backend/scripts/seed_sdk_contract.py` (written to
-`tests/sdk-contract/live/.api_key`):
+With the stack up and the keys from `python backend/scripts/seed_sdk_contract.py` (a plain
+key written to `tests/sdk-contract/live/.api_key`, and a second key with the `sdk:ruleset`
+scope written to `tests/sdk-contract/live/.api_key_local`):
 
 ```bash
 export K=$(cat tests/sdk-contract/live/.api_key)
@@ -209,23 +239,32 @@ curl -s -X POST localhost:8000/api/v1/tracking/track -H "X-API-Key: $K" -H 'Cont
 curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/api/v1/tracking/assign -H 'Content-Type: application/json' -d '{"experiment_key":"sdk_contract_ab","user_id":"x"}'   # 401
 curl -s -X POST localhost:8000/api/v1/tracking/assign -H "X-API-Key: $K" -H 'Content-Type: application/json' -d '{"experiment_key":"nope","user_id":"x"}' | jq .detail             # 404
 curl -s "localhost:8000/api/v1/feature-flags/evaluate/nope?user_id=x" -H "X-API-Key: $K" | jq .detail                                                                          # 404
+# 5. the ruleset: the plain key is refused, the scoped key is served
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/api/v1/sdk/ruleset -H "X-API-Key: $K"                                                 # 403
+curl -s localhost:8000/api/v1/sdk/ruleset -H "X-API-Key: $(cat tests/sdk-contract/live/.api_key_local)" | jq '{schema, bucketing}'   # 1, "md5-mod100-v1"
 ```
 
 Then pause the experiment in the dashboard and repeat step 1: 404 — the SDK's "return
-default variant" path.
+default variant" path. Two more status details every SDK route shares: a NUL or an unpaired
+surrogate in a path segment answers 422, and an unexpected failure answers a fixed sentence
+with a request ID that is also in the `X-Request-ID` header (quote it when you report a bug).
 
 ### Key takeaways
 
 - Four endpoints: assign, evaluate, track, batch — API key in `X-API-Key`, keys not IDs.
 - The server decides: gates, stickiness, bandit weights and `variant_id` resolution all live
-  in one place; a local bucketer can only be wrong.
-- Ineligible = 200 + `assigned:false`; inactive flag = 200 + `reason:"inactive"`; unknown or
-  non-ACTIVE experiment = 404. SDKs must distinguish these.
-- Evaluations feed the safety monitor's denominator; events match on `event_name`.
+  in one place. Local flag evaluation reproduces the server's answer from its ruleset or
+  asks; experiments never leave the server.
+- Ineligible = 200 + `assigned:false` + a reason; inactive flag = 200 + `reason:"inactive"`;
+  unknown or non-ACTIVE experiment = 404. SDKs must distinguish these.
+- Evaluations feed the safety monitor's denominator (server rows, plus counts reported by
+  local mode); events match on `event_name`.
+- The local-evaluation routes need a key with the `sdk:ruleset` scope, owned by an ADMIN or
+  DEVELOPER, kept on a server.
 
 ---
 
-## Hour 2 — The consistent hash: what it's for, what it's no longer for, and the golden vectors
+## Hour 2 — The consistent hash: the function the SDKs and the server's experiment assignment share, and the golden vectors
 
 ### What & why
 
@@ -239,14 +278,30 @@ Every Experimently SDK exports a function — `consistent_hash` / `consistentHas
 
 Until September 2026 that function _was_ the SDK: a client fetched a flag's rollout
 percentage and decided `hash < percentage/100` locally, and several SDKs assigned experiment
-variants the same way. The rewiring (PR #67) moved every decision to the server. The hash
-stayed, for two reasons: **compatibility** (integrations had built on it, and offline tooling
-uses it to reproduce buckets), and **parity testing** — it's a small, pure, language-neutral
-function that's easy to get subtly wrong (endianness, the divisor, signed vs unsigned), so it
-makes a perfect canary for "did this port get the details right?"
+variants the same way. The rewiring (commit `68aa7cd3`) moved every decision to the server.
+The hash stayed in every SDK as an exported utility, for **compatibility** (integrations had
+built on it, and offline tooling uses it to reproduce buckets) and for **parity testing** —
+it's a small, pure, language-neutral function that's easy to get subtly wrong (endianness,
+the divisor, signed vs unsigned), so it makes a perfect canary for "did this port get the
+details right?"
+
+Then the story turned. Measuring the server against the SDKs showed that the server's _own_
+experiment assignment used a different function: the whole 128-bit digest `% 100`, salted
+with the experiment's UUID, which no client has. Issue #81 recorded the disagreement, and the
+fix (#282, commit `b46e5259`) moved the server to the SDK function: **new experiment
+assignments on the server now use exactly the golden-vector hash**, over
+`"{user_id}:{experiment.key}"`. (Those two numbers are from the project's tracker before it
+moved to `getexperimently/experimently`; on the current tracker the same numbers name other
+items, so read the commits.) Hour 9 tells the whole story.
+
+So the hash is now a contract between the SDKs and the server's experiment assignment. The
+SDKs still never use it to decide anything: they ask the server. And it is **not** the only
+bucketing function on the server — flag rollouts use a different one (below), which is what
+local evaluation (Hour 3) reproduces.
 
 Hence the **golden vectors**: a JSON file of `(user_id, flag_key) → md5_hex, expected_hash`
-pairs, plus rollout inclusion vectors at 3/5/50/100%, that every SDK's unit tests check.
+pairs, plus rollout inclusion vectors at 3/5/50/100%, that every SDK and the backend are
+checked against.
 
 ### How Experimently does it
 
@@ -284,7 +339,7 @@ The vectors, with the algorithm written into the file so no reader needs the doc
     },
 ```
 
-The reference implementation, with the "utility only" warning at the top:
+The reference implementation in the Python SDK, whose docstring now says what it is not:
 
 ```python
 # 📁 sdk/python/experimentation/hashing.py
@@ -292,8 +347,11 @@ The reference implementation, with the "utility only" warning at the top:
 
 This is exported as a utility so that ``{user_id}:{flag_key}`` buckets can be
 reproduced offline (and verified against ``tests/sdk-contract/golden-vectors.json``).
-Nothing in the client uses it to decide a variant: assignment and flag
-evaluation are always made by the server.
+It is NOT the function the server buckets flag rollouts with (that is
+``int(md5(...).hexdigest(), 16) % 100``, "md5-mod100-v1", which local
+evaluation reproduces in :mod:`experimentation.evaluator`), and nothing in the
+client uses it to decide a variant or a flag.
+...
 """
 _HASH_DIVISOR = 4294967296  # 2 ** 32
 
@@ -336,7 +394,7 @@ func ConsistentHash(userID, key string) float64 {
 ```
 
 ```java
-// 📁 sdk/java/core/src/main/java/com/experimentationplatform/sdk/ConsistentHash.java
+// 📁 sdk/java/core/src/main/java/com/getexperimently/sdk/ConsistentHash.java
             // Little-endian unsigned 32-bit integer from the first 4 bytes
             // (Python: struct.unpack('<I', digest[:4])[0]).
             long hash = ((bytes[0] & 0xFFL))
@@ -353,67 +411,125 @@ catches and a "does it look random?" test never would. The JS SDK carries its ow
 `md5.ts` (182 lines) because browsers have no synchronous MD5 in the platform, and `crypto`
 isn't available at the edge; the Swift SDK uses CommonCrypto's `CC_MD5`.
 
-The golden-vector tests are the offline half of the contract suite — the `SDK Contract Tests`
-job in the PR gate:
+The golden-vector check is the offline half of the contract suite — the `SDK Contract Tests`
+job in the PR gate. It runs each SDK's **own** exported function, not a copy of the
+algorithm: `tests/sdk-contract/hash_contract.py` drives a thin harness per SDK in
+`tests/sdk-contract/harness/` (python, js, edge, react-native and go) and does every
+comparison itself — the hash within 1e-10, the MD5 digest where the SDK exports one, the
+rollout inclusions, and exactly 9 hash vectors and 2 rollout vectors answered by each SDK.
+`--list` names every other `sdk/` directory and why this job does not run it (iOS needs
+CommonCrypto, Android a Kotlin build); their own hash tests run in the SDK unit-test
+workflow, and the job fails on a directory it does not classify.
+
+**What the server uses.** The backend reads the same file. Its one implementation of the
+contract is `backend/app/core/consistent_hash.py`:
 
 ```python
-# 📁 tests/sdk-contract/test_python_sdk.py
-class TestRolloutVectors:
-    """Validate rollout inclusion/exclusion matches golden vectors."""
+# 📁 backend/app/core/consistent_hash.py
+def hash_user(user_id: str, key: str) -> float:
+    """A stable float in [0.0, 1.0) for *user_id* under *key*.
+    ...
+    """
+    digest = hashlib.md5(
+        f"{user_id}:{key}".encode("utf-8"), usedforsecurity=False
+    ).digest()
+    (uint32,) = struct.unpack_from("<I", digest[:4])
+    return uint32 / HASH_DIVISOR
 
-    @pytest.mark.parametrize("vector", load_golden_vectors()["rollout_vectors"], ids=lambda v: f"rollout_{v['user_id']}:{v['flag_key']}")
-    def test_rollout_inclusion(self, vector):
-        h = compute_hash(vector["user_id"], vector["flag_key"])
 
-        if "rollout_3_percent" in vector:
-            included = h < 0.03
-            assert included == vector["rollout_3_percent"], (...)
+def bucket_of(user_id: str, key: str) -> int:
+    """The same position as an integer in [0, 100).
+    ...
+    """
+    return int(hash_user(user_id, key) * BUCKET_COUNT)
 ```
 
-**What the server actually uses.** Here's the thing the rewiring made explicit: the server's
-_own_ hashes are different functions. Experiment assignment is `md5("{user_id}:{experiment.id}")`
-as a 128-bit integer `% 100` (the experiment's UUID, not its key); flag rollout is
-`md5("{user_id}:{flag.key}")` `% 100 < rollout_percentage`:
+and experiment assignment calls it with the experiment's public key, falling back to the UUID
+only for an experiment that has none:
 
 ```python
 # 📁 backend/app/services/assignment_service.py
-        # Create a hash using user ID and experiment ID
-        hash_input = f"{user_id}:{experiment.id}"
-        hash_value = int(
-            hashlib.md5(hash_input.encode(), usedforsecurity=False).hexdigest(), 16
-        )
+        namespace = experiment.key or str(experiment.id)
+        bucket = bucket_of(user_id, namespace)
+
+        # Cumulative distribution over allocations expressed 0-100.
+        cumulative = 0
+        for variant in experiment.variants:
+            cumulative += variant.traffic_allocation
+            if bucket < cumulative:
+                return variant.id
 ```
+
+Assignment is sticky — `assign_user` only reaches this for a user with no assignment row — so
+changing the function moved nobody who had already been assigned.
+
+**What the server does _not_ use it for.** Flag rollout is a different function, and it did
+not change: the whole MD5 digest of `"{user_id}:{flag.key}"` as a 128-bit integer, `% 100`.
+Local evaluation calls it by the name the ruleset gives it, `md5-mod100-v1`:
 
 ```python
 # 📁 backend/app/services/feature_flag_service.py
+        # Create a hash using user ID and flag key for deterministic assignment
+        hash_input = f"{user_id}:{flag.key}"
+        hash_value = int(
+            hashlib.md5(hash_input.encode(), usedforsecurity=False).hexdigest(), 16
+        )
+
+        # Get bucket (0-99)
         bucket = hash_value % 100
 ```
 
-So an SDK's `consistent_hash(user, flag_key) < 0.05` and the server's `% 100 < 5` are
-_correlated but not identical_ buckets (first-4-bytes-LE ÷ 2³² vs full-digest mod 100). When
-SDKs decided locally, a user could be in the 5% on the client and out of it on the server —
-and the dashboard's counts (server-side) disagreed with what users saw. That's the concrete
-harm behind "the server decides."
+For `user-123` / `my-flag` the contract hash puts the user in bucket **69** and the flag
+rollout function in bucket **79**. Both are deterministic; they are simply different
+functions, and the server keeps several more (holdout, mutual exclusion groups and bandit
+routing each have their own, listed in the docstring of `consistent_hash.py`). Never write
+"one hash everywhere": changing any of them re-buckets users, so none is changed in passing.
 
-> **Did You Know?** The Lambda assignment service (Hour 9) has a _third_ implementation:
-> `md5("{user_id}:{experiment_key}_variant")[:4]` little-endian ÷ (2³² − 1) — the SDK's
-> byte order with a suffixed salt and an off-by-one divisor, walked against the variants'
-> cumulative allocation. It agrees with neither the SDK hash nor the backend's. The drift is
-> documented, not fixed; Hour 9 is about living with it.
+The backend is held to the vectors by its own test, which also pins the difference so a
+"cleanup" cannot quietly merge the two readings:
+
+```python
+# 📁 backend/tests/unit/core/test_consistent_hash.py
+@pytest.mark.regression
+def test_the_whole_digest_modulo_100_is_a_different_answer():
+    """The exact defect #81 describes, pinned so it cannot return.
+
+    This is what `assignment_service` used to do.
+    """
+    old = (
+        int(hashlib.md5(b"user-123:my-flag", usedforsecurity=False).hexdigest(), 16)
+        % 100
+    )
+    assert bucket_of("user-123", "my-flag") == 69
+    assert old == 79
+```
+
+When the change landed, each defect it guards against was planted and the suite watched:
+reading the bytes big-endian failed 3 tests, the old whole-digest `% 100` failed 3, and
+dropping the key from the input failed 4.
+
+> **Did You Know?** There used to be a _fourth_ function. The assignment Lambda under
+> `backend/lambda/` salted the key with `_variant` and divided by 2³² − 1, and agreed with
+> neither the SDKs nor the API. It was deleted in #606; Hour 9 is the case study.
 
 ### Try It Yourself
 
+From a clone of `getexperimently/experimently`:
+
 ```bash
-cd /path/to/experimentation-platform
-python -m pytest tests/sdk-contract/test_python_sdk.py -q -o addopts=""
-node tests/sdk-contract/test_js_sdk.js
+cd experimently
+python tests/sdk-contract/hash_contract.py --list
+python tests/sdk-contract/hash_contract.py python          # add js edge react-native go once they are built
+python -m pytest tests/sdk-contract -q -o addopts=""
+python -m pytest backend/tests/unit/core/test_consistent_hash.py -q -o addopts=""
 python - <<'EOF'
 import hashlib, struct, json
 v = json.load(open("tests/sdk-contract/golden-vectors.json"))["hash_vectors"][0]
 d = hashlib.md5(f"{v['user_id']}:{v['flag_key']}".encode()).digest()
 print(d.hex() == v["md5_hex"], struct.unpack("<I", d[:4])[0] / 2**32 == v["expected_hash"])
-print("big-endian would give", struct.unpack(">I", d[:4])[0] / 2**32)      # the classic port bug
-print("server flag bucket   ", int(d.hex(), 16) % 100)                     # a different function
+print("big-endian would give ", struct.unpack(">I", d[:4])[0] / 2**32)        # the classic port bug
+print("assignment bucket    ", int(struct.unpack("<I", d[:4])[0] / 2**32 * 100))  # 69: the contract
+print("flag rollout bucket  ", int(d.hex(), 16) % 100)                       # 79: a different function
 EOF
 ```
 
@@ -422,23 +538,26 @@ Then write the hash in a language you know that isn't in `sdk/` (bash with `md5s
 
 ### Key takeaways
 
-- The hash: `md5("{user}:{key}")`, first 4 bytes little-endian, ÷ 2³². Exported everywhere,
-  used for decisions nowhere.
-- Golden vectors pin `md5_hex`, `expected_hash` and rollout inclusion; they run offline in
-  the PR gate and catch endianness/signedness/divisor bugs a port is prone to.
-- The server's own buckets (`% 100` on the full digest, UUID-salted for experiments) are
-  different functions — the reason local bucketing was retired.
+- The hash: `md5("{user}:{key}")`, first 4 bytes little-endian, ÷ 2³². Every SDK exports it;
+  the server's experiment assignment uses it over the experiment's public key; no SDK uses it
+  to decide anything.
+- Golden vectors pin `md5_hex`, `expected_hash` and rollout inclusion; the PR gate runs each
+  SDK's own function against them, and the backend's test reads the same file.
+- Flag rollout is a different function (`md5-mod100-v1`: whole digest `% 100`), and so are
+  holdout, mutual exclusion and bandit routing. Local evaluation reproduces the flag
+  function, not the exported hash.
 
 ---
 
-## Hour 3 — Caching, fan-out and failure policy: the semantics every SDK shares
+## Hour 3 — Caching, fan-out, failure policy and local evaluation: the semantics every SDK shares
 
 ### What & why
 
 If the server decides, an SDK's design questions are all about the _in-between_: how long to
 believe an answer, what to do while waiting, what to send when the caller didn't say which
-experiment an event belongs to, and what to do when the server is unreachable. The rewiring
-fixed one answer to each, in the SDK guide, and every port implements it:
+experiment an event belongs to, what to do when the server is unreachable, and — for two
+SDKs — when a flag may be answered without asking. The rewiring fixed one answer to each, in
+the SDK guide, and every port implements it:
 
 **Cache.** Successful assignments and evaluations are cached **per user + key** for
 `cache_ttl` (default 300 s; the edge SDK 60 s). **Failures are never cached** — a transient
@@ -623,7 +742,8 @@ pipeline would make a different choice; this SDK is not one.
 > depends on it, you'll get the cached pre-upgrade answer for up to five minutes. The docs
 > say it in every SDK: "attributes are assumed stable per user; call `clear_cache()` after
 > changing them." The React provider does this for you by re-keying on the attributes'
-> JSON (Hour 6).
+> JSON (Hour 6). A flag answered by local evaluation (below) is computed from the attributes
+> of that call, so the caveat does not apply to it.
 
 > **By the Way** — "nothing cached → nothing sent" surprises people. A server-side SDK that's
 > just been restarted has an empty cache; the first `track("purchase")` without a key sends
@@ -631,6 +751,61 @@ pipeline would make a different choice; this SDK is not one.
 > the user was shown — and the fix is to pass `experiment_key` when you know it, or to
 > assign/evaluate before tracking in the same process. The contract smoke (Hour 11) tests
 > exactly this ordering.
+
+### Local evaluation: when an SDK may answer a flag itself (beta)
+
+Everything above is **server mode**, the default in every SDK. The JavaScript and Python SDKs
+also have an opt-in **local mode** for server-side code, where a flag evaluation is a function
+call instead of a request:
+
+```ts
+const client = new ExperimentationClient({ apiUrl, apiKey: serverKey, evaluation: 'local' });
+const ready = await client.ready({ timeoutMs: 5_000 });   // never rejects; evaluations never wait for it
+const { enabled, reason, source } = await client.evaluateFlag('new_search', { userId: 'user-123', attributes: { country: 'US' } });
+await client.close();                                      // stop refreshing, send the counts
+```
+
+```python
+client = ExperimentationClient(api_url, server_key, evaluation="local")
+client.ready(timeout_seconds=5)                            # never raises; truthy when ready
+flag = client.get_feature_flag("new_search", "user-123", {"country": "US"})
+client.close()                                             # or: with ExperimentationClient(...) as client:
+```
+
+It keeps the one rule by making a narrow promise: **a local answer is the answer the evaluate
+endpoint would give for the ruleset version the process holds — the same `enabled` and the
+same `reason` — or there is no local answer and the SDK makes the server request it makes in
+server mode.** It never guesses. The mechanics:
+
+- **The ruleset.** `GET /api/v1/sdk/ruleset` serves every flag in one normalised document with
+  an `ETag`; a refresh that sends it back in `If-None-Match` gets `304` while nothing changed.
+  Each flag is marked `"evaluation": "local"` or `"remote"`.
+- **What is answered locally.** Only conditions using `eq`, `neq`, `in`, `not_in`, `contains`,
+  `not_contains`, `starts_with`, `ends_with`, `gt`, `gte`, `lt`, `lte`, `is_null` and
+  `is_not_null`, on values the SDK can compare exactly as the server does (strings with
+  strings, numbers with numbers, no coercion). Any other operator, a type mismatch, a number
+  beyond 2⁵³ − 1, an unpaired surrogate, `is_null` on a string containing whitespace, or a
+  flag key the ruleset does not have yet: the server answers.
+- **Bucketing.** Rollouts use the server's flag function, `md5-mod100-v1` (the whole digest
+  `% 100`) — **not** the exported `consistentHash` from Hour 2.
+- **Freshness.** A refresh every 30 s by default (never below 5 s, ±10% jitter); on errors the
+  SDK keeps serving the last ruleset and backs off up to 5 minutes; 401/403 (key revoked,
+  scope removed, owner no longer allowed) **discard** the ruleset and every flag goes to the
+  server. `maxStaleMs` / `max_stale_seconds` bound how old a ruleset may be before evaluations
+  go back to the server.
+- **Where it may run.** Server-side only: the ruleset carries every flag's targeting values,
+  so the key needs the `sdk:ruleset` scope, and the JavaScript SDK throws at construction if
+  asked for local mode in a browser.
+- **The safety denominator.** The server never sees a local evaluation, so the SDK reports
+  counts per flag every 60 s (and on `close()`) to `POST /api/v1/tracking/evaluations`. Two
+  dashboard figures fall as local mode is adopted, because a count carries no user and no
+  rule: a flag's rule-match rate and its unique users.
+- **Experiments stay on the server**, in every mode.
+
+Results carry `source: "local" | "server"` in local mode, and failures of the background
+work are reported through `onError` / `on_error` with the operations `refresh`, `flush` and
+`evaluate`. How the promise is _proved_ — a corpus generated from the server's own evaluator —
+is Hour 10's subject.
 
 ### Try It Yourself
 
@@ -673,6 +848,9 @@ experimentation.types.ExperimentationError: POST /api/v1/tracking/assign failed 
   nothing cached → nothing sent.
 - Detailed methods raise a typed error with `status`; convenience wrappers return
   `"control"` / `False`; `track` never raises; 429 retried once after `Retry-After`.
+- Local mode (JS and Python, server-side, beta): flags only, from `GET /api/v1/sdk/ruleset`,
+  bucketed with `md5-mod100-v1`; anything it cannot answer exactly goes to the server; counts
+  go to `POST /api/v1/tracking/evaluations`.
 - These semantics, not the language, are the SDK. Part III is about keeping them identical.
 
 ---
@@ -682,14 +860,19 @@ experimentation.types.ExperimentationError: POST /api/v1/tracking/assign failed 
 **Q1. A product engineer wants to compute the variant client-side "to save a round trip."
 What's the one-paragraph answer?**
 The server's assignment isn't just a hash: it's sticky rows, holdout, mutual exclusion,
-targeting, bandit weights and the experiment's status. A local hash reproduces none of them
-and uses a different bucket function anyway. Use the cache: one round trip per user per five
-minutes.
+targeting, bandit weights and the experiment's status. The hash is the one every SDK exports,
+but a local hash reproduces none of the rest. That is why even local mode leaves experiments
+on the server. Use the cache: one round trip per user per five minutes.
 
 **Q2. `POST /tracking/assign` returns 200 with `assigned: false, reason: "targeting"`. Is that
 an error the SDK should surface?**
-No. The user is ineligible and gets control; the SDK returns the assignment normally (with
-`is_control: true`) and logs nothing. Only 4xx/5xx are errors.
+No. The user is ineligible and gets control; it is a successful response, not a failure, so
+nothing is logged as an error. The JavaScript and Python SDKs return the assignment with
+`is_control: true` **and** `assigned: false, reason: "targeting"`. Render control, and never
+count that user as enrolled: export only `assigned: true` rows to a warehouse. Against a server
+that predates the fields, JS and Python leave them unset (unknown, not `false`); React
+defaults `assigned` to `true`; the other SDKs drop both fields today, a known gap (issue
+#316, Hour 12). Only 4xx/5xx are errors.
 
 **Q3. Why does the `track` body carry no variant?**
 The server resolves `variant_id` from the user's assignment row at write time; a client-sent
@@ -709,9 +892,18 @@ experiment key, or assign before tracking.
 Not here: the client is on a request path with a ~5 s budget. One retry after `Retry-After`
 (capped at 5 s), then the default. The cache limits how often 429s happen at all.
 
-**Quiz.** A flag is disabled with the kill switch. What does the SDK return, and is it cached?
+**Q7. A service runs the Python SDK in local mode. The API is unreachable for ten minutes and,
+during the outage, someone kill-switches a flag. What do users of that service see?**
+The flag stays on in that process until a refresh succeeds: on errors the SDK keeps serving
+the last ruleset it received. Set `max_stale_seconds` if you would rather fall back to the
+server (which, during an outage, means failures and the safe default) once the ruleset is
+that old. A 401/403 is different: it discards the ruleset at once.
+
+**Quiz.** A flag is disabled with the kill switch. What does a server-mode SDK return, and is
+it cached?
 → `enabled: false, reason: "inactive"` — a successful evaluation, so yes, it's cached for
-the TTL. Re-enabling the flag takes up to five minutes to reach cached users.
+the TTL. Re-enabling the flag takes up to five minutes to reach cached users. In local mode
+the change arrives with the next refresh (30 s by default).
 
 ---
 

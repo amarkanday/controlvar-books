@@ -1,17 +1,17 @@
-# Part III — Fifteen Languages
+# Part III — Sixteen SDKs
 
 ### Hours 7–9
 
 [← Part II](./part-2-building-a-client.md) · [Contents](./README.md) · [Part IV →](./part-4-proving-agreement.md)
 
-The Python and JavaScript SDKs are the references; the other thirteen are ports. This Part is
-about porting well. Hour 7 walks the nine "native" ports — Go, Java (and its Spring Boot
+The Python and JavaScript SDKs are the references; the other fourteen are ports or adapters.
+This Part is about porting well. Hour 7 walks the nine "native" ports — Go, Java (and its Spring Boot
 starter), Swift, Kotlin, Ruby, PHP, .NET, Elixir, Flutter — and shows that each one is the
 same five decisions expressed in its language's idiom for concurrency, errors and lifetime.
 Hour 8 covers the three that sit on a standard or a special runtime: the OpenFeature
-providers, the edge client, React Native. Hour 9 is the cautionary tale: the Lambda
-assignment service, a _second implementation of the server_, and what drift between two
-deciders costs.
+providers, the edge client, React Native. Hour 9 is a case study with an ending: a _second
+implementation of the server's decision_, the four hash functions that drifted apart, and the
+two changes that closed it.
 
 ---
 
@@ -28,8 +28,10 @@ A port has to preserve five things exactly and is free to change everything else
 | Fan-out rule (keyed → `/track`, key-less → `/batch` over cached entries, empty → nothing) | Concurrency model (goroutines, coroutines, async/await, threads, processes) |
 | Failure policy: detailed call fails loudly, convenience call returns a safe default, `track` never fails | How "fails loudly" is spelled (`error`, exception, `throws`, `{:error, _}`, `null`) |
 | The hash and the golden vectors | Everything about packaging and DI |
+| `context` sent on flag evaluation; `assigned`/`reason` passed through on assignment | |
 
-The second column is where language taste lives. The first column is the contract, and the
+The last row is where the ports are not all there yet; the Watch Out at the end of this
+section names the gaps. The second column is where language taste lives. The first column is the contract, and the
 docblock at the top of every client restates it — deliberately, in nearly the same words, so
 a reviewer can diff the _promises_ across ports without reading the code.
 
@@ -39,7 +41,7 @@ a reviewer can diff the _promises_ across ports without reading the code.
 
 ```go
 // 📁 sdk/go/client.go
-// Client is the main interface for interacting with the Experimentation Platform.
+// Client is the main interface for interacting with Experimently.
 // Implementations must be safe for concurrent use by multiple goroutines.
 type Client interface {
 	// EvaluateFlag evaluates a feature flag for the given user via
@@ -90,14 +92,15 @@ type APIError struct {
 }
 ```
 
-`Close()` exists because Go's `http.Transport` keeps idle connections; the Python SDK has no
-`close()` because `urllib` keeps none. Same contract, different resource model.
+`Close()` exists because Go's `http.Transport` keeps idle connections. The Python SDK's
+`close()` is a no-op in server mode because `urllib` keeps none; it does real work only in
+local mode, where there is a refresh thread to stop. Same contract, different resource model.
 
 **Java** — a builder-configured client and a Spring Boot auto-configuration so a Spring app
 gets an injectable bean from four properties:
 
 ```java
-// 📁 sdk/java/spring-boot-starter/src/main/java/com/experimentationplatform/sdk/spring/ExperimentationAutoConfiguration.java
+// 📁 sdk/java/spring-boot-starter/src/main/java/com/getexperimently/sdk/spring/ExperimentationAutoConfiguration.java
 @AutoConfiguration
 @ConditionalOnClass(ExperimentationClient.class)
 @EnableConfigurationProperties(ExperimentationProperties.class)
@@ -121,12 +124,13 @@ public class ExperimentationAutoConfiguration {
 `@ConditionalOnProperty(... name = "api-key")` means the starter does nothing until
 `experimentation.api-key` is set — no bean, no startup failure, no accidental calls to
 `localhost:8000` from a test profile. The comment about milliseconds vs seconds is the kind of
-unit boundary a port introduces and must document (the Lambda has a worse one; Hour 9).
+unit boundary a port introduces and must document (the deleted Lambda copy had a worse one;
+Hour 9).
 
 **Swift** — `async throws`, `NSCache`, an offline store, and the same in-flight dedupe as JS:
 
 ```swift
-// 📁 sdk/ios/Sources/ExperimentationSDK/ExperimentationClient.swift
+// 📁 sdk/ios/Sources/Experimently/ExperimentationClient.swift
 /// ## How it works
 /// - **The server decides.** `evaluateFlag` calls `GET /api/v1/feature-flags/evaluate/{key}`
 ///   and `getAssignment` calls `POST /api/v1/tracking/assign`; no bucketing happens on device.
@@ -158,7 +162,7 @@ week."
 fire-and-forget:
 
 ```kotlin
-// 📁 sdk/android/sdk/src/main/kotlin/com/experimentationplatform/android/ExperimentationClient.kt
+// 📁 sdk/android/sdk/src/main/kotlin/com/getexperimently/android/ExperimentationClient.kt
  * Successful results are also written to the [OfflineStore] (SharedPreferences in
  * production) and read back when the API cannot be reached. Failures are never cached.
  * There is no local bucketing and no "fetch all flag definitions" path: the former
@@ -185,7 +189,7 @@ no-ops so existing integrations compile, and the docblock says so.
 **Ruby, PHP, .NET, Elixir, Flutter** — the same docblock, five more idioms:
 
 ```ruby
-# 📁 sdk/ruby/lib/experimentation_platform/client.rb
+# 📁 sdk/ruby/lib/experimently/client.rb
   # Flag evaluation and experiment assignment are decided by the server; the
   # SDK never buckets users locally. Successful results are cached per
   # user + key for +cache_ttl+ seconds; failures are never cached.
@@ -211,8 +215,8 @@ exposes `EvaluateFlagAsync` / `GetAssignmentAsync` / `TrackAsync` returning `Tas
 Elixir is the port that most changes shape, because the BEAM's unit of state is a process:
 
 ```elixir
-# 📁 sdk/elixir/lib/experimentation_platform/client.ex
-  GenServer client for the Experimentation Platform public API.
+# 📁 sdk/elixir/lib/experimently/client.ex
+  GenServer client for the Experimently public API.
 
   Flag evaluation and experiment assignment are decided by the server; the
   SDK never buckets users locally. Successful results are cached per
@@ -238,6 +242,17 @@ caller would be _correct_ but would give up the drain-on-stop guarantee that thi
 > `cache_ttl_seconds` is seconds. Each is idiomatic; each is documented at the boundary.
 > A port review checklist item: _every_ duration parameter names its unit in the identifier.
 
+> **Watch Out!** Two contract rows are not yet met by every port, and both are open issues
+> rather than design choices. **Context on flag evaluation:** only the React, JavaScript
+> and Python SDKs send the user's attributes as `context` today; the others evaluate with
+> `user_id` alone, so a flag's attribute targeting never matches through them (Ruby's
+> `evaluate_flag` takes `_attributes` and ignores it). Issue #438 tracks the most visible
+> case, native mobile: React Native, iOS, Android and Flutter. **`assigned` / `reason` (#316):** the
+> JavaScript and Python SDKs pass both through (unknown when an older server omits them),
+> React defaults a missing `assigned` to `true`, and the other ports drop both fields — so
+> their callers cannot tell an ineligible user from an enrolled one. A port review should
+> check these two rows explicitly until the issues close.
+
 > **Did You Know?** The Android SDK's Kotlin touches no `android.*` API — deliberately, so
 > `sdk/android/jvm` can compile it for a plain JVM and the contract smoke runs on a Linux CI
 > runner with no Android SDK and no emulator. Designing the port so its core is
@@ -251,8 +266,8 @@ Pick two ports you can run and diff their promises:
 cd sdk/go && go test -race ./... 2>&1 | tail -3
 cd ../ruby && bundle exec rspec 2>&1 | tail -3
 # The docblocks, side by side:
-sed -n '/How it works/,/Thread Safety/p' ../ios/Sources/ExperimentationSDK/ExperimentationClient.swift
-sed -n '1,40p' ../elixir/lib/experimentation_platform/client.ex
+sed -n '/How it works/,/Thread Safety/p' ../ios/Sources/Experimently/ExperimentationClient.swift
+sed -n '1,40p' ../elixir/lib/experimently/client.ex
 ```
 
 Then run the same smoke through both: `python tests/sdk-contract/live/run_live_contract.py
@@ -267,6 +282,8 @@ Then run the same smoke through both: `python tests/sdk-contract/live/run_live_c
 - Mobile ports add an offline store with the 404-never-falls-back rule; server ports add
   lifecycle (`Close`, `stop/1`) where the runtime holds resources.
 - Watch the unit boundaries; keep cores platform-free so CI can run them.
+- Known gaps: only React, JS and Python send `context` on flag evaluation (native mobile is
+  #438); most ports drop `assigned`/`reason` (#316).
 
 ---
 
@@ -292,10 +309,10 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
 ```ts
 // 📁 sdk/openfeature/src/ExperimentationProvider.ts
 /**
- * OpenFeature Provider for the Experimentation Platform.
+ * OpenFeature Provider for Experimently.
  *
  * Implements the @openfeature/server-sdk `Provider` interface on top of
- * `@experimentation-platform/js-sdk`. Every evaluation is decided by the
+ * `@getexperimently/js-sdk`. Every evaluation is decided by the
  * server (`GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…`); the
  * JS SDK caches successful answers per user + flag for `cacheTtlMs` and never
  * caches failures.
@@ -347,7 +364,15 @@ cover its hash. And it's honest about the mismatch between the standards: OpenFe
 concept of experiments or events, so those are reached through `provider.client`, and the
 provider reports the SDK's cache hit as OpenFeature's `CACHED` reason. The Python provider
 mirrors it (`resolve_boolean_details` etc., `Reason.CACHED` / `TARGETING_MATCH` / `DISABLED`
-/ `ERROR`), and the same docblock rules apply.
+/ `ERROR`), and the same docblock rules apply. The JS provider is the package
+`@getexperimently/openfeature-provider` and takes `@openfeature/server-sdk` as a peer
+dependency, so the application chooses the OpenFeature version.
+
+The server once had OpenFeature-shaped routes of its own. The evaluate routes were removed in
+#345 (they never returned a result), and the flag listing under `/api/v1/openfeature/` was
+deprecated in favour of the ruleset and **removed** in #770, in the release after 0.17.0; it
+now answers 404. The providers never used either: they evaluate through the JS and Python
+SDKs, which is why nothing on the client side changed.
 
 **Edge** — zero Node built-ins, a 500 ms default timeout, and a two-level cache:
 
@@ -397,6 +422,12 @@ across isolates:
  *   TTL:   kvTtlMs (defaults to cacheTtlMs)
 ```
 
+The edge client used to be able to download a bootstrap payload of flags from
+`/api/v1/edge/bootstrap`. That route was deprecated in favour of the ruleset (#495) and
+**removed** in #770, in the release after 0.17.0; it now answers 404. The Cloudflare and Deno
+adapters keep their old bootstrap and refresh methods as `@deprecated` no-ops ("There is no
+bootstrap payload any more"), so existing Workers still compile.
+
 The edge client's failure policy is "never throws, safe values" for _every_ method — the
 JS SDK's convenience wrappers become the only API, because an edge function has no one to
 catch an exception and a 500 there takes the whole page down. Same policy family, the
@@ -420,11 +451,12 @@ that throws:
  * `config.onError`.
 ```
 
-React Native is the one SDK the harness can't run against a real runtime — "unit tests only
-(no device runtime)" in the status table — so its contract smoke is a Jest test under
-`testEnvironment: node` that writes its JSON report to a file (Hour 11). The SDK was designed
-so that this is possible: its client is plain TypeScript over `fetch`, with the RN-specific
-storage behind an interface and mocked in tests.
+React Native has no device runtime in CI, but it is still in the live contract: its smoke is a
+Jest test under `testEnvironment: node` that writes its JSON report to a file (Hour 11), and
+the `SDK Live Contract` job runs it on every pull request. The SDK was designed so that this
+is possible: its client is plain TypeScript over `fetch`, with the RN-specific storage behind
+an interface and mocked in tests. What that run does not prove is behaviour on a device
+(Metro bundling, real `AsyncStorage`, backgrounding).
 
 > **By the Way** — the OpenFeature providers send **no** attributes even though the evaluate
 > endpoint accepts `context`. That's a documented gap, not an oversight: OpenFeature's
@@ -455,8 +487,9 @@ console.log(await client.getStringDetails('sdk_contract_flag', 'dflt', { targeti
 "
 ```
 
-Then read `sdk/edge/src/adapters/deno.ts` and sketch a Cloudflare KV `EdgeStore` (its `get`
-/ `put` map directly onto `KVNamespace.get` / `put({expirationTtl})`).
+Then read `sdk/edge/src/adapters/deno.ts` and `sdk/edge/src/adapters/cloudflare.ts` side by
+side: the Cloudflare adapter is a KV-backed `EdgeStore` whose `get` / `put` map onto
+`KVNamespace.get` / `put({expirationTtl})`, with KV's 60-second minimum TTL handled.
 
 ### Key takeaways
 
@@ -464,45 +497,60 @@ Then read `sdk/edge/src/adapters/deno.ts` and sketch a Cloudflare KV `EdgeStore`
   boolean from `enabled` and typed values from `config`, report `CACHED` on SDK cache hits;
   experiments and tracking go through the underlying client.
 - Edge: no Node built-ins, 500 ms timeout, 60 s TTL, memory → KV → network, never throws.
+  The bootstrap route is removed (#770); the adapters keep no-op shims.
 - React Native: JS SDK shape + `AsyncStorage` + `onError`; testable under plain node by
-  design.
+  design, and run by the live contract in CI.
 
 ---
 
-## Hour 9 — The other implementation: Lambda assignment, DynamoDB and the drift problem
+## Hour 9 — Case study: two deciders, four hashes, and how the drift was closed
 
 ### What & why
 
-"The server decides" assumes there is one server. There isn't, quite. `backend/lambda/`
-holds a second implementation of assignment and flag evaluation — Python handlers meant to
-run behind API Gateway with DynamoDB as their store, built for the P50 < 20 ms / 10k rps
-targets the FastAPI service can't promise. It has its own consistent hash, its own targeting
-evaluator, its own holdout and mutual-exclusion logic, and its own unit conventions. It's
-well-tested (71+ tests) and it is _not the same decider_.
+"The server decides" assumes there is one server. Until October 2026 there wasn't, quite.
+`backend/lambda/` held a second implementation of experiment assignment — a Python handler
+meant to run behind API Gateway with DynamoDB as its store, built for latency targets the
+FastAPI service could not promise — with its own consistent hash, its own targeting
+evaluator and its own unit conventions. It was well tested, and it was _not the same
+decider_.
 
-This Hour is about that honestly: what the Lambda does, where it disagrees with the API, and
-what the platform does (and doesn't) do about it. The lesson generalises: every second
-implementation of a decision is a drift liability, and the cost of drift in an
-experimentation system is not a crash — it's an SRM you can't explain.
+This Hour is the story of that drift from discovery to close, in three acts, because it is
+the clearest lesson the SDK work produced: **every second implementation of a decision is a
+drift liability, and the cost of drift in an experimentation system is not a crash — it's an
+SRM you can't explain.** It also shows the two ways to close drift: make the implementations
+agree by contract, or delete one of them. The project did both.
 
 ### How Experimently does it
 
-The Lambda's hash, from the shared module — SDK byte order, SDK-style normalisation, but a
-salt convention nobody else uses:
+**Act 1 — the finding (#81).** Nobody had compared the bucketing functions with each other.
+When someone did, there were four, and they disagreed. The backend's hash module keeps the
+record in its docstring:
+
+```python
+# 📁 backend/app/core/consistent_hash.py
+HISTORY. There were four experiment/flag hashes, and they disagreed (#81).
+
+    openfeature.py          MD5("{user}:{key}"), first 4 bytes LE, / 2^32 (removed, #241)
+    assignment_service.py   MD5("{user}:{experiment.id}"), FULL digest, % 100
+    global_holdout / MEG    MD5("{user}:{salt}"), first 4 bytes LE, % 100
+    lambda/shared           MurmurHash3-ish of the user, salted "{key}_variant"
+
+The first is the contract: ``tests/sdk-contract/golden-vectors.json`` pins it
+and the SDKs implement it. The others were free to drift because
+nothing compared them.
+```
+
+Two of the disagreements were measured, and both are silent. For `user-123` / `my-flag` the
+contract puts the user in bucket **69** and the API's assignment put them in bucket **79**,
+because reading the whole 128-bit digest modulo 100 is a different number from reading the
+first four bytes little-endian. And the API hashed the experiment's UUID primary key, which no
+client has, so nothing outside the server could have agreed with it even in principle.
+
+The Lambda's copy was a third shape. Its shared hasher (still in the repository, deployed by
+nothing) uses the SDK byte order but a suffixed salt and the other divisor:
 
 ```python
 # 📁 backend/lambda/shared/consistent_hash.py
-        # Use experiment_key as salt if none provided
-        hash_salt = salt or experiment_key
-
-        # Calculate hash for traffic allocation check
-        traffic_hash = self._hash(user_id, f"{hash_salt}_traffic")
-        traffic_value = traffic_hash / self.MAX_HASH_VALUE
-
-        # Check if user is in traffic allocation
-        if traffic_value >= traffic_allocation:
-            return None  # User excluded from experiment
-
         # Calculate hash for variant assignment
         variant_hash = self._hash(user_id, f"{hash_salt}_variant")
         variant_value = variant_hash / self.MAX_HASH_VALUE
@@ -517,135 +565,149 @@ salt convention nobody else uses:
 
 ```python
 # 📁 backend/lambda/shared/consistent_hash.py
-    def _hash(self, user_id: str, salt: str) -> int:
-        """
-        Calculate MurmurHash3-like hash for consistent assignment.
-
-        Uses Python's hashlib as a substitute for MurmurHash3.
-        In production, consider using mmh3 library for better performance.
-        """
-        # Combine user_id and salt
-        combined = f"{user_id}:{salt}".encode("utf-8")
-
-        # Use MD5 for deterministic hashing (first 4 bytes as uint32)
-        hash_bytes = hashlib.md5(combined).digest()[:4]
-        hash_value = struct.unpack("<I", hash_bytes)[0]
-
-        return hash_value
+    MAX_HASH_VALUE = 0xFFFFFFFF  # 2^32 - 1
 ```
 
-Compare with the API's assignment (Build book Day 4):
+Side by side, as they stood before the fixes:
 
-| | FastAPI `AssignmentService` | Lambda `AssignmentService` |
+| | API assignment (before #282) | Lambda copy (deleted in #606) |
 |---|---|---|
 | Hash input | `"{user_id}:{experiment.id}"` (UUID) | `"{user_id}:{experiment_key}_variant"` (key + suffix) |
 | Normalisation | full 128-bit digest `% 100` | first 4 bytes LE ÷ (2³² − 1) |
-| Traffic gate | none (allocation is per-variant) | separate `_traffic` hash vs `traffic_allocation` (0.0–1.0) |
+| Traffic gate | none (allocation is per variant) | a separate `_traffic` hash against `traffic_allocation` (0.0–1.0) |
 | Allocation units | percent per variant, summing to 100 | fraction per variant, summing to 1.0 |
-| Stickiness | `assignments` table (Postgres) | `assignments` table (DynamoDB) |
-| Eligibility | holdout → MEG → targeting, via the rules engine + adapter | holdout → MEG → targeting, via the Lambda's own evaluator |
-| Ineligible | 200 + `assigned: false` + reason | `{"variant": null, "excluded": true}` |
+| Eligibility | holdout → mutual exclusion → targeting | its own targeting evaluator; its handler passed no holdout or mutual exclusion config |
 
-Two systems given the same user and experiment will, in general, choose _different_
-variants. Each is internally consistent (sticky within itself), so a product that used only
-one would be fine. A product whose web tier used the API and whose mobile tier used the
-Lambda would have users in two variants at once.
+Given the same user and experiment, the two chose the same variant about half the time on a
+50/50 split — they were independent functions. Each was sticky within itself, so a product
+that used only one would have looked fine; a product whose web tier used the API and whose
+mobile tier used the Lambda would have had users in two variants at once.
 
-The unit drift is the memorable one — the memory file for this repo has carried it for
-months:
+The units row is the memorable one. In the same package, flag `rollout_percentage` is 0–100
+while experiment `traffic_allocation` is 0.0–1.0, and nothing in the types tells them apart:
 
 ```python
 # 📁 backend/lambda/feature_flag_evaluation/evaluator.py
-        rollout_percentage = flag_config.rollout_percentage
-
-        # 0% rollout - no users included
-        if rollout_percentage <= 0:
-            return False
-
-        # 100% rollout - all users included
-        if rollout_percentage >= 100:
-            return True
-
         # Use consistent hashing to determine if user is in rollout
         # Get bucket from 0-99 (100 buckets for percentage)
-        bucket = self.hasher.get_bucket(user_id=user_id, experiment_key=flag_config.key, num_buckets=100)
+        bucket = self.hasher.get_bucket(
+            user_id=user_id, experiment_key=flag_config.key, num_buckets=100
+        )
 
         # User is included if their bucket is less than rollout percentage
         return bucket < rollout_percentage
 ```
 
-`rollout_percentage` is 0–100 for flags; `traffic_allocation` is 0.0–1.0 for experiments —
-in the same Lambda package. Nothing in the type system distinguishes them, and a config
-copied from one to the other is silently wrong (a `0.5` rollout is 0%; a `50` allocation is
-"everyone, and then some").
+A config copied from one to the other is silently wrong: a `0.5` rollout is 0%, a `50`
+allocation is "everyone, and then some".
 
-What's actually deployed? The CDK compute stack ships a **placeholder**:
+**Act 2 — make the API agree with the contract (#282).** The golden-vector hash already had
+the strongest claim: every SDK and the vectors file implemented it. So the API moved to it
+(commit `b46e5259`), over the experiment's public `key`:
 
 ```python
-# 📁 infrastructure/cdk/stacks/compute_stack.py
-        # Create a dummy Lambda function for assignment
-        self.assignment_lambda = lambda_.Function(
-            self,
-            "AssignmentLambda",
-            runtime=lambda_.Runtime.PYTHON_3_11,
-            code=lambda_.Code.from_inline(
-                "def handler(event, context):\n"
-                "    return {\n"
-                "        'statusCode': 200,\n"
-                "        'body': '{\"message\": \"Assignment Lambda placeholder\"}'\n"
-                "    }\n"
-            ),
+# 📁 backend/app/services/assignment_service.py
+        Uses `backend.app.core.consistent_hash`, which is the algorithm
+        `tests/sdk-contract/golden-vectors.json` pins and the SDKs
+        implement. Before #81 this method had its own: MD5 of
+        ``"{user_id}:{experiment.id}"`` read as one 128-bit integer modulo 100.
+        ...
+        Assignment is sticky -- `assign_user` only reaches this for a user with
+        no existing row -- so changing the function re-buckets nobody who has
+        already been assigned.
 ```
 
-and the API Gateway stack routes `GET /assignments` to it. So today: **every SDK calls the
-FastAPI service** (the contract), the Lambda assignment code exists and is tested but is
-not what the placeholder function runs, and the drift is latent rather than live. That is
-the state to preserve until the Lambda is either retired or made a thin proxy — and it's
-why the SDK contract (Part I) names `POST /api/v1/tracking/assign` on the API, never the
-Gateway path.
+Three details made this a safe change rather than a re-bucketing incident. Assignment is
+sticky, so nobody already assigned moved. The backend's new test reads the same
+`golden-vectors.json` the SDKs are held to, so the server cannot drift from them again
+without a red build (Hour 2 quotes it). And the change deliberately touched **only**
+experiment assignment: the flag rollout function, holdout, mutual exclusion and bandit
+routing each kept their own hash, because changing any of them re-buckets users.
 
-The one place the two _do_ meet is real: the bandit scheduler reads DynamoDB counters first
-(`get_experiment_counters`) before falling back to Postgres (Build book Day 19). The
-counters are written by the event-processor Lambda from the Kinesis stream. That's a data
-path, not a decision path — the Lambda counts what the API assigned — and it's the pattern
-that _doesn't_ drift: one decider, many readers.
+**Act 3 — delete the second decider (#606).** Aligning the Lambda would have meant porting
+the hash _and_ the holdout, mutual exclusion and targeting gates, then keeping them aligned
+for ever. And it turned out the Lambda copy was worse than misaligned: its handler passed no
+mutual exclusion or holdout configuration at all, so through it a user would be enrolled in
+every experiment of an exclusion group. No stack had ever deployed it. So it was deleted
+(commit `1599459c`), and the API became the only code that assigns a user to an experiment.
+The directory's README now says so:
 
-> **Watch Out!** "It has 71 tests" is not "it agrees with the API." The Lambda's tests
-> verify the Lambda against itself. There is no cross-implementation test that feeds the same
-> `(user, experiment)` to both deciders and asserts the same variant — because they would
-> fail. If you're asked to wire the real Lambda handler into CDK, that test is the first
-> thing to write, and making it pass means one of the two hash functions changes (with a
-> re-bucketing of every live experiment).
+```markdown
+<!-- 📁 backend/lambda/README.md -->
+# Lambda Functions (not deployed)
 
-> **Did You Know?** The consistent-hash docstring says "MurmurHash3-like … In production,
-> consider using mmh3." It never happened, which is lucky: switching the Lambda to Murmur
-> would have added a _fourth_ bucket function to the family. The golden vectors pin the SDK
-> hash precisely so that a well-meant "performance improvement" can't do this to the SDKs.
+This directory contains AWS Lambda code for event processing and feature flag evaluation.
+**No stack deploys it**; see `docs/integrations/aws.md` for the functions the stacks do deploy.
+Experiment assignment happens only in the API (`POST /api/v1/tracking/assign`), which applies
+the global holdout, mutual exclusion groups and targeting.
+```
+
+and `test_nothing_deploys_backend_lambda` in `infrastructure/tests/test_lambda_functions_doc.py`
+pins it. Precisely: no stack deploys a handler from `backend/lambda/`; the assignment Lambda
+was removed (#606). The stacks do deploy placeholder or inline functions —
+`DatabaseAccessLambda` in the compute stack in every environment, and in a full checkout
+`AnalyticsLambda` (a placeholder) and `ETLTriggerLambda` (a real inline function that starts
+the Glue jobs). What remains under `backend/lambda/` — `event_processor/`,
+`feature_flag_evaluation/` and `shared/` — is code with tests and no deployment.
+
+**One decider, many readers.** The pattern that _doesn't_ drift is the one the bandit
+scheduler uses. It can read per-variant counters from DynamoDB, an optional module, before
+PostgreSQL — but only when they are at least as complete as PostgreSQL's for every variant
+(#426); otherwise it counts assignments and converting users in PostgreSQL itself. Those
+counters were meant to be written by the event-processor Lambda from the Kinesis stream;
+that Lambda is not deployed, and the analytics stack's Kinesis consumer is a placeholder.
+Either way it is a data path, not a decision path: readers count what the one decider
+assigned.
+
+> **Watch Out!** "It is well tested" was never "it agrees with the API". The Lambda's tests
+> verified the Lambda against itself; no test fed the same `(user, experiment)` to both
+> deciders. The fix was not that missing pairwise test but something stronger: **every**
+> implementation is now checked against one file (`golden-vectors.json`), so agreement is
+> transitive. When you find yourself writing a second implementation of a decision, write
+> the shared vector file first.
+
+> **Did You Know?** The Lambda hasher's docstring still says "MurmurHash3-like … In
+> production, consider using mmh3 library". It never happened, which was lucky: switching it
+> to Murmur would have added a _fifth_ bucket function to the family. The golden vectors pin
+> the SDK hash precisely so that a well-meant "performance improvement" can't do this.
 
 ### Try It Yourself
 
+Reproduce Act 1's numbers with nothing but `hashlib`:
+
 ```python
 >>> import hashlib, struct
->>> user, key, exp_id = "user-123", "checkout_redesign", "3f2a9b1c-0000-4000-8000-000000000001"
->>> api_bucket = int(hashlib.md5(f"{user}:{exp_id}".encode()).hexdigest(), 16) % 100            # FastAPI: variant by cumulative %
->>> lam = struct.unpack("<I", hashlib.md5(f"{user}:{key}_variant".encode()).digest()[:4])[0] / 0xFFFFFFFF   # Lambda: [0,1) vs cumulative fractions
->>> sdk = struct.unpack("<I", hashlib.md5(f"{user}:{key}".encode()).digest()[:4])[0] / 2**32              # SDK utility hash
->>> api_bucket, round(lam, 4), round(sdk, 4)
+>>> user, key, exp_id = "user-123", "my-flag", "3f2a9b1c-0000-4000-8000-000000000001"
+>>> d = hashlib.md5(f"{user}:{key}".encode()).digest()
+>>> int(struct.unpack("<I", d[:4])[0] / 2**32 * 100)                 # the contract: API assignment today
+69
+>>> int(d.hex(), 16) % 100                                            # the old API reading (and flag rollout today)
+79
+>>> lam = struct.unpack("<I", hashlib.md5(f"{user}:{key}_variant".encode()).digest()[:4])[0] / 0xFFFFFFFF
+>>> old_api = int(hashlib.md5(f"{user}:{exp_id}".encode()).hexdigest(), 16) % 100   # UUID-salted, as before #282
 ```
 
-For a 50/50 experiment, count over 10,000 synthetic users how often `api_bucket < 50` and
-`lam < 0.5` agree — it's ~50%, i.e. independent. Then run the Lambda's own tests to see
-what they _do_ guarantee: `python -m pytest backend/lambda/assignment/tests -q -o addopts=""`.
+Then read the two commits that closed it, and run the test that keeps it closed:
+
+```bash
+git show --stat b46e5259     # the API adopts the contract hash
+git show --stat 1599459c     # the second decider is deleted
+python -m pytest backend/tests/unit/core/test_consistent_hash.py -q -o addopts=""
+```
+
+Exercise E3.5 measures the agreement rate between the two deciders.
 
 ### Key takeaways
 
-- The Lambda is a second decider with its own hash (`_variant`/`_traffic` suffixed salt,
-  ÷ 2³² − 1), its own evaluator and mixed units (0–100 vs 0.0–1.0); it agrees with the API
-  ~50% of the time on a 50/50 split.
-- The deployed CDK function is a placeholder and all SDKs use the API — the drift is
-  latent. Keep it that way until there's a cross-implementation agreement test.
-- One decider, many readers (DynamoDB counters feeding the bandit scheduler) is the pattern
-  that doesn't drift.
+- Four bucketing functions existed for experiments and flags, and nothing compared them; the
+  API and the Lambda copy chose the same variant about half the time.
+- The API adopted the golden-vector hash over the experiment's key (#282); stickiness meant
+  nobody already assigned moved, and the backend's test now reads the SDKs' vector file.
+- The Lambda copy, which also skipped mutual exclusion and holdout, was deleted (#606). No
+  stack deploys a handler from `backend/lambda/`; experiment assignment happens only in the
+  API.
+- Close drift by contract (one vector file every implementation reads) or by deletion. One
+  decider, many readers.
 
 ---
 
@@ -654,7 +716,9 @@ what they _do_ guarantee: `python -m pytest backend/lambda/assignment/tests -q -
 **Q1. List the five things a port must preserve exactly.**
 Endpoints/bodies/headers; per-user+key cache with TTL, successes only; the fan-out rule;
 the failure policy (loud detailed call, safe convenience call, `track` never fails); the
-hash and its golden vectors.
+hash and its golden vectors. Two more rows are part of the contract but not yet met by every
+port: sending `context` on flag evaluation (#438) and passing `assigned`/`reason` through
+(#316).
 
 **Q2. Go returns `(&EvalResult{Enabled:false}, err)` on failure. Which two contract
 behaviours does that single return satisfy?**
@@ -675,10 +739,14 @@ Because the underlying SDK's cache is where the answer came from, and OpenFeatur
 reasons include `CACHED`; the provider checks `getEvaluatedFlags(userId)` before evaluating
 so it can tell.
 
-**Q6. Two teams integrate the same experiment — one via the Python SDK, one via a hand-rolled
-call to the Lambda. What goes wrong and how would you detect it?**
-Users get different variants per surface (independent hash functions). Detect with an SRM
-per surface and a join of `assignments` in Postgres vs DynamoDB on `user_id`.
+**Q6. Before the fixes in Hour 9, two teams integrated the same experiment — one through the
+API, one through the Lambda copy. What went wrong, how would you have detected it, and what
+closed it?**
+Users got different variants per surface: the two deciders used independent hash functions,
+agreeing about half the time on a 50/50 split, and the Lambda copy also skipped mutual
+exclusion and holdout. Detection: an SRM per surface, and a join of the two assignment stores
+on `user_id`. What closed it: the API moved to the golden-vector hash (#282), then the second
+decider was deleted (#606), so there is one assignment path.
 
 **Quiz.** Elixir runs `evaluate_flag` in the caller's process but `track` in the GenServer.
 What contract guarantee does the second half buy?
@@ -702,14 +770,16 @@ line the harness expects (Hour 11). Verify the hash against the golden vectors f
 the `targetingKey` → `user_id` rule and the aliasing (`country` ↔ `user.country`). List one
 attribute name that would collide.
 
-**E3.4 — Edge store.** Implement a Cloudflare KV `EdgeStore` and show, with two simulated
-isolates sharing one KV, that the second isolate's first `evaluateFlag` makes no network
-call.
+**E3.4 — Edge store.** Read the Cloudflare KV adapter in `sdk/edge/src/adapters/cloudflare.ts`
+and write a test for it: with two simulated isolates sharing one in-memory `KVNamespace`
+fake, show that the second isolate's first `evaluateFlag` makes no network call, and that a
+`cacheTtlMs` of 10 s reaches KV as `expirationTtl: 60`.
 
-**E3.5 — Agreement test.** Write the cross-decider test described in Hour 9: feed 1,000
-`(user, experiment)` pairs to the FastAPI `_hash_user_to_variant` and the Lambda's
-`assign_variant` with equivalent configs; report the agreement rate; mark it `xfail` with a
-reason.
+**E3.5 — Agreement test, after the fact.** Write the cross-decider test that would have caught
+Hour 9's drift: feed 1,000 `(user, experiment)` pairs to the backend's `bucket_of` and to
+`ConsistentHasher.assign_variant` in `backend/lambda/shared/consistent_hash.py` (still in the
+repository, undeployed) with equivalent 50/50 configs, and report the agreement rate. Then
+argue why the project deleted the second decider instead of aligning it.
 
 ---
 
@@ -737,23 +807,43 @@ that `user.country` and a top-level `country` are aliases so a rule written eith
 matches. Collision: an OpenFeature context that supplies both `country` and `user.country`
 with different values — pick top-level wins and say so.
 
-**S3.4**
+**S3.4** — the adapter's store does exactly this:
 
 ```ts
-const kvStore = (ns: KVNamespace): EdgeStore => ({
-  get: k => ns.get(k),
-  put: (k, v, ttlMs) => ns.put(k, v, { expirationTtl: Math.max(60, Math.ceil(ttlMs / 1000)) }),
-});
+// 📁 sdk/edge/src/adapters/cloudflare.ts
+/** Cloudflare KV rejects `expirationTtl` values below 60 seconds. */
+const KV_MIN_TTL_SECONDS = 60;
 ```
 
-(KV's minimum TTL is 60 s — another unit boundary.) Isolate A evaluates → memory + KV;
-isolate B (fresh memory) evaluates → memory miss → KV hit → no `fetch`.
+and its `put` passes `Math.max(KV_MIN_TTL_SECONDS, seconds)` (KV's minimum TTL is 60 s —
+another unit boundary). Fake `KVNamespace` as a `Map` with a recorded `put`. Isolate A
+evaluates → memory + KV; isolate B (a fresh client, same fake) evaluates → memory miss → KV
+hit → the mocked `fetch` is never called; the recorded `put` options show
+`{ expirationTtl: 60 }`.
 
-**S3.5** — build an `Experiment` with two 50% variants and a Lambda `ExperimentConfig` with
-two 0.5 variants and `traffic_allocation=1.0`; for each user compare the chosen variant's
-_position_; agreement ≈ 0.5. `@pytest.mark.xfail(reason="FastAPI and Lambda use different
-bucket functions; see SDK book Hour 9", strict=True)` — `strict` so that if someone
-unifies them, the test starts failing-to-fail and gets promoted.
+**S3.5**
+
+```python
+import sys
+sys.path.insert(0, "backend/lambda")          # `lambda` is a keyword: import `shared` directly
+from shared.consistent_hash import ConsistentHasher
+from backend.app.core.consistent_hash import bucket_of
+
+h = ConsistentHasher()
+variants = [{"key": "control", "allocation": 0.5}, {"key": "treatment", "allocation": 0.5}]
+users = [f"user-{i}" for i in range(1000)]
+agree = sum(
+    ("control" if bucket_of(u, "checkout_redesign") < 50 else "treatment")
+    == h.assign_variant(u, "checkout_redesign", variants, 1.0)
+    for u in users
+)
+print(agree / len(users))                     # ~0.5: independent functions
+```
+
+Agreement is about 0.5 (0.4996 over 10,000 users at the reference commit) — the two are
+independent. Aligning the Lambda would have meant porting the hash _and_ the holdout, mutual
+exclusion and targeting gates, and keeping them aligned for ever, for a function no stack
+deployed. Deleting it left one decider; that is the cheaper invariant.
 
 ---
 

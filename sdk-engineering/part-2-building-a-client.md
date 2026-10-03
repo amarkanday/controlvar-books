@@ -2,7 +2,7 @@
 
 ### Hours 4–6
 
-[← Part I](./part-1-the-contract.md) · [Contents](./README.md) · [Part III →](./part-3-fifteen-languages.md)
+[← Part I](./part-1-the-contract.md) · [Contents](./README.md) · [Part III →](./part-3-sixteen-sdks.md)
 
 Part I fixed the semantics. This Part reads three real implementations of them, chosen because
 each one faces a different environment. The Python SDK (Hour 4) is the reference: synchronous,
@@ -19,8 +19,8 @@ by.
 
 ### What & why
 
-The Python SDK is 460 lines of client plus four small modules — and the four modules are the
-design. **Transport** isolates HTTP so the client can be tested without a network and
+The Python SDK's server mode is a 591-line client plus four small modules — and the four
+modules are the design. **Transport** isolates HTTP so the client can be tested without a network and
 users can swap `urllib` for `requests` or `httpx`. **Request** is one private method that
 turns a `(method, path, body, query)` into decoded JSON or a typed error, with the 429 retry
 in exactly one place. **Cache** is the `UserKeyCache` from Hour 3, twice. **Types** are
@@ -31,6 +31,12 @@ The constraint that shaped it: **no runtime dependencies**. A server-side SDK ge
 into applications with their own pinned `requests`/`urllib3`/`httpx` versions; a dependency
 of our own is a conflict waiting to happen. `urllib.request` is in the standard library and
 is enough for four JSON endpoints.
+
+Local mode (Hour 3) adds two more modules, also standard library only: `local.py` (569
+lines: the refresh thread, backoff, `ready()`/`status()`, and the counts it sends to
+`POST /api/v1/tracking/evaluations`) and `evaluator.py` (495 lines: the operators and the
+`md5-mod100-v1` bucket). Nothing in this Hour depends on them: a client created without
+`evaluation="local"` never fetches a ruleset.
 
 ### How Experimently does it
 
@@ -145,6 +151,11 @@ write:
             variant_name=data["variant_name"],
             is_control=bool(data.get("is_control", False)),
             configuration=data.get("configuration"),
+            # Only taken when the server sent them: a missing ``assigned`` stays
+            # None (unknown), never False, so older servers are not mistaken for
+            # "not enrolled".
+            assigned=data["assigned"] if isinstance(data.get("assigned"), bool) else None,
+            reason=data["reason"] if isinstance(data.get("reason"), str) else None,
         )
         self._assignments.set(user_id, experiment_key, assignment)
         return assignment
@@ -153,7 +164,9 @@ write:
 The shape check matters more than it looks: a proxy that returns an HTML 200 error page, or a
 misconfigured `api_url` that points at the dashboard, would otherwise produce an
 `Assignment` with `variant_name=None` — and _cache it_. The check turns that into a raised
-error with the body attached, and the failure is never cached.
+error with the body attached, and the failure is never cached. Note also how `assigned` is
+read: only a real boolean is taken, so a server that predates the field yields `None`
+("unknown"), never `False` ("not enrolled").
 
 The types:
 
@@ -169,6 +182,8 @@ class Assignment:
     variant_name: str
     is_control: bool
     configuration: Optional[Dict[str, Any]]
+    assigned: Optional[bool] = None
+    reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -177,13 +192,16 @@ class FlagEvaluation:
 
     ``reason`` says why the server decided as it did (``"targeting_rule"``,
     ``"rollout"``, ``"inactive"`` or ``"error"``); ``None`` when the server did
-    not send one.
+    not send one. A local answer carries the reason the server would have given.
+    ``source`` is set only with ``evaluation="local"``: ``"local"`` when answered
+    in-process from the ruleset, ``"server"`` when the server evaluated it.
     """
 
     key: str
     enabled: bool
     config: Any = None
     reason: Optional[str] = None
+    source: Optional[str] = None
 ```
 
 And the batch path, with the index arithmetic that keeps error positions meaningful across
@@ -220,9 +238,11 @@ chunks:
 
 > **By the Way** — `ExperimentationClient` is safe to share between threads: the caches
 > lock, the transport is stateless, and `urllib` opens a connection per call (no pool to
-> corrupt). That's the intended usage — one client per process, created at startup — and
-> the reason there's no `close()`. A pooled transport (`requests.Session`) can be injected
-> by anyone who needs keep-alive; it just has to implement `send`.
+> corrupt). That's the intended usage — one client per process, created at startup. It has a
+> `close()` (and `with ExperimentationClient(...) as client:`), but in server mode it is a
+> no-op: there is nothing to release. In local mode `close()` stops the refresh thread and
+> sends the evaluation counts not yet sent. A pooled transport (`requests.Session`) can be
+> injected by anyone who needs keep-alive; it just has to implement `send`.
 
 > **Watch Out!** `get_all_flags` is **not** cached and **not** part of the fan-out — it
 > returns `{flag_key: bool}` with no `config` or `reason`, so there's nothing complete to
@@ -236,11 +256,11 @@ chunks:
 >>> from experimentation import ExperimentationClient
 >>> c = ExperimentationClient("http://localhost:8000", open("tests/sdk-contract/live/.api_key").read().strip())
 >>> a = c.get_assignment("sdk_contract_ab", "u-hour4", {"country": "US"}); a
-Assignment(experiment_key='sdk_contract_ab', user_id='u-hour4', variant_id='…', variant_name='treatment', is_control=False, configuration=None)
+Assignment(experiment_key='sdk_contract_ab', user_id='u-hour4', variant_id='…', variant_name='treatment', is_control=False, configuration=None, assigned=True, reason='assigned')
 >>> a == c.get_assignment("sdk_contract_ab", "u-hour4")        # cached, equal (frozen dataclass)
 True
 >>> c.get_feature_flag("sdk_contract_flag", "u-hour4")
-FlagEvaluation(key='sdk_contract_flag', enabled=True, config=None, reason='rollout')
+FlagEvaluation(key='sdk_contract_flag', enabled=True, config=None, reason='rollout', source=None)
 >>> c.track("u-hour4", "purchase", event_value=9.99)            # fans out to both
 True
 >>> c.get_feature_flag("nope", "u-hour4")
@@ -260,7 +280,7 @@ send(self, *a): print(a[0], a[1]); return super().send(*a)`) and watch the cache
   (URL, JSON, one 429 retry, typed error), two `UserKeyCache`s, frozen dataclasses.
 - Response shapes are validated before caching; a bad 200 raises and is not cached.
 - No runtime dependencies; thread-safe; one client per process; inject a transport for
-  pooling or tests.
+  pooling or tests. `close()` matters only in local mode.
 - `get_all_flags` is uncached and outside the fan-out by design.
 
 ---
@@ -288,10 +308,14 @@ The class contract:
 ```ts
 // 📁 sdk/js/src/client.ts
 /**
- * Client for the Experimentation Platform public API.
+ * Client for the Experimently public API.
  *
- * - Flag evaluation and experiment assignment are decided by the server; no
- *   local bucketing happens here. `consistentHash` is exported as a utility only.
+ * - By default (`evaluation: 'server'`) flag evaluation and experiment assignment
+ *   are decided by the server. With `evaluation: 'local'` (server-side code only)
+ *   flags are answered in-process from the server's ruleset whenever the answer is
+ *   provably the server's, and by the server otherwise; experiments always stay on
+ *   the server. `consistentHash` is exported as a utility only; it is not the flag
+ *   bucketing function.
  * - Successful evaluations/assignments are cached per user + key for
  *   `cacheTtlMs`; failures are never cached. Concurrent calls for the same
  *   user + key share one in-flight request.
@@ -331,18 +355,34 @@ to in-flight state):
   }
 ```
 
-The key is `` `flag` + NUL + userId + NUL + flagKey `` (written ` ` in the source) — a
+The key is `` `flag` + NUL + userId + NUL + flagKey `` (written `\u0000` in the source) — a
 NUL separator so a user ID containing a colon can't collide with another user + key pair.
-`evaluateFlag` wraps its fetch in it after the cache check:
+`evaluateFlag` tries a local answer first (local mode only), then the cache, then wraps its
+fetch in the dedupe:
 
 ```ts
 // 📁 sdk/js/src/client.ts
   async evaluateFlag(flagKey: string, user: UserContext): Promise<FlagEvaluation> {
     const { userId, attributes } = requireUser(user);
+    if (this.local) {
+      const answer = this.local.answer(flagKey, userId, attributes);
+      if (answer !== DEFER) {
+        const evaluation: FlagEvaluation = {
+          key: flagKey,
+          enabled: answer.enabled,
+          config: null,
+          reason: answer.reason,
+          source: 'local',
+        };
+        // Recorded for the key-less track() fan-out, exactly as a server answer is.
+        this.flags.set(userId, flagKey, evaluation);
+        return evaluation;
+      }
+    }
     const cached = this.flags.get(userId, flagKey);
     if (cached) return cached;
 
-    return this.dedupe(`flag<NUL>${userId}<NUL>${flagKey}`, async () => {
+    return this.dedupe(`flag\u0000${userId}\u0000${flagKey}`, async () => {
       const data = await this.requestJson<FlagEvaluateResponse>(
         `/api/v1/feature-flags/evaluate/${encode(flagKey)}?user_id=${encode(userId)}${contextQuery(attributes)}`
       );
@@ -352,13 +392,17 @@ NUL separator so a user ID containing a colon can't collide with another user + 
         config: data?.config === undefined ? null : data.config,
       };
       if (typeof data?.reason === 'string') evaluation.reason = data.reason;
+      if (this.local) evaluation.source = 'server';
       this.flags.set(userId, flagKey, evaluation);
       return evaluation;
     });
   }
 ```
 
-(`<NUL>` above stands for the ` ` escape in the real file.)
+The local branch runs
+**before** the cache read: a local answer is computed from this call's attributes, so it is
+never stale in the way a cached server answer can be. It is still written to the cache, so the
+key-less `track()` fan-out attributes events to it like any other evaluation.
 
 The request — abort timeout, unbound fetch, typed error codes, one retry:
 
@@ -419,13 +463,18 @@ export type ExperimentationErrorCode =
 ```
 
 `onError` — the only window into swallowed failures, and itself guarded so a throwing
-handler can't break fire-and-forget:
+handler can't break fire-and-forget. Local mode added three operations to it, all background
+work with no caller to reject to:
 
 ```ts
 // 📁 sdk/js/src/types.ts
+export type SwallowedOperation = 'track' | 'trackBatch' | 'refresh' | 'flush' | 'evaluate';
+...
   /**
-   * Called with the error whenever `track` / `trackBatch` swallow a failure.
-   * Those methods never reject; this is the only way to observe their failures.
+   * Called with the error whenever `track` / `trackBatch` swallow a failure, and in local mode
+   * when a ruleset refresh (`'refresh'`), an evaluation-count report (`'flush'`) or a local
+   * evaluation (`'evaluate'`, which then goes to the server) fails.
+   * Those operations never reject; this is the only way to observe their failures.
    */
   onError?: (error: ExperimentationError, operation: SwallowedOperation) => void;
 ```
@@ -525,7 +574,9 @@ for `NETWORK_ERROR`.
 
 - Same semantics as Python plus what the environment demands: `AbortController` timeouts,
   in-flight dedupe keyed by user + key (cleared on settle), injectable `fetch`, `onError`
-  for swallowed failures, a bundled MD5.
+  for swallowed failures (`track`, `trackBatch`, and in local mode `refresh`, `flush`,
+  `evaluate`), a bundled MD5.
+- Local mode answers before the cache, and the constructor refuses it in a browser.
 - `ExperimentationError.code` ∈ HTTP_ERROR | NETWORK_ERROR | TIMEOUT | INVALID_RESPONSE —
   the distinction `fetch` doesn't give you.
 - `Retry-After` accepts seconds or an HTTP-date; the single retry is capped at `timeoutMs`.
@@ -671,12 +722,14 @@ The SSR entry point — same calls, never throws, no hooks:
 ```ts
 // 📁 sdk/react/src/ssr/index.ts
 /**
- * SSR utilities for the Experimentation Platform React SDK.
+ * SSR utilities for the Experimently React SDK.
  *
  * Use these utilities in server-side rendering contexts (Next.js getServerSideProps,
  * Remix loaders, etc.) where browser APIs are not available. ServerClient never throws.
  *
  * @example
+ * import { ServerClient } from '@getexperimently/react-sdk/ssr';
+ *
  * export async function getServerSideProps({ req }) {
  *   const client = new ServerClient({ apiKey: process.env.API_KEY, baseUrl: process.env.API_URL });
  *   const user = { userId: req.session.userId };
@@ -744,15 +797,26 @@ the storefront on the next reload:
 
 ```json
 // 📁 demo/shoplab/tsconfig.json
-      "@experimentation-platform/react-sdk": ["../../sdk/react/src/index.ts"]
+      "@getexperimently/react-sdk": [
+        "../../sdk/react/src/index.ts"
+      ]
 ```
 
 ```js
 // 📁 demo/shoplab/next.config.js
-    config.resolve.alias = {
-      ...config.resolve.alias,
-      '@experimentation-platform/react-sdk': SDK_ENTRY,
+const ALIAS_TARGETS = {
+  '@getexperimently/react-sdk': SDK_ENTRY,
+  // Force a single React copy. ...
+  react: path.resolve(__dirname, 'node_modules/react'),
+  'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
+};
 ```
+
+The `react` and `react-dom` entries force one copy of React: without them the SDK source could
+resolve React from its own directory and every hook would throw "Invalid hook call". One alias
+map, two spellings: webpack takes the absolute paths as they are, and Turbopack
+(the default bundler since Next 16) gets them rewritten relative to the package. StreamPulse
+uses the same alias.
 
 The checkout page tracks with no key — the fan-out attributes the purchase to every
 experiment and flag the storefront showed this visitor:
@@ -768,9 +832,9 @@ And the demo's own tests mock the SDK at the package name, with setters for the 
 needs and a `trackEventMock` to assert on — the pattern for any app that consumes the SDK:
 
 ```tsx
-// 📁 demo/shoplab/src/__mocks__/experimentation-sdk.tsx
+// 📁 demo/shoplab/src/__mocks__/experimently-sdk.tsx
 /**
- * Manual mock of `@experimentation-platform/react-sdk` for jest.
+ * Manual mock of `@getexperimently/react-sdk` for jest.
  *
  * jest.config.js maps the package name here, so pages/components under test get these
  * hooks instead of the real provider. Tests configure return values with `__setExperiment`,
@@ -792,7 +856,7 @@ export const trackEventMock = jest.fn<void, TrackArgs>();
 ### Try It Yourself
 
 ```bash
-cd sdk/react && npm test -- --silent 2>&1 | tail -5          # 215 tests: hooks, provider, SSR, HOC
+cd sdk/react && npm test -- --silent > /tmp/react-sdk-tests.txt 2>&1; tail -5 /tmp/react-sdk-tests.txt   # hooks, provider, SSR, HOC
 cd ../../demo/shoplab && npm run dev                          # http://localhost:3200
 ```
 
@@ -831,8 +895,10 @@ One. The first call puts a promise in `inflight` under the user + key; the other
 the same promise; when it settles, the value is in the cache for the TTL.
 
 **Q4. When is `onError` called, and why can it not throw?**
-Only when `track`/`trackBatch` swallow a failure — it's the only window into them. It's
-wrapped in try/catch because a throwing handler would turn fire-and-forget into a rejection.
+When `track`/`trackBatch` swallow a failure, and in local mode when a ruleset refresh, an
+evaluation-count report or a local evaluation fails — background work with no caller to
+reject to; it's the only window into them. It's wrapped in try/catch because a throwing
+handler would turn fire-and-forget into a rejection.
 
 **Q5. What does `useExperiment` return between mount and the server's answer, and why is
 that safe?**
@@ -923,4 +989,4 @@ work.
 
 ---
 
-**Next:** [Part III — Fifteen Languages →](./part-3-fifteen-languages.md)
+**Next:** [Part III — Sixteen SDKs →](./part-3-sixteen-sdks.md)
