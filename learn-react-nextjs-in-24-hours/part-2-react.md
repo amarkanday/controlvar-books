@@ -128,7 +128,7 @@ truthy; `{a ? <X/> : <Y/>}` picks one. And after the guards, the compiler knows
 `experiment` is not null.
 
 A list with keys — the lifecycle buttons, driven by the status table from Hour 2 and by the
-user's role:
+user's role (abridged where marked `...`):
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
@@ -138,18 +138,22 @@ user's role:
   // refused every lifecycle change, including on an experiment it owns.
   const actions = mayChange ? statusActions : [];
   ...
-            {actions.map((action) => (
-              <button
-                key={action}
-                type="button"
-                onClick={() => onActionClick(action)}
-                disabled={pendingAction !== null}
-                className={`px-3 py-1.5 rounded-md text-sm font-medium ${ACTION_META[action].className}`}
-                data-testid={`action-${action}`}
-              >
-                {pendingAction === action ? ACTION_META[action].pending : ACTION_META[action].label}
-              </button>
-            ))}
+              {actions.map((action) => {
+                const meta = ACTION_META[action];
+                const busy = pendingAction === action;
+                return (
+                  <button
+                    key={action}
+                    type="button"
+                    onClick={() => onActionClick(action)}
+                    disabled={pendingAction !== null}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${meta.className}`}
+                    data-testid={`action-${action}`}
+                  >
+                    {busy ? meta.pending : meta.label}
+                  </button>
+                );
+              })}
 ```
 
 `key={action}` — stable and unique per item. `onClick={() => onActionClick(action)}` — an
