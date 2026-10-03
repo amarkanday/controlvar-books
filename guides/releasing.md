@@ -19,8 +19,9 @@ disagree, the app repository is fixed first and this guide follows it. The app's
 Every pull request is squash-merged to `main` with its title as the commit subject. `release-please` reads
 those subjects and keeps one standing pull request, `chore(main): release X.Y.Z`, that bumps the version and
 writes the changelog. Merging that pull request makes `release-please.yml` tag the merge commit `vX.Y.Z`, open a
-GitHub release, and **call `release.yml` itself through `workflow_call`**, which builds, scans, signs and
-publishes the images and the Helm chart. Nobody runs `release.yml` by hand on the normal path. The docs site is
+GitHub release, and **call `release.yml` itself through `workflow_call`**, which builds, scans and signs the
+images, publishes them, and attaches the Helm chart to the release (the chart is not signed; only the images
+are). Nobody runs `release.yml` by hand on the normal path. The docs site is
 the one thing the release does not deploy: you dispatch it.
 
 ```
