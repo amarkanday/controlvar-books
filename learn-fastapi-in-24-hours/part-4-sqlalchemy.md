@@ -12,7 +12,7 @@ the pool behind it (Hour 16), how the codebase queries — including JSONB and t
 (Hour 17) — and how the schema evolves with Alembic and the bootstrap (Hour 18). Keep `psql`
 open next to Python; the fastest way to understand an ORM is to watch the SQL it emits.
 
-> **Version note.** SQLAlchemy 2.0.52. The codebase uses the **legacy `Query` API**
+> **Version note.** SQLAlchemy 2.0.54. The codebase uses the **legacy `Query` API**
 > (`db.query(Model).filter(...)`) throughout rather than 2.0's `select()`; both work in 2.x,
 > and consistency wins. New code should match the surrounding module.
 
@@ -111,8 +111,18 @@ class FeatureFlag(Base, BaseModel):
     )
     targeting_rules = Column(JSONB)  # Rules for flag enablement
     rollout_percentage = Column(Integer, default=0, nullable=False)  # Gradual rollout
+    ...
+    default_value = Column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     variants = Column(JSONB)  # For multivariate flags
     tags = Column(JSONB)  # For categorization
+    ...
+    workspace_id = Column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
     ...
     @declared_attr
     def __table_args__(cls):
@@ -131,6 +141,13 @@ class FeatureFlag(Base, BaseModel):
     def __repr__(self):
         return f"<FeatureFlag {self.key}>"
 ```
+
+Two columns in that model teach more than their size. `default_value` has a `server_default`
+as well as a Python `default`, and the comment beside it says why: during a rolling deploy the
+*previous* release's image is still inserting rows without naming the column, and only a
+database-side default fills it. `workspace_id` is a bare indexed UUID with no `ForeignKey`,
+because the `workspaces` table belongs to an optional module and a core model must import
+without it; the module attaches the constraint from its own side when it is loaded.
 
 Column types worth knowing: `String(n)` (varchar with a length the database enforces),
 `Text` (unbounded), `Integer`, `Float`, `Boolean`, `DateTime` (naive here),
@@ -159,11 +176,29 @@ user_role_association = Table(
 )
 ```
 
-> **Watch Out!** The `Event` model overrides the mixin's `created_at` with a **`String`**
-> column holding an ISO timestamp. That's a historical wart, not a pattern — `EventService`
-> normalises every timestamp to `2026-09-11T14:03:22.118342+00:00` so string comparison
-> still sorts correctly, and the daily results code parses it back. Don't copy it; do know it
-> when you query `events` by date.
+> **Watch Out!** The `Event` model overrides the mixin's `created_at` with a **string**
+> column holding an ISO timestamp. That's a historical wart, not a pattern. What keeps it
+> sortable is a `TypeDecorator`, so no caller can forget:
+>
+> ```python
+> # 📁 backend/app/models/event.py
+> class UTCTimestampString(TypeDecorator):
+>     impl = String
+>     cache_ok = True
+>
+>     def process_bind_param(self, value: Any, dialect: Any) -> Optional[str]:
+>         if value is None:
+>             return None
+>         return normalize_event_timestamp(value)
+> ...
+>     created_at = Column(UTCTimestampString, nullable=False, index=True)
+> ```
+>
+> `process_bind_param` runs for every value *bound* through the column type — every write,
+> and every comparison: `Event.created_at >= some_datetime` binds `some_datetime` through it
+> too, so both sides are UTC strings in the same shape (`2026-09-11T14:03:22.118342+00:00`).
+> Values read back are returned as stored. Don't copy the string column; do copy the idea of
+> putting a normalisation in the type rather than in every service that touches it.
 
 > **By the Way.** PostgreSQL enum casing bit this codebase once: `ExperimentStatus` values
 > are lower-case (`"draft"`), `FeatureFlagStatus` upper-case (`"ACTIVE"`), and a migration
@@ -197,8 +232,13 @@ schema prefix).
 
 - **`ForeignKey("users.id")` without the schema prefix.** Resolves against `public` and fails
   at `create_all` with "could not find table".
-- **A new model not imported in `backend/app/models/__init__.py`.** Relationship strings
-  can't be resolved; scripts that import only some models get "not mapped".
+- **A new core model not listed in `CORE_MODEL_MODULES`** (`backend/app/models/__init__.py`).
+  `register_core_models()` imports every module in that tuple, and the bootstrap, alembic's
+  `env.py` and the test conftest call it; a model missing from it is missing from the schema
+  they build, and relationship strings to it can't be resolved. A *module's* model is never
+  listed there: the modules package registers it with `hooks.register_model_module()`, and
+  `modules_loader.load_modules()` imports it, so a core checkout (no `modules/` directory)
+  never sees it.
 - **Two import paths for one model.** Two classes, one table — `Class is not mapped`
   errors. Fully qualified imports only.
 - **Mutable Python defaults on JSONB columns** (`default={}`). SQLAlchemy calls callables
@@ -260,7 +300,10 @@ class Variant(Base, BaseModel):
 
 String class names (`"Variant"`) rather than the class itself avoid circular imports — the
 registry resolves them when mappers are configured, which is why every model must be
-imported somewhere before the first query (`backend/app/models/__init__.py` does it).
+imported somewhere before the first query. For core models that is
+`register_core_models()` in `backend/app/models/__init__.py`, which imports every module
+named in `CORE_MODEL_MODULES`; a module's models arrive through
+`hooks.register_model_module()` when the modules package is loaded.
 
 The two delete layers, and where they _disagree_ on purpose: an `Event` outlives its
 experiment at the database level (`SET NULL`) even though the ORM relationship would cascade.
@@ -314,10 +357,11 @@ serialises; two `joinedload`s turn 1 + 2N queries into one.
 > into the join. For large collections use `selectinload` (a second `IN` query) or don't load
 > them at all — count them (Hour 17).
 
-> **Did You Know?** `Variant.assignments` is declared twice in `models/experiment.py` with
-> identical arguments. It's harmless (the second definition replaces the first) and it's the
-> "duplicate SQLAlchemy relationship definitions" warning in `CLAUDE.md`. A _non_-identical
-> duplicate would silently change behaviour — which is why reviewers grep for it.
+> **Did You Know?** A relationship declared twice in one class body is legal Python: the
+> second assignment simply replaces the first. If the two differ, behaviour silently changes —
+> which is why the project's contributor notes warn about duplicate relationship definitions
+> and reviewers grep for them (`git grep -n "assignments = relationship" backend/app/models/experiment.py`
+> shows one per class today).
 
 ### Try It Yourself
 
@@ -378,6 +422,11 @@ Because `SessionLocal` is `autoflush=False`, a query does **not** flush pending 
 first. That's why `create_experiment` calls `flush()` before creating variants: it needs
 `experiment.id` (generated by the Python default on flush) to set `variant.experiment_id`.
 
+One more verb matters when part of a transaction may fail and you want to keep the rest:
+`db.begin_nested()` opens a **savepoint**. Used as a context manager, it releases the
+savepoint on success and rolls back to it on an exception, so one failed attempt does not
+poison the outer transaction.
+
 #### Why the engine's pool settings look the way they do
 
 The engine is the process-wide connection pool. Twenty pooled connections plus twenty
@@ -395,10 +444,13 @@ The canonical create — add, flush for the id, add children, commit, refresh, r
 # 📁 backend/app/services/experiment_service.py
         # Create experiment
         experiment = Experiment(**obj_data)
-        if not experiment.key:
-            experiment.key = self.generate_key(experiment.name)
-        self.db.add(experiment)
-        self.db.flush()  # Flush to get the experiment ID
+        if experiment.key:
+            # A key the caller chose: a conflict is theirs to hear about, so
+            # it propagates unchanged (the endpoint answers 409 naming it).
+            self.db.add(experiment)
+            self.db.flush()  # Flush to get the experiment ID
+        else:
+            self._insert_with_generated_key(experiment)
 
         # Create variants
         for variant_data in variants_data:
@@ -407,7 +459,6 @@ The canonical create — add, flush for the id, add children, commit, refresh, r
 
         # Create metrics
         for metric_data in metrics_data:
-            ...
             metric = Metric(**metric_data, experiment_id=experiment.id)
             self.db.add(metric)
 
@@ -419,8 +470,35 @@ The canonical create — add, flush for the id, add children, commit, refresh, r
 ```
 
 Everything between the first `add` and the `commit` is one transaction: if a metric
-violates the unique `(experiment_id, name)` index, the `commit` raises, nothing is written,
-and the endpoint's `except` turns it into a 400.
+violates the unique `(experiment_id, name)` index, the `commit` raises and nothing is written.
+The endpoint catches `(IntegrityError, DataError)`, rolls back so the session stays usable,
+and answers **409** naming the key when the conflict is on a key the caller chose, or **400**
+with a fixed sentence otherwise (the driver's text goes to the server log, never to the
+client).
+
+A generated key can also collide (it ends in a short random suffix). That case is retried
+inside a savepoint, so a conflict rolls back only the attempt, not the session:
+
+```python
+# 📁 backend/app/services/experiment_service.py
+    def _insert_with_generated_key(self, experiment: Experiment) -> None:
+        for attempt in range(1, KEY_GENERATION_ATTEMPTS + 1):
+            experiment.key = self.generate_key(experiment.name)
+            try:
+                with self.db.begin_nested():
+                    self.db.add(experiment)
+                    self.db.flush()  # Flush to get the experiment ID
+                return
+            except IntegrityError as exc:
+                if attempt == KEY_GENERATION_ATTEMPTS or not (
+                    is_experiment_key_conflict(exc)
+                ):
+                    raise
+                ...
+```
+
+Without the savepoint, the first `IntegrityError` would leave the whole session in a failed
+transaction and every retry would fail with it.
 
 A small write with the same shape:
 
@@ -455,23 +533,45 @@ A no-request session with explicit error handling — the scheduler's tick:
             ...
             db.commit()
         except Exception as e:
-            logger.error(f"Error processing scheduled experiments: {str(e)}")
+            logger.error(f"Error processing scheduled experiments: {e!s}")
             db.rollback()
         finally:
             db.close()
 ```
 
-And a helper that shows why `refresh` and `commit` are separate concerns — the API key's
-`update_last_used` writes a server-side `func.now()` and commits immediately:
+And a write on the hottest path in the app, done as a race-safe Core `UPDATE` rather than
+"load, set, commit". `get_api_key` calls it on every authenticated SDK request, so it writes at
+most about once per key per resolution window, and repeats the staleness test in the
+`WHERE` clause so two workers that race past the in-memory check change nothing:
 
 ```python
 # 📁 backend/app/models/api_key.py
-    def update_last_used(self, db_session) -> None:
-        """Update the last_used_at timestamp."""
-        self.last_used_at = func.now()
-        db_session.add(self)
+    def update_last_used(self, db_session, now: Optional[datetime] = None) -> bool:
+        if now is None:
+            # Naive UTC, like expires_at and is_expired.
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cutoff = now - LAST_USED_RESOLUTION
+        if self.last_used_at is not None and self.last_used_at > cutoff:
+            return False
+
+        cls = type(self)
+        result = db_session.execute(
+            update(cls)
+            .where(
+                cls.id == self.id,
+                or_(cls.last_used_at.is_(None), cls.last_used_at <= cutoff),
+            )
+            .values(last_used_at=now, updated_at=cls.updated_at)
+            .execution_options(synchronize_session=False)
+        )
         db_session.commit()
+        return bool(result.rowcount)
 ```
+
+Three details are worth stealing: the conditional `WHERE` makes the write idempotent under
+concurrency; `updated_at=cls.updated_at` pins the column to itself so the mixin's `onupdate`
+doesn't record "using a key" as "editing it"; and `result.rowcount` tells the caller whether
+a row was actually written.
 
 The engine, once more, with the reasons in the comments:
 
@@ -494,10 +594,12 @@ engine = create_engine(
 > is why the harness creates its session with `expire_on_commit=False`. If you see a
 > `SELECT` you didn't expect right after a commit, that's expiry.
 
-> **By the Way.** `db.commit()` in a **service** is the house convention; endpoints don't
-> commit. That keeps transaction boundaries next to the logic that defines them and lets a
-> service be reused from a scheduler or a script with the same semantics. The one thing an
-> endpoint _does_ do after a service commits is invalidate caches (`cache_control.redis.delete(...)`).
+> **By the Way.** `db.commit()` in a **service** is the house convention; endpoints mostly
+> don't commit. That keeps transaction boundaries next to the logic that defines them and lets
+> a service be reused from a scheduler or a script with the same semantics. The exceptions
+> are deliberate: `create_experiment` writes a compliance-audit row after the service has
+> committed, and commits that itself (the audit service only flushes). And after a service
+> commits, endpoints invalidate caches.
 
 ### Try It Yourself
 
@@ -554,8 +656,9 @@ The `Query` API is a builder: `db.query(Model)` then `.filter(...)`, `.options(.
 
 Three query habits distinguish this codebase:
 
-1. **Count, don't load.** The results engine needs _numbers_ per variant, so it runs
-   `query(func.count(...)).filter(...).scalar()` rather than loading rows.
+1. **Count, don't load.** The results engine needs _numbers_ per variant, so it asks the
+   database for counts (`func.count`, or a `GROUP BY` that returns one row per user) rather
+   than loading whole rows.
 2. **JSONB is queryable.** `Experiment.tags.contains([search])` uses the `@>` containment
    operator; raw SQL uses `jsonb_extract_path_text` and `?` for key existence.
 3. **`text()` is rare, bound, and marked.** Where a query needs SQL the builder can't express
@@ -601,10 +704,27 @@ and pagination:
         experiments = query.offset(skip).limit(limit).all()
 ```
 
-(`hasattr(Experiment, sort_by)` is the guard that keeps a user-supplied sort field from
-becoming an attribute error — and it's why the endpoint documents the allowed values.)
+Look hard at the sort. `hasattr(Experiment, sort_by)` is *not* a whitelist: a mapped class
+has plenty of attributes that are not sortable columns (`metadata`, `registry`, relationships
+such as `variants`), and `hasattr` is true for all of them. When a parameter can only take a
+handful of values, say so in its type and let FastAPI refuse anything else with a 422 before
+the handler runs:
 
-The core counting queries — the Week 1 join, as SQLAlchemy:
+```python
+from typing import Literal
+
+SortField = Literal["created_at", "updated_at", "name", "status"]
+
+def list_experiments(sort_by: SortField = Query("created_at"), ...):
+    sort_field = getattr(Experiment, sort_by)   # only ever one of the four columns
+```
+
+That is the general rule for any user-supplied identifier — a column name, a sort key, a
+table: map it through a closed set (a `Literal`, an `Enum`, or a dict from allowed names to
+columns), never through `getattr` on a class guarded by `hasattr`.
+
+The core counting queries — the Week 1 join, as SQLAlchemy. The denominator is assignments
+per variant; the numerator is **converting users**, not conversion events:
 
 ```python
 # 📁 backend/app/services/analysis_service.py
@@ -613,25 +733,49 @@ The core counting queries — the Week 1 join, as SQLAlchemy:
         for variant_id in variant_ids:
             count = (
                 self.db.query(func.count(Assignment.id))
-                .filter(Assignment.experiment_id == experiment.id, Assignment.variant_id == variant_id)
-                .scalar() or 0
+                .filter(
+                    Assignment.experiment_id == experiment.id,
+                    Assignment.variant_id == variant_id,
+                )
+                .scalar()
+                or 0
             )
             assignments[variant_id] = count
 
-        # Get conversion counts per variant
+        # Converting users per variant (event_matching.py): a user with
+        # several conversion events counts once, so conversions <= assignments.
         conversions = {}
         for variant_id in variant_ids:
-            count = (
-                self.db.query(func.count(Event.id))
-                .filter(
-                    Event.experiment_id == experiment.id,
-                    Event.variant_id == variant_id,
-                    conversion_event_filter(metric.event_name),
-                )
-                .scalar() or 0
+            conversions[variant_id] = count_converting_users(
+                self.db, experiment.id, variant_id, metric.event_name
             )
-            conversions[variant_id] = count
 ```
+
+`count_converting_users` groups the matching events by user and keeps only users who are
+actually assigned to the variant the event is tagged with:
+
+```python
+# 📁 backend/app/services/event_matching.py
+def _converters(
+    db: Session, experiment_id: Any, variant_id: Any, criterion: Any
+) -> List[Tuple[str, Any]]:
+    rows = (
+        db.query(Event.user_id, func.min(Event.created_at))
+        .filter(
+            Event.experiment_id == experiment_id,
+            Event.variant_id == variant_id,
+            criterion,
+        )
+        .group_by(Event.user_id)
+        .all()
+    )
+    return [(str(user_id), first) for user_id, first in rows]
+```
+
+A user who purchased three times counts once, and an event from a user with no assignment to
+that variant does not count, so a conversion rate can never exceed 100%. Counting
+`func.count(Event.id)` would answer a different question ("how many purchase events"), and
+the rates built on it would be wrong.
 
 `conversion_event_filter` returns a **criterion object** — a reusable piece of `WHERE` — which
 is how one rule is shared by every analysis path:
@@ -705,8 +849,10 @@ The advisory lock is the other `text()` in the codebase — bound parameter, no 
 
 > **Watch Out!** `.count()` on a `Query` wraps your query in `SELECT count(*) FROM (...)`;
 > `query(func.count(Model.id)).scalar()` is the direct form. Both are fine; the direct form
-> is what the codebase uses for per-variant counts and it composes with `filter()` cleanly.
-> Never load `.all()` to `len()` it.
+> is what the codebase uses for per-variant assignment counts and it composes with `filter()`
+> cleanly. Never load whole model rows to `len()` them; when you need distinct users, select
+> just the user column with `GROUP BY` (as `_converters` does) or count
+> `func.distinct(...)`.
 
 > **Did You Know?** `Experiment.tags.contains([search])` compiles to `tags @> '["search"]'`
 > — PostgreSQL's JSONB containment, which uses the GIN index if one exists. `.has_key("k")`
@@ -731,9 +877,11 @@ q2 = db.query(Experiment).filter(Experiment.tags.contains(["checkout"]))
 print(q2.statement.compile(dialect=postgresql.dialect()))
 ```
 
-Then write the query for "distinct users who converted per variant" (the dedup Day 6 of the
-Build book mentions) — `func.count(func.distinct(Event.user_id))` — and compare its count
-with the event count for a demo experiment.
+Then, for a demo experiment, compare `func.count(Event.id)` with
+`func.count(func.distinct(Event.user_id))` over the same `conversion_event_filter` — events
+versus users — and then with `count_converting_users(db, exp.id, variant_id, "purchase")`,
+which also drops users not assigned to the variant. The last number is the one `/results`
+reports.
 
 ### Common mistakes
 
@@ -744,6 +892,10 @@ with the event count for a demo experiment.
 - **Interpolating a request value into `text()`.** Bound parameters only; the scan blocks it
   for a reason.
 - **Loading rows to count them.** `func.count(...).scalar()`.
+- **Counting events when you mean users.** A conversion rate's numerator is converting users
+  (`count_converting_users`), never `func.count(Event.id)`.
+- **Turning a user-supplied name into an attribute with `getattr`.** Declare the allowed
+  values (`Literal`/`Enum`) on the parameter instead.
 
 ### Key takeaways
 
@@ -756,107 +908,194 @@ with the event count for a demo experiment.
 
 ---
 
-## Hour 18 — Alembic: revisions, autogenerate, the bootstrap
+## Hour 18 — Alembic: two heads, autogenerate, the bootstrap
 
 ### What & why
 
-**Alembic** versions the schema as a chain of revision scripts under
-`backend/app/db/migrations/versions/`. Each has a `revision` id, a `down_revision` pointing to
-its parent, `upgrade()` and `downgrade()`. The database records which revision it's at in
-`alembic_version` (schema-qualified here). `upgrade head` applies what's missing;
-`revision --autogenerate` diffs the models' metadata against the database and drafts a script.
+**Alembic** versions the schema as a graph of revision scripts. Each has a `revision` id, a
+`down_revision` pointing to its parent, `upgrade()` and `downgrade()`. The database records
+the revisions it is at in an `alembic_version` table (schema-qualified here). `upgrade`
+applies what's missing; `revision --autogenerate` diffs the models' metadata against the
+database and drafts a script.
 
-Experimently's twist, met in the Build book: the chain **can't build a fresh database**
-(older autogenerated revisions re-create tables), so a fresh database is built by
-`backend.app.db.bootstrap` — `Base.metadata.create_all` from the models, then `alembic stamp
-head` — and only _existing_ databases run `upgrade head`. Models are truth; migrations are
-the delta.
+Experimently's graph has a shape most tutorials never show you: **two heads**.
+
+- The **core chain** lives in `backend/app/db/migrations/versions/`.
+- The **`modules` branch** lives in `modules/backend/app/db/migrations/versions/`. Its first
+  revision, `modules_0001_rbac`, has `branch_labels = ("modules",)` and a `down_revision` on
+  the core chain, so the branch forks off a real core revision and grows on its own.
+
+`alembic.ini` lists both directories under `version_locations`, and alembic skips a listed
+directory that does not exist. So a **full** checkout (with `modules/`) has two heads, and a
+**core** checkout (no `modules/`) has one. That separation is the point: deleting `modules/`
+leaves a consistent core chain behind.
+
+Three consequences follow, and they are the whole of this Hour's day-to-day practice:
+
+1. **Upgrade with `heads`, plural.** `upgrade heads` applies every branch. The singular form
+   names one head, and with two present alembic refuses: *"Multiple head revisions are present
+   for given argument 'head'; please specify a specific target revision, '<branchname>@head'
+   to narrow to a specific head, or 'heads' for all heads"*. On a core checkout `heads` names
+   the one head just the same, so `heads` is always right.
+2. **A new revision names the head it extends.** A bare `revision --autogenerate` fails with
+   *"Multiple heads are present; please specify the head revision on which the new revision
+   should be based, or perform a merge."* Pass `--head <core head id>` for a core change, or
+   `--head modules@head` for a module's; alembic writes the file beside the head it extends,
+   so a modules revision lands in `modules/backend/app/db/migrations/versions/`.
+3. **Never merge the two heads.** Alembic's own error message suggests a merge. Ignore it
+   here (see the Watch Out below).
+
+The second twist, met in the Build book: the historical chain **can't build a fresh
+database** (several old autogenerated revisions re-create tables earlier ones created). So a
+fresh database is built by `python -m backend.app.db.bootstrap` — the schema is created from
+the models, then every head is stamped — and only _existing_ databases run `upgrade heads`.
+Models are truth; migrations are the delta.
 
 ### In the wild
 
-`env.py` wires Alembic to the same `POSTGRES_*` variables everything else uses and puts the
-version table in the app schema:
+`env.py` builds the database URL from the same `POSTGRES_*` variables everything else uses,
+and it has to be careful about it:
 
 ```python
 # 📁 backend/app/db/migrations/env.py
-# Import your models
-from backend.app.models import Base
+from backend.app.db.schema import export_schema_name, metadata_for_schema
+from backend.app.db.url import postgres_url as build_postgres_url
 
-# Set target_metadata to your SQLAlchemy models
-target_metadata = Base.metadata
-
-# Get schema from environment variable
-schema = os.environ.get("POSTGRES_SCHEMA", "experimentation")
-db_name = os.environ.get("POSTGRES_DB", "experimentation")
-
-_db_user = os.environ.get("POSTGRES_USER", "postgres")
-_db_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
-_db_host = os.environ.get("POSTGRES_SERVER") or os.environ.get("POSTGRES_HOST") or "localhost"
-_db_port = os.environ.get("POSTGRES_PORT", "5432")
-postgres_url = f"postgresql://{_db_user}:{_db_password}@{_db_host}:{_db_port}/{db_name}"
-config.set_main_option("sqlalchemy.url", postgres_url)
+schema = export_schema_name()
 ...
-    context.configure(url=url, target_metadata=target_metadata, literal_binds=True,
-                      dialect_opts={"paramstyle": "named"}, version_table_schema=schema)
+from backend.app.models import register_core_models  # noqa: E402
+from backend.app.modules_loader import require_modules_or_absent  # noqa: E402
+
+Base = register_core_models()
+# Strict on purpose: if the modules package is present but fails to register,
+# target_metadata would hold only the core tables and autogenerate would
+# propose dropping every module table. Better to refuse than to be quiet.
+require_modules_or_absent()
+...
+target_metadata = metadata_for_schema(Base, schema)
+...
+postgres_url = build_postgres_url(
+    user=_db_user,
+    password=_db_password,
+    host=_db_host,
+    port=_db_port,
+    database=db_name,
+)
+config.set_main_option("sqlalchemy.url", postgres_url.replace("%", "%%"))
 ```
+
+Four lessons hide in those lines:
+
+- **`build_postgres_url` percent-encodes the user and password.** A password containing `@`,
+  `/` or `#` would otherwise break the URL. Then `.replace("%", "%%")` escapes the result
+  *once more*, for this path only: alembic's config is a `configparser`, which reads `%` as
+  interpolation, so an encoded `%23` would be refused. `%%` is configparser's own escape and
+  is undone when the value is read back.
+- **The models are registered explicitly** (`register_core_models()`, then the modules' own
+  models through the seam), and a present-but-broken `modules` package is refused — because
+  autogenerate compares against whatever is in `target_metadata`, and a missing table there
+  is a proposed `drop_table`.
+- **`metadata_for_schema(Base, schema)`** hands alembic the metadata as it reads on the
+  schema this run resolved, so the metadata autogenerate compares and the schema it reflects
+  are the same string by construction.
+- **The comparison is scoped.** `context.configure(...)` passes `version_table_schema=schema`
+  (the version table lives in the app schema), `include_schemas=True` (reflect that schema,
+  not `public`), an `include_name` filter that keeps every *other* schema out, and an
+  `include_object` filter that keeps the module tables out of a core-chain autogenerate.
 
 The bootstrap's decision and its two branches:
 
 ```python
 # 📁 backend/app/db/bootstrap.py
-def has_alembic_version(engine: Engine, schema: str) -> bool:
-    return inspect(engine).has_table("alembic_version", schema=schema)
+    if has_alembic_version(engine, schema):
+        ...
+        if may_run_alembic(cfg, recorded_revisions(engine, schema), schema):
+            logger.info(
+                "alembic_version present in schema %s: running upgrade heads", schema
+            )
+            command.upgrade(cfg, "heads")
+        result = "upgraded"
+        reconcile_with_models(engine, schema)
+    else:
+        logger.info(
+            "Fresh database: creating schema %s from models and stamping heads",
+            schema,
+        )
+        create_from_models(engine, schema)
+        # POSTGRES_SCHEMA already names `schema` -- alembic_sees_schema().
+        command.stamp(cfg, "heads")
+        result = "created"
 
-
-def create_from_models(engine: Engine, schema: str) -> None:
-    """Create every table defined by the SQLAlchemy models inside *schema*."""
-    Base = _point_models_at_schema(schema)
-    Base.metadata.create_all(bind=engine)
+    ensure_first_superuser(engine, schema)
 ```
 
-A hand-finished migration in the house style — docstring with the epic, a schema helper,
-explicit revision ids, backwards-compatible nullable columns:
+It runs under a PostgreSQL advisory lock, so several replicas starting at once queue rather
+than race, and it creates the first administrator from `FIRST_SUPERUSER` /
+`FIRST_SUPERUSER_PASSWORD` when the `users` table is empty. `reconcile_with_models` is what
+makes a profile switch (a core database met by a full build) land on the same schema a fresh
+full bootstrap builds; it creates missing **module** tables only, never a core table whose
+migration somebody forgot to write.
+
+A hand-finished migration in the house style — a docstring that says what and why, explicit
+revision ids, the schema from the environment, and an **expand** step that the previous
+release's image survives:
 
 ```python
-# 📁 backend/app/db/migrations/versions/ep057_workspaces.py
-"""EP-057: Add Multi-Tenant Team Workspaces tables
-
-Revision ID: ep057_workspaces
-Revises: ep046_llm_experiments
-Create Date: 2026-03-07 00:00:00.000000
+# 📁 backend/app/db/migrations/versions/a89544fb1075_feature_flags_store_a_default_value.py
+"""Feature flags: a ``default_value`` column, false on every row
 ...
-Adds nullable workspace_id foreign-key columns to:
-  experiments    -- backwards-compatible; NULL = legacy/unscoped
-  feature_flags  -- backwards-compatible; NULL = legacy/unscoped
+The server default is load-bearing beyond that first fill.  The previous
+release's image does not know the column, so its INSERTs do not name it; during
+a deploy, and after an image-only rollback (``rollback.yml``), the database
+supplies false.  Without the default those INSERTs fail on ``NOT NULL``.
+...
+Core chain, extending the core head ``d12cbd384bbe`` (generated with
+``revision --autogenerate --head d12cbd384bbe``, then edited).  Nothing here
+touches a module table, so a full checkout still has exactly two heads: this
+revision and ``modules_0002_warehouse_analysis``.
+...
 """
+...
+# revision identifiers, used by Alembic.
+revision: str = "a89544fb1075"
+down_revision: Union[str, None] = "d12cbd384bbe"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
 
-# Revision identifiers
-revision: str = "ep057_workspaces"
-down_revision: Union[str, None] = "ep046_llm_experiments"
-branch_labels = None
-depends_on = None
-
-
-def _schema() -> str:
-    """Return the current Alembic migration schema (falls back to 'public')."""
-    ...
-    return os.environ.get("POSTGRES_SCHEMA", schema)
-
-
+# The schema name comes from the deployment's own environment, never from a
+# request.
+_SCHEMA = os.environ.get("POSTGRES_SCHEMA", "experimentation")
+...
 def upgrade() -> None:
-    schema = _schema()
+    if not _has_column():
+        op.add_column(
+            _TABLE,
+            sa.Column(
+                _COLUMN, sa.Boolean(), nullable=False, server_default=sa.false()
+            ),
+            schema=_SCHEMA,
+        )
 
-    # ── 1. workspaces ─────────────────────────────────────────────────────────
-    op.create_table(
-        "workspaces",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.Column("name", sa.String(200), nullable=False),
-        sa.Column("slug", sa.String(50), nullable=False, unique=True),
-        ...
-        schema=schema,
-    )
+
+def downgrade() -> None:
+    op.drop_column(_TABLE, _COLUMN, schema=_SCHEMA)
+```
+
+Note the `--head d12cbd384bbe` in its docstring, the guard that makes it a no-op on a schema
+the bootstrap already built from the models, and the closing sentence: after this revision a
+full checkout *still* has exactly two heads.
+
+And the other branch's root, which is what makes the second head:
+
+```python
+# 📁 modules/backend/app/db/migrations/versions/modules_0001_rbac.py
+# revision identifiers, used by Alembic.
+revision: str = "modules_0001_rbac"
+...
+down_revision: Union[str, None] = "a7b8c9d0e1f2"
+branch_labels: Union[str, Sequence[str], None] = ("modules",)
+...
+depends_on: Union[str, Sequence[str], None] = None
 ```
 
 The workflow, from the repository root:
@@ -865,65 +1104,94 @@ The workflow, from the repository root:
 export POSTGRES_DB=experimentation POSTGRES_SCHEMA=experimentation
 ALEMBIC="python -m alembic -c backend/app/db/alembic.ini"
 
+$ALEMBIC heads                                          # two in a full checkout: the core head and modules
 $ALEMBIC current                                        # where is this database?
-$ALEMBIC history | head                                 # the chain
-$ALEMBIC revision --autogenerate -m "add experiment decision_notes"
+$ALEMBIC history | head                                 # the graph
+$ALEMBIC revision --autogenerate --head <core head id> -m "add experiment decision_notes"
+$ALEMBIC revision --autogenerate --head modules@head -m "..."   # a module's change instead
 $EDITOR backend/app/db/migrations/versions/*decision_notes.py    # READ IT
-$ALEMBIC upgrade head
-$ALEMBIC merge -m "merge heads" <rev1> <rev2>           # only when two branches both added a revision
-python -m backend.app.db.bootstrap                      # fresh DB: create_all + stamp; existing: upgrade head
+$ALEMBIC upgrade heads
+python -m backend.app.db.bootstrap                      # fresh DB: create from models + stamp heads; existing: upgrade heads
 ```
 
-What to check in an autogenerated file, in order: (1) `down_revision` is the current head's
-**id** (never a slug or filename); (2) the `upgrade()` contains _only_ your change — drop
-proposals for indexes or enum alterations you didn't touch are drift, not your migration;
-(3) new columns are nullable or defaulted so the previous image keeps working during a
-migrate-then-deploy; (4) the schema is taken from a helper, not hard-coded; (5) the
-`downgrade()` is at least plausible.
+What to check in an autogenerated file, in order: (1) `down_revision` is the **id** of the
+head you named (never a slug or filename), and the file sits beside it; (2) the `upgrade()`
+contains _only_ your change — drop proposals for indexes or enum alterations you didn't touch
+are drift, not your migration; (3) it is **backward-compatible**: new columns are nullable or
+have a `server_default`, so the previous image keeps working during a deploy and after an
+image-only rollback (expand now; contract — drop the old column — in a later release, once
+nothing reads it); (4) the schema comes from the environment or a helper, not hard-coded;
+(5) the `downgrade()` is at least plausible; (6) `alembic heads` still prints exactly two.
+
+> **Watch Out!** Two heads is the normal state of a full checkout, not something to fix.
+> Never run `alembic merge` on them, however the error message phrases it. The merge file
+> would land in the **core** versions directory with `down_revision = (<core head>,
+> 'modules_0001_rbac')`, and every core checkout — which has no `modules_0001_rbac` — would
+> then fail to load the script directory at all. Use `upgrade heads`, and `--head` on a new
+> revision.
 
 > **Watch Out!** PostgreSQL enums: `ALTER TYPE ... ADD VALUE` can't run inside a transaction
 > on older versions and can't be undone; removing or renaming a value needs a new type and a
 > column cast. When autogenerate emits an enum change, stop and decide whether a `String` +
 > `CheckConstraint` is the better column.
 
-> **By the Way.** The test suite never runs migrations — it uses `create_all` from the models
-> — so a migration is tested by _applying_ it: locally, in `db-migrate.yml`, and by the
-> production `run-migrations` Fargate task that gates the blue/green deploy. If a migration
-> diverges from the models, the next autogenerate on an `upgrade`d database shows the diff.
+> **By the Way.** The unit tests build their schema with `create_all` from the models, but
+> migrations are not left untested. `backend/tests/integration/database/` holds the
+> transition tests — `test_profile_transitions.py` (a core database met by a full image and
+> the reverse), `test_modules_0002_transitions.py`, `test_newer_database_rollback.py`,
+> `test_alembic_branch_revisions.py` and one test per data-bearing migration such as
+> `test_feature_flag_default_value_migration.py` — and `test_autogenerate_is_empty.py`, which
+> bootstraps a fresh database for both profiles and asserts that `revision --autogenerate`
+> against it proposes **nothing**. Any operation it proposes is either a migration somebody
+> forgot to write or a comparison pointed at the wrong schema — and the second kind shows up
+> as `op.drop_table`. On AWS, only the deploy's migration task writes the schema; the API
+> tasks run with `RUN_MIGRATIONS=false`.
 
 ### Try It Yourself
 
-Run the loop against a scratch database (the Build book's Day 13 exercise), then inspect the
-version table and the chain:
+Look at the graph and the version table:
 
 ```bash
-docker compose exec postgres psql -U postgres -d experimentation -c "select * from experimentation.alembic_version"
 python -m alembic -c backend/app/db/alembic.ini heads
-ls backend/app/db/migrations/versions | wc -l
+python -m alembic -c backend/app/db/alembic.ini branches
+docker compose exec postgres psql -U postgres -d experimentation -c "select * from experimentation.alembic_version"
+ls backend/app/db/migrations/versions modules/backend/app/db/migrations/versions
 ```
 
-Then find the two revisions the bootstrap docstring blames for the non-replayable chain
-(`git grep -n "re-create" backend/app/db/bootstrap.py`) and open one.
+`heads` prints two lines in a full checkout — the core head, and
+`modules_0002_warehouse_analysis (modules) (head)` — and `alembic_version` holds one row per
+head. Compare the `down_revision` of `modules_0001_rbac` with `alembic history` to find the
+core revision the branch forks from. Finally, find the revisions the
+bootstrap docstring blames for the non-replayable chain
+(`git grep -n "re-create" backend/app/db/bootstrap.py`).
 
 ### Common mistakes
 
-- **`alembic upgrade head` on an empty database.** Use the bootstrap.
+- **`upgrade` against an empty database.** The historical chain can't replay from zero; use
+  the bootstrap.
+- **The singular `head`.** It works only by accident on a core checkout; `heads` always works.
+- **A bare `revision --autogenerate`.** Name the head: `--head <core head id>` or
+  `--head modules@head`.
+- **Merging the heads.** Breaks every core checkout. Two heads is correct.
 - **Committing an autogenerated migration unread.** Drift, enum changes and wrong
   `down_revision`s all come from this.
-- **A `NOT NULL` column without a default** on a live table — the deploy's old image fails
-  every insert until the new image is live.
+- **A `NOT NULL` column without a `server_default`** on a live table — the deploy's old image
+  fails every insert until the new image is live, and again after an image-only rollback.
 - **Running alembic from `backend/`** with the root-relative `-c` path (or vice versa). From
   the root: `-c backend/app/db/alembic.ini`.
 
 ### Key takeaways
 
-- Alembic: revision chain, `alembic_version` in the app schema, `env.py` on the shared
-  `POSTGRES_*` variables.
-- Fresh database → bootstrap (`create_all` + `stamp head` + first admin); existing → `upgrade
-  head`.
-- Autogenerate, then read: `down_revision` id, minimal diff, nullable/additive, schema
-  helper.
-- Migrations are tested by applying them; models are truth.
+- Two heads in a full checkout: the core chain and the `modules` branch
+  (`branch_labels = ("modules",)`), in two `version_locations`. One in a core checkout.
+- `upgrade heads`; `revision --autogenerate --head <core head id>` or `--head modules@head`;
+  never merge.
+- Fresh database → `python -m backend.app.db.bootstrap` (create from models + `stamp heads` +
+  first admin); existing → `upgrade heads`.
+- `env.py`: percent-encoded URL with `%%` for configparser, `metadata_for_schema`, scoped
+  comparison (`include_schemas`, `include_name`, `include_object`).
+- Every migration is backward-compatible (expand, then contract). Autogenerate against a fresh
+  bootstrap must be empty, and the transition tests pin it.
 
 ---
 
@@ -951,8 +1219,10 @@ parameters; the only interpolated identifier is the schema from `get_schema_name
 line carries `nosemgrep`/`nosec` with the justification.
 
 **Q5. What does the bootstrap do on a database that already has `alembic_version`?**
-`alembic upgrade head` — the incremental path. Only a database _without_ the version table
-gets `create_all` + `stamp head`.
+`upgrade heads` — the incremental path, every branch (then it reconciles any missing module
+tables). Only a database _without_ the version table is created from the models and gets
+`stamp heads`. Plural both times: a full checkout has two heads, and alembic refuses the
+singular `head` when there is more than one.
 
 **Q6. A list endpoint serialises `variants` for each of 100 experiments. Without
 `joinedload`, how many queries?**
@@ -988,6 +1258,10 @@ without `text()`.
 contains `op.drop_index("experimentation_experiment_status_dates", ...)`. What do you do, and
 why?
 
+**E4.6 — Ship the migration.** Write the commands, from the repository root, that generate
+and apply the core migration for E4.1 on a full checkout, and say what `alembic heads` should
+print afterwards.
+
 ---
 
 ## Solutions
@@ -1017,7 +1291,9 @@ class DecisionLog(Base, BaseModel):
     decision_logs = relationship("DecisionLog", back_populates="experiment", cascade="all, delete-orphan")
 ```
 
-Plus an import in `backend/app/models/__init__.py`.
+Plus, in `backend/app/models/__init__.py`, `"decision_log"` added to `CORE_MODEL_MODULES`
+(it's a core model), so `register_core_models()` — and with it the bootstrap, `env.py` and the
+test harness — sees the table.
 
 **S4.2**
 
@@ -1071,7 +1347,24 @@ index (`Experiment.__table_args__`), so autogenerate proposing to drop it means 
 you diffed against lacks it (built by an older path) or the index name differs. Keep the
 migration to exactly the `decision_logs` change, and investigate the drift separately —
 either fix the database (create the index) or the model (rename), then confirm a fresh
-autogenerate against an `upgrade`d database is empty.
+autogenerate against an `upgrade`d database is empty — the same property
+`test_autogenerate_is_empty.py` pins against a freshly bootstrapped one.
+
+**S4.6**
+
+```bash
+ALEMBIC="python -m alembic -c backend/app/db/alembic.ini"
+$ALEMBIC heads                     # note the core head id (the line without "(modules)")
+$ALEMBIC revision --autogenerate --head <core head id> -m "add decision_logs"
+$EDITOR backend/app/db/migrations/versions/*add_decision_logs.py   # read it: down_revision = the core head id
+$ALEMBIC upgrade heads
+$ALEMBIC heads                     # still two: the new revision and modules_0002_warehouse_analysis
+```
+
+`decision_logs` is a core table, so the revision extends the core head, not `modules@head`,
+and lands in `backend/app/db/migrations/versions/`. `heads` still prints two lines; if it
+prints three, the revision was based on the wrong parent. Never resolve that with a merge —
+delete the file and regenerate it with the right `--head`.
 
 ---
 

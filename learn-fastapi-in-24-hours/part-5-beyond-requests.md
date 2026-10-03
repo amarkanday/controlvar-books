@@ -36,7 +36,7 @@ serving requests, which has two consequences:
 
 #### Why in-process schedulers, and why they skip under test
 
-A separate worker service would be cleaner; in-process tasks mean the Community Edition is
+A separate worker service would be cleaner; in-process tasks mean the core profile is
 one container plus a database. The cost is that every replica starts every scheduler — solved
 with the advisory lock (Build book, Day 17). And under the test profile the lifespan starts
 **nothing**: a `TestClient` used as a context manager would otherwise run real ticks against
@@ -45,7 +45,8 @@ calling their tick methods directly.
 
 ### In the wild
 
-The lifespan, with its test guard:
+The lifespan, with its two guards: it refuses to serve at all when `ENVIRONMENT` was never
+set, and it starts no scheduler under the test profile:
 
 ```python
 # 📁 backend/app/main.py
@@ -58,13 +59,27 @@ async def lifespan(app: FastAPI):
     database in the middle of unrelated tests (they patch the same service
     functions, and the ticks open and drop connections). Scheduler behaviour
     is covered directly in ``backend/tests/unit/core/test_scheduler_*``.
+
+    First, it refuses to serve when ENVIRONMENT was never set: the settings
+    then default to development, whose relaxed rules a deployment must choose
+    rather than fall into. Importing the application (the OpenAPI dump, the
+    release's version check) is unaffected; only serving it is refused.
     """
+    if not settings.environment_explicit:
+        logger.error(ENVIRONMENT_NOT_SET_MESSAGE)
+        raise EnvironmentNotSet(ENVIRONMENT_NOT_SET_MESSAGE)
+
     if settings.is_test:
         logger.info("Test environment: background schedulers are not started")
         yield
         return
 
     logger.info("Starting experiment scheduler")
+    # The singleton is built at import with the class default; the configured
+    # cadence is applied here, before its loop starts (#484). ...
+    experiment_scheduler.interval_minutes = (
+        settings.EXPERIMENT_SCHEDULER_INTERVAL_MINUTES
+    )
     await experiment_scheduler.start()
     ...
     logger.info("Starting bandit scheduler")
@@ -76,6 +91,15 @@ async def lifespan(app: FastAPI):
     await experiment_scheduler.stop()
     ...
 ```
+
+Two things to notice. Raising from the lifespan **before** `yield` stops the server from
+starting: an API started with no `ENVIRONMENT` exits with `EnvironmentNotSet` instead of
+quietly running with development's relaxed rules. That is why `make dev` sets
+`ENVIRONMENT=development` on its own command line, and why a scratch app you build by
+importing `backend.app.main` needs it too. And the lifespan is where configuration meets
+long-lived objects: the experiment scheduler singleton is created at import with the class
+default of 15 minutes, and the lifespan applies `EXPERIMENT_SCHEDULER_INTERVAL_MINUTES` to it
+before its loop starts.
 
 A scheduler's skeleton — `start` creates the task, `stop` cancels and awaits it, the loop
 runs one locked tick then sleeps:
@@ -129,7 +153,7 @@ class ExperimentScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in experiment scheduler: {str(e)}")
+                logger.error(f"Error in experiment scheduler: {e!s}")
                 # Wait a bit before trying again
                 await asyncio.sleep(60)
 ```
@@ -198,9 +222,11 @@ metrics — while letting cancellation through untouched:
 > next deadline and sleep until it.
 
 > **By the Way.** FastAPI also has `BackgroundTasks` — per-request work run after the
-> response is sent (`background_tasks.add_task(fn, ...)`). It's imported in
-> `experiments.py` but the platform doesn't lean on it: post-response work that must survive
-> a crashed worker belongs in a scheduler tick or a queue, not in the request's process.
+> response is sent (`background_tasks.add_task(fn, ...)`). The platform uses it exactly once:
+> `POST /api/v1/experiments/schedules/process` (superuser only) answers 202 and then runs
+> `experiment_scheduler.process_scheduled_experiments` after the response. That is a
+> convenience trigger for work the scheduler would do anyway; post-response work that must
+> survive a crashed worker belongs in a scheduler tick or a queue, not in the request's process.
 
 ### Try It Yourself
 
@@ -221,8 +247,9 @@ async def main():
 asyncio.run(main())
 ```
 
-Then read `backend/tests/unit/core/test_scheduler_tick.py` to see how the shared runner is
-tested with a fake tick and a real advisory lock.
+Then read `backend/tests/unit/core/test_scheduler_lock.py` to see how the shared runner,
+`run_locked_tick`, is tested with a fake tick and a real advisory lock (two database
+connections, exactly the two-replica situation the lock exists for).
 
 ### Common mistakes
 
@@ -235,7 +262,8 @@ tested with a fake tick and a real advisory lock.
 
 ### Key takeaways
 
-- The lifespan starts and stops long-lived tasks; under the test profile it starts none.
+- The lifespan starts and stops long-lived tasks; under the test profile it starts none, and
+  with no `ENVIRONMENT` set it refuses to serve.
 - A scheduler = `create_task` + a `while` loop of `run_locked_tick(tick)` + `sleep`;
   `stop()` cancels and awaits.
 - Let `CancelledError` propagate; log-and-sleep on other errors.
@@ -260,8 +288,9 @@ Both live on the event loop and both change three assumptions the request/respon
 makes:
 
 1. **Authentication happens once, at the handshake**, and browsers can't set headers on a
-   WebSocket handshake — so the token has to travel another way (a subprotocol entry, a
-   query parameter).
+   WebSocket handshake — so the token has to travel another way: as an entry in the
+   subprotocol list, which browsers can set (non-browser clients can still send
+   `Authorization: Bearer`).
 2. **A dependency-provided session must not be held for the connection's life.** A
    WebSocket that pins a pooled connection for an hour starves the pool.
 3. **Errors are close codes, not status codes.** An unauthorised WebSocket is _accepted_ then
@@ -270,7 +299,7 @@ makes:
 
 ### In the wild
 
-The WebSocket endpoint — auth by three routes, early session release, a receive-with-timeout
+The WebSocket endpoint — auth by the subprotocol or a bearer header, early session release, a receive-with-timeout
 loop that doubles as a periodic timer:
 
 ```python
@@ -284,7 +313,6 @@ manager = ConnectionManager()
 
 
 def _extract_ws_token(websocket: WebSocket, token: Optional[str]) -> Optional[str]:
-    """Subprotocol first, then ``Authorization: Bearer``, then ``?token=``."""
     from_subprotocol = _token_from_subprotocol(websocket)
     if from_subprotocol:
         return from_subprotocol
@@ -292,18 +320,17 @@ def _extract_ws_token(websocket: WebSocket, token: Optional[str]) -> Optional[st
     scheme, _, value = authorization.partition(" ")
     if scheme.lower() == "bearer" and value.strip():
         return value.strip()
-    if token:
-        return token
-    return None
+    ...
 
 
 @router.websocket("/ws/experiments/{experiment_id}/results")
 async def stream_results(
     websocket: WebSocket,
     experiment_id: str,
-    token: Optional[str] = Query(None, description="Access token (alternative to the bearer header)"),
+    ...
     db: Session = Depends(deps.get_db),
 ) -> None:
+    ...
     from backend.app.db.session import SessionLocal
 
     # Sync SQLAlchemy work runs in the threadpool, like a sync HTTP dependency.
@@ -402,12 +429,24 @@ async def stream_audit_logs(
 ):
     """
     Returns recent audit log entries as Server-Sent Events.
+    Useful for real-time audit dashboards.
     Streams up to `limit` entries (default 50, max 100) then closes.
+    Superusers, ADMIN and ANALYST receive every entry; DEVELOPER and VIEWER
+    receive only their own.
     """
+    # Resolved in the handler, before the response starts, not inside the
+    # generator.
+    own_only = None if can_read_all_audit_logs(current_user) else current_user.id
 
     async def event_generator():
         ...
-        logs, _ = AuditService.get_audit_logs(db, limit=limit, entity_type=entity_type_enum, page=1)
+        logs, _ = AuditService.get_audit_logs(
+            db,
+            user_id=own_only,
+            limit=limit,
+            entity_type=entity_type_enum,
+            page=1,
+        )
         for i, log in enumerate(logs):
             event_data = json.dumps({"id": str(log.id), "timestamp": ..., "action_type": log.action_type, ...})
             yield f"data: {event_data}\n\n"
@@ -420,6 +459,11 @@ async def stream_audit_logs(
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 ```
+
+Note where the role check sits: `own_only` is worked out in the handler, **before**
+`StreamingResponse` starts. Once the first chunk is sent the status line (200) is already on
+the wire, so a decision that could refuse or narrow the response has to be made first. The
+generator only runs the query it was handed.
 
 `X-Accel-Buffering: no` tells nginx (the dashboard image's proxy) not to buffer the stream;
 without it the client sees everything at once when the response ends. The wire format is
@@ -445,8 +489,8 @@ The client side of the WebSocket, for the shape of the contract:
 > **Did You Know?** The `experimently.bearer` subprotocol trick works because RFC 6455 lets a
 > client offer a list of subprotocols in `Sec-WebSocket-Protocol`; the server must echo one it
 > accepts. The dashboard offers `experimently.bearer, <token>`; the server reads the token as
-> the second entry and echoes `experimently.bearer`. It keeps the token out of the URL (and
-> out of access logs), which `?token=` can't.
+> the entry after the marker and echoes `experimently.bearer`. It keeps the token out of the
+> URL, and so out of every access log on the path.
 
 ### Try It Yourself
 
@@ -457,8 +501,8 @@ pip install websockets >/dev/null 2>&1
 python - <<PY
 import asyncio, json, websockets
 async def main():
-    uri = "ws://localhost:8000/api/v1/ws/experiments/<EXPERIMENT_ID>/results?token=$TOKEN"
-    async with websockets.connect(uri) as ws:
+    uri = "ws://localhost:8000/api/v1/ws/experiments/<EXPERIMENT_ID>/results"
+    async with websockets.connect(uri, subprotocols=["experimently.bearer", "$TOKEN"]) as ws:
         print("snapshot:", json.loads(await ws.recv())["status"])
         await ws.send(json.dumps({"action": "ping"})); print(await ws.recv())
         await ws.send(json.dumps({"action": "refresh"})); print(json.loads(await ws.recv())["event"])
@@ -469,11 +513,11 @@ python -c "
 import asyncio, websockets
 async def m():
     try:
-        async with websockets.connect('ws://localhost:8000/api/v1/ws/experiments/x/results?token=bad') as ws: await ws.recv()
+        async with websockets.connect('ws://localhost:8000/api/v1/ws/experiments/x/results', subprotocols=['experimently.bearer', 'bad']) as ws: await ws.recv()
     except websockets.ConnectionClosed as e: print(e.code, e.reason)
 asyncio.run(m())"
 # SSE
-curl -sN "$API/feature-flags/audit-logs/stream?limit=3" -H "Authorization: Bearer $TOKEN" | head -8
+curl -sN "$API/audit-logs/stream?limit=3" -H "Authorization: Bearer $TOKEN" | head -8
 ```
 
 ### Common mistakes
@@ -486,7 +530,7 @@ curl -sN "$API/feature-flags/audit-logs/stream?limit=3" -H "Authorization: Beare
 
 ### Key takeaways
 
-- WebSocket: `@router.websocket`, token via subprotocol / header / `?token=`, accept-then-close
+- WebSocket: `@router.websocket`, token via the subprotocol (browsers) or a bearer header, accept-then-close
   with `4401` on failure, release the auth session, `wait_for(receive, timeout)` as a timer.
 - `ConnectionManager` groups sockets per experiment behind an `asyncio.Lock` and prunes dead
   ones on broadcast.
@@ -532,19 +576,28 @@ class RedisRateLimiter:
     keeps serving traffic even when Redis is temporarily unreachable.
     """
 
+    def __init__(self) -> None:
+        # The connection parameters (REDIS_HOST/PORT/PASSWORD/DB/SSL) are read
+        # from the settings by create_redis_client on first use.
+        self._redis_client: Optional[object] = None
+        self._redis_available: bool = True
+        self._fallback = SlidingWindowRateLimiter()
+
     def _get_redis(self):
         """Lazy-connect to Redis on first call."""
         if self._redis_client is None and self._redis_available:
             try:
-                import redis as redis_lib
+                from backend.app.core.redis_client import create_redis_client
 
-                self._redis_client = redis_lib.Redis(
-                    host=self._redis_host, port=self._redis_port, password=self._redis_password or None,
-                    db=self._redis_db, socket_connect_timeout=2, socket_timeout=1, decode_responses=True,
+                self._redis_client = create_redis_client(
+                    socket_connect_timeout=2,
+                    socket_timeout=1,
+                    decode_responses=True,
                 )
                 # Test connectivity
                 self._redis_client.ping()
                 self._redis_available = True
+                logger.info("Rate limiter connected to Redis")
             except Exception as exc:
                 logger.warning("Rate limiter Redis unavailable, using in-memory fallback: %s", exc)
                 self._redis_client = None
@@ -582,8 +635,15 @@ class RedisRateLimiter:
             return self._fallback.is_allowed(key, limit, window_seconds)
 ```
 
-Note the tight timeouts (`socket_connect_timeout=2`, `socket_timeout=1`): a slow Redis must
-not slow every request, so the limiter would rather fall back than wait. The pipeline makes
+Note what the limiter passes and what it doesn't. It passes only **client options**, the
+tight timeouts (`socket_connect_timeout=2`, `socket_timeout=1`): a slow Redis must not slow
+every request, so the limiter would rather fall back than wait. The **connection parameters**
+come from one place, `backend.app.core.redis_client.create_redis_client`, which reads
+`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB` and `REDIS_SSL` from the settings and
+refuses a caller that tries to pass `host=` or `password=` itself. Before that helper existed,
+each call site built `redis.Redis(host=..., port=...)` by hand and they drifted (one forgot
+the password, another TLS); a test now scans the tree and fails on a Redis constructor
+anywhere else. The pipeline makes
 `INCR` + `TTL` one round trip; `ttl == -1` means "no expiry yet" and marks the first hit of a
 window.
 
@@ -632,10 +692,9 @@ def _get_cache_service() -> CacheService:
     connection errors explicitly.
     """
     try:
-        import redis as redis_lib
-        from backend.app.core.config import settings
+        from backend.app.core.redis_client import create_redis_client
 
-        r = redis_lib.Redis(host=settings.REDIS_HOST, port=int(settings.REDIS_PORT), db=0)
+        r = create_redis_client()
         # Quick ping to verify the connection is alive.
         r.ping()
         return CacheService(redis_client=r)
@@ -677,7 +736,28 @@ the answer:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
-    cache_key = f"results:{experiment_id}:{confidence_level}:{correction_method}:{breakdown or ''}"
+def _results_cache_key(
+    experiment_id: UUID,
+    confidence_level: float,
+    correction_method: str,
+    breakdown: Optional[str],
+) -> str:
+    """
+    The Redis key for one ``GET /results/{experiment_id}`` answer.
+
+    It starts with ``results:{experiment_id}:``, the prefix
+    ``invalidate-cache`` clears, and then names the statistics engine version,
+    so an answer cached by an engine that computed different numbers is never
+    served after an upgrade: the new engine simply misses it.
+    """
+    return (
+        f"results:{experiment_id}:{ENGINE_VERSION}:"
+        f"{confidence_level}:{correction_method}:{breakdown or ''}"
+    )
+    ...
+    cache_key = _results_cache_key(
+        experiment_id, confidence_level, correction_method, breakdown
+    )
     ...
     # --- Cache write ---
     try:
@@ -691,9 +771,13 @@ the answer:
 
 The key rule is the important one: `confidence_level`, `correction_method` and `breakdown`
 all change the result, so they're in the key; a cache keyed on the experiment alone would
-serve a 95%-confidence result to a 99% request. Invalidation is explicit
-(`POST /results/{id}/invalidate-cache`) and pattern-based on writes (the experiment endpoints
-delete `experiments:{owner}:*` after a change).
+serve a 95%-confidence result to a 99% request. `ENGINE_VERSION` is the less obvious input:
+the *code* that computes the answer is also an input, so a statistics-engine upgrade changes
+the key and the new engine simply misses every answer the old one cached. Invalidation is
+explicit (`POST /results/{id}/invalidate-cache` clears the `results:{experiment_id}:` prefix)
+and, for the experiment cache, pattern-based on writes: a change deletes `experiment:{id}`
+and every `experiments:*` list key (lists are cached per user, but every role sees every
+experiment, so one change makes all of them stale).
 
 > **Watch Out!** `_get_cache_service()` pings Redis on every call — a round trip per results
 > request. It's acceptable at dashboard volumes and would not be on an SDK path; the SDK
@@ -702,8 +786,10 @@ delete `experiments:{owner}:*` after a change).
 
 > **By the Way.** `deps.get_cache_control` is the older, async, Redis-pool-based cache hook
 > that the experiment endpoints receive as `cache_control`. It's disabled unless
-> `settings.CACHE_ENABLED` (true only in `ProdSettings`), and the harness overrides it to
-> `CacheControl(enabled=False, skip=True)`. Two cache mechanisms in one codebase is a known
+> `settings.CACHE_ENABLED` is true, and that setting is `False` in every settings class,
+> `ProdSettings` included; even when switched on it affects only the experiment and admin
+> routes, because the feature-flag routes always read the database. The harness overrides it
+> to `CacheControl(enabled=False, skip=True)`. Two cache mechanisms in one codebase is a known
 > wart; prefer the `CacheService` shape for new code.
 
 ### Try It Yourself
@@ -740,7 +826,8 @@ Redis at all.
 - Redis backs rate limits (fixed window, `INCR`+`EXPIRE`) and the results cache; both fall
   back (in-memory limiter, disabled cache) rather than fail.
 - Tight socket timeouts so a slow Redis can't slow the API.
-- Cache keys include every parameter that changes the result; TTLs are status-aware; caches
+- Cache keys include every parameter that changes the result (the engine version too); TTLs
+  are status-aware; caches
   round-trip through the response model so stale shapes fail validation.
 - `REDIS_REQUIRED=true` is the only way Redis affects readiness.
 
@@ -764,19 +851,22 @@ So the client receives the application close code (`4401`, "Unauthorized"). Clos
 accepting surfaces as a bare HTTP 403 during the handshake, with no reason a client can act
 on.
 
-**Q4. Three ways a token can reach the WebSocket endpoint — which is preferred and why?**
-Subprotocol (`Sec-WebSocket-Protocol: experimently.bearer, <token>`), `Authorization: Bearer`
-header, `?token=`. The subprotocol is preferred for browsers: they can't set headers on the
-handshake, and a query parameter puts the token in URLs and access logs.
+**Q4. How should a client send its token to the WebSocket endpoint, and why not in the URL?**
+A browser sends it as a subprotocol entry (`Sec-WebSocket-Protocol: experimently.bearer,
+<token>`), because it can't set other headers on the handshake; a non-browser client may send
+`Authorization: Bearer <token>`. A token in the URL ends up in every access log on the path.
 
 **Q5. Redis is down. What happens to (a) rate limits, (b) results caching, (c) `/health/ready`?**
 (a) In-memory sliding window per process — limits still apply, per replica. (b) Disabled
 `CacheService`; every request recomputes. (c) Redis reported as unhealthy; readiness still
 200 unless `REDIS_REQUIRED=true`.
 
-**Q6. Why is the results cache keyed on `confidence_level` and `correction_method`?**
-Both change the computed numbers; a key on the experiment id alone would return one request's
-result to a different request. The key must include every input that affects the output.
+**Q6. Why is the results cache keyed on `confidence_level`, `correction_method` and
+`ENGINE_VERSION`?**
+All three change the computed numbers; a key on the experiment id alone would return one
+request's result to a different request, and a key without the engine version would serve
+numbers from the previous statistics engine after an upgrade. The key must include every
+input that affects the output, including the code that computes it.
 
 **Quiz.** `asyncio.wait_for(websocket.receive_text(), timeout=30)` — what are the two
 outcomes and what does each mean for the loop?
@@ -930,8 +1020,9 @@ Invalidate: on any `PUT`/`activate`/`deactivate`/rollback of that flag, delete
 `flag:{flag_key}:*` (pattern delete via `scan_iter`). A reason to refuse: every evaluation
 must still write a `RawMetric` (safety divides by evaluations), so a cache hit would have to
 record metrics anyway — the query it saves is a single indexed row read, and the Redis round
-trip plus the invalidation surface may cost more than it saves. The team moved the hot path
-to Lambda + DynamoDB instead.
+trip plus the invalidation surface may cost more than it saves. The codebase made exactly
+that call: the feature-flag routes always read the database, and an SDK that needs fewer
+round trips fetches the whole ruleset once (`GET /api/v1/sdk/ruleset`) and evaluates locally.
 
 ---
 

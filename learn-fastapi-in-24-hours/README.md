@@ -5,10 +5,12 @@
 > **Preface.** Most FastAPI tutorials stop at `@app.get("/items/{id}")` and a `BaseModel` with
 > two fields. This book is different. Every concept is taught **twice**: once in the abstract,
 > and once with a real snippet pulled from the **Experimently** backend (a FastAPI + SQLAlchemy +
-> PostgreSQL experimentation platform, ~66,000 lines of typed Python, 5,800+ tests). By Hour 24
-> you won't just _know_ FastAPI — you'll know how a production team uses it to run an API with
-> fifty router modules, three authentication paths, five background schedulers, and a test
-> harness that spins up a database per process. And you'll have met the 422 that saved a bad
+> PostgreSQL experimentation platform: about 70,000 lines of typed Python in the core
+> `backend/app`, and 5,400+ backend tests by the app README's count). By Hour 24 you won't
+> just _know_ FastAPI — you'll know how a production team uses it to run an API with
+> thirty-seven core routers (plus the optional modules' routers, mounted through a seam),
+> several authentication paths, five background schedulers, and a test harness that spins up
+> a database per process. And you'll have met the 422 that saved a bad
 > experiment (Hour 1) and the shape mismatch that 5,000 green tests didn't catch (Hour 22).
 
 ---
@@ -21,8 +23,8 @@
   injection, Pydantic validators and async/sync rules because tutorials never show _why_ a
   production app reaches for them.
 - **Reviewers** who want one reference for the conventions this backend enforces —
-  fully-qualified imports, `Depends(get_db)`, async flag deps vs sync experiment deps, the
-  `except HTTPException: raise` idiom — so review is about substance.
+  fully-qualified imports, `Depends(get_db)`, access by role through one rule per resource,
+  the `except HTTPException: raise` idiom — so review is about substance.
 
 You need: working Python (functions, classes, decorators, `async`/`await`, type hints). You do
 **not** need prior FastAPI, Pydantic or SQLAlchemy.
@@ -65,12 +67,15 @@ each over the next 24 hours; keep them in view:
    closed after the response — and the seam the test harness overrides. → Hours 9, 10, 22
 4. **Endpoints are thin; services hold logic; models are tables.** The dependency direction is
    endpoint → service → model, never back. → Hours 2, 16
-5. **Async where it's async, sync where it's sync.** Feature-flag and report dependencies are
-   `async`; experiment dependencies are sync; synchronous SQLAlchemy in an `async def` blocks
-   the loop, so keep handlers short and consistent per module. → Hours 12, 19
+5. **Async where it's async, sync where it's sync.** The access rules routes actually call
+   are sync — `can_act_on_feature_flag` for every flag change, `get_experiment_change_access`
+   for experiments — and only flag create is an async `Depends(deps.can_create_feature_flag)`;
+   synchronous SQLAlchemy in an `async def` blocks the loop, so keep handlers short and
+   consistent per module. → Hours 12, 19
 6. **Fail closed.** Settings validators refuse to start production with a weak secret or the
    dev bypass; `except HTTPException: raise` keeps a deliberate 404 from becoming a 500;
-   dependencies check READ before UPDATE. → Hours 4, 8, 12
+   access is decided by role, and a role without the action is refused even on what it
+   created. → Hours 4, 8, 12
 
 ---
 
@@ -95,7 +100,7 @@ each over the next 24 hours; keep them in view:
 - **Hour 9** — `Depends`: the mechanism (yield, caching, overrides)
 - **Hour 10** — The session dependency: `get_db`
 - **Hour 11** — Authentication dependencies: bearer, API key, `auto_error=False`
-- **Hour 12** — Authorization dependencies: composing checks, sync vs async
+- **Hour 12** — Authorization: one decision per resource, by role
 - **Hour 13** — Middleware: the ASGI onion and why order is stated
 
 ### Part IV — SQLAlchemy 2 & PostgreSQL _(Hours 14–18)_ → [`part-4-sqlalchemy.md`](./part-4-sqlalchemy.md)
@@ -104,7 +109,7 @@ each over the next 24 hours; keep them in view:
 - **Hour 15** — Relationships, cascades, `back_populates`, `joinedload`
 - **Hour 16** — Sessions, transactions, `flush`/`commit`/`refresh`, the pool
 - **Hour 17** — Queries: filters, aggregates, JSONB, `text()` done safely
-- **Hour 18** — Alembic: revisions, autogenerate, the bootstrap
+- **Hour 18** — Alembic: two heads, autogenerate, the bootstrap
 
 ### Part V — Beyond Request/Response _(Hours 19–21)_ → [`part-5-beyond-requests.md`](./part-5-beyond-requests.md)
 
@@ -122,8 +127,9 @@ each over the next 24 hours; keep them in view:
 
 ## A note on accuracy
 
-The snippets here were lifted from the repository on 2026-09-11. Files move; if a path 404s,
-`git grep` the symbol (e.g. `git grep -n "def get_current_user"`). The _patterns_ outlast the
-line numbers.
+The snippets here are verified against getexperimently/experimently at `a4a6dbd2` (0.17.0
+plus unreleased changes, including three breaking ones: #747, #769, #770). Files move; if a
+path 404s, `git grep` the symbol (e.g. `git grep -n "def get_current_user"`). The _patterns_
+outlast the line numbers.
 
 _Now turn to [Part I](./part-1-foundations.md) and start the clock. ⏱️_
