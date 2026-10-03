@@ -533,7 +533,7 @@ A no-request session with explicit error handling — the scheduler's tick:
             ...
             db.commit()
         except Exception as e:
-            logger.error(f"Error processing scheduled experiments: {str(e)}")
+            logger.error(f"Error processing scheduled experiments: {e!s}")
             db.rollback()
         finally:
             db.close()

@@ -153,7 +153,7 @@ class ExperimentScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in experiment scheduler: {str(e)}")
+                logger.error(f"Error in experiment scheduler: {e!s}")
                 # Wait a bit before trying again
                 await asyncio.sleep(60)
 ```

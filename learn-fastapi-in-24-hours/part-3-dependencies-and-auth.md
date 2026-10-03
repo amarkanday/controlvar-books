@@ -66,23 +66,36 @@ async def get_db() -> Generator[Session, None, None]:
         db.close()
 ```
 
-A dependency that reads a **path parameter** and takes an **optional argument with a default**:
+A dependency that reads a **path parameter** and takes an **optional argument with a default**
+(it is used by no route today; it is here for the shape, not as a pattern to copy):
 
 ```python
 # 📁 backend/app/api/deps.py
 def get_experiment_by_key(
     experiment_key: str,
     db: Session = Depends(get_db),
-    required_status: Optional[ExperimentStatus] = None
+    required_status: Optional[ExperimentStatus] = None,
 ) -> Experiment:
     """
     Get experiment by key or ID.
+
+    Args:
+        experiment_key (str): Experiment key or ID
+        db (Session): Database session
+        required_status (Optional[ExperimentStatus]): If provided, the experiment must have this status
+
+    Returns:
+        Experiment: Experiment with the given key or ID
+
+    Raises:
+        HTTPException: If experiment not found or has incorrect status
     """
     experiment = None
 
     # First try to lookup by ID (UUID)
     try:
         from uuid import UUID
+
         experiment_id = UUID(experiment_key)
         experiment = db.query(Experiment).filter(Experiment.id == experiment_id).first()
     except (ValueError, TypeError):
@@ -91,16 +104,30 @@ def get_experiment_by_key(
 
     # If not found by ID, try the original lookup method
     if not experiment:
-        experiment = db.query(Experiment).filter(getattr(Experiment, "key", None) == experiment_key).first()
+        experiment = (
+            db.query(Experiment)
+            .filter(getattr(Experiment, "key", None) == experiment_key)
+            .first()
+        )
 
     if not experiment:
         raise HTTPException(status_code=404, detail="Experiment not found")
 
     # Check for required status if specified
-    if required_status is not None and hasattr(experiment, 'status') and experiment.status != required_status:
-        raise HTTPException(status_code=400, detail=f"Experiment not in {required_status.value} status")
+    if (
+        required_status is not None
+        and hasattr(experiment, "status")
+        and experiment.status != required_status
+    ):
+        raise HTTPException(
+            status_code=400, detail=f"Experiment not in {required_status.value} status"
+        )
     # Default check for active status (only if required_status is not specified)
-    elif required_status is None and hasattr(experiment, 'status') and experiment.status != ExperimentStatus.ACTIVE:
+    elif (
+        required_status is None
+        and hasattr(experiment, "status")
+        and experiment.status != ExperimentStatus.ACTIVE
+    ):
         raise HTTPException(status_code=400, detail="Inactive experiment")
 
     return experiment
@@ -319,7 +346,7 @@ The schedulers, with no request, own theirs:
             ...
             db.commit()
         except Exception as e:
-            logger.error(f"Error processing scheduled experiments: {str(e)}")
+            logger.error(f"Error processing scheduled experiments: {e!s}")
             db.rollback()
         finally:
             db.close()
@@ -696,7 +723,7 @@ On top of it sit exactly two decisions that routes use, one per resource:
   `deps.get_experiment_change_access(experiment, user, action=Action.UPDATE)`. Plain,
   synchronous functions the endpoint _calls_ once it has loaded the experiment.
 - **Feature flags:** `can_act_on_feature_flag(user, flag.owner_id, action)`, a plain function
-  returning `bool`, which every route that reads or changes a flag calls inline before it
+  returning `bool`, which every per-flag route calls inline before it
   touches the row. The one exception is _create_ — there is no flag yet — which is gated by
   the async dependency `Depends(deps.can_create_feature_flag)`.
 
