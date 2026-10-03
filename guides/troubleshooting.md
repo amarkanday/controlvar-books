@@ -571,10 +571,11 @@ inspectable stubs. Assert on the stub's props, not on SVG.
 the lock). This once turned every frontend CI job red.
 
 **The `/docs` page links somewhere unexpected**
-By design: `/docs` is a hub of links into the published documentation site
-([getexperimently.github.io/experimently](https://getexperimently.github.io/experimently/)),
-built by `docsUrl()` in `frontend/src/services/docs.ts`. The dashboard serves no markdown pages
-of its own.
+By design: `/docs` is a hub of links built by `docsUrl()` in `frontend/src/services/docs.ts`.
+By default they go to the Markdown in the GitHub repository; with `NEXT_PUBLIC_DOCS_URL` set at
+build time they go to a built MkDocs site instead (the marketing build points it at the published
+one, [getexperimently.github.io/experimently](https://getexperimently.github.io/experimently/)).
+The dashboard serves no markdown pages of its own.
 
 **Playwright E2E fails locally**
 It needs a seeded, running backend and dashboard (`./demo/setup-local.sh`), Node 22, and
@@ -706,8 +707,9 @@ Export `AWS_ACCOUNT_ID` (or let the CLI set `CDK_DEFAULT_ACCOUNT` from credentia
 account id is hard-coded, by design.
 
 **The Fargate stack fails: certificate / HTTPS listener**
-`CERTIFICATE_ARN` must point at an ACM certificate for the HTTPS listener; without it the
-stack is only suitable for dev.
+`CERTIFICATE_ARN` must point at an ACM certificate for the HTTPS listener. `cdk synth` refuses
+without it (a `ValueError` from `fargate_service_stack.py`), in every environment; there is no
+HTTP-only fallback.
 
 **A deployed Lambda returns a placeholder message**
 By design. No stack deploys a handler from `backend/lambda/`; the assignment Lambda was

@@ -17,7 +17,9 @@ want the why.
 
 The published product documentation lives at
 [getexperimently.github.io/experimently](https://getexperimently.github.io/experimently/); it is
-deployed from release tags, and the dashboard's `/docs` page links into it.
+deployed from release tags. The dashboard's `/docs` page links, by default, to the Markdown in the
+GitHub repository, or, with `NEXT_PUBLIC_DOCS_URL` set at build time, to a built site such as the
+published one.
 
 ---
 
@@ -429,10 +431,11 @@ One `deploy.yml` serves staging and production (approval-gated), with `db-migrat
 Most endpoint modules are epics with an ID in a comment. The ones you'll hear about, core:
 EP-001 rules engine · EP-013 monitoring · EP-016 results engine · EP-019 Fargate deploy ·
 EP-021 sequential testing · EP-022 mutual exclusion & holdout · EP-030 Slack/email alerting ·
-EP-058 WebSocket results · Issue #21 CUPED · #22 bandits · #23 AI design + MCP · #25
-interaction detection · #28 dimensional analysis. **Modules** (full profile only): EP-057
-workspaces · EP-037 SSO · EP-050 HIPAA · EP-033 compliance audit signing · EP-036 split-URL ·
-#26 warehouse analytics · custom roles (rbac) · integrations · counters · etl. `api/api.py`
+EP-058 WebSocket results · CUPED · bandits · AI design + MCP · interaction detection ·
+dimensional analysis. **Modules** (full profile only): EP-057 workspaces · EP-037 SSO ·
+EP-050 HIPAA · EP-033 compliance audit signing · EP-036 split-URL · warehouse analytics ·
+custom roles (rbac) · integrations · counters · etl. (Some code comments cite "Issue #N" for
+these; those are the old tracker's numbers and do not match this repository's issues.) `api/api.py`
 lists the core routers in mount order; the modules register theirs from
 `modules/backend/app/register.py`.
 
