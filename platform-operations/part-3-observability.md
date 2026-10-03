@@ -36,7 +36,7 @@ from their browser's network tab; you can go straight to the lines.
 The middleware — adopt or mint, bind, echo:
 
 ```python
-# 📁 backend/app/middleware/request_id_middleware.py
+# 📁 backend/app/middleware/request_id_middleware.py (condensed)
 class RequestIDMiddleware(BaseHTTPMiddleware):
     """Starlette middleware that ensures every request has a unique ID."""
 
@@ -61,7 +61,7 @@ two concurrent requests in the same worker don't see each other's IDs. The loggi
 configuration reads it back through a processor:
 
 ```python
-# 📁 backend/app/core/logger.py
+# 📁 backend/app/core/logger.py (condensed)
 def configure_logging(log_level: str = "INFO", json_logs: bool = True, service_name: str = "experimentation-platform", stream: Any = None) -> None:
     """Configure structlog **and** the standard library for the application.
 
@@ -235,7 +235,7 @@ Routes (all unauthenticated, none in the OpenAPI schema):
 Readiness — the checks, the rule, and the production redaction:
 
 ```python
-# 📁 backend/app/core/health.py
+# 📁 backend/app/core/health.py (condensed)
 def readiness_payload() -> tuple[Dict[str, Any], int]:
     """Run the readiness checks. Returns ``(body, http_status)``."""
     checks: Dict[str, Dict[str, Any]] = {
@@ -316,7 +316,7 @@ Where each probe is consumed — the contract table:
 The metrics guard — constant-time token compare, three states:
 
 ```python
-# 📁 backend/app/core/health.py
+# 📁 backend/app/core/health.py (condensed)
 def metrics_access(request: Request) -> Optional[JSONResponse]:
     """Return an error response when the scrape is not allowed, else ``None``."""
     if not metrics_enabled():
@@ -347,7 +347,7 @@ What's exposed — the metric registry, with the platform-specific counters that
 dashboards meaningful:
 
 ```python
-# 📁 backend/app/core/metrics.py
+# 📁 backend/app/core/metrics.py (condensed)
 http_requests_total: Counter = Counter(...)              # method, endpoint, status
 http_request_duration_seconds: Histogram = Histogram(...)
 experiment_assignments_total: Counter = Counter(...)     # experiment_id, variant_id
@@ -514,7 +514,7 @@ explicitly, and _never_ a reason for the API to crash:
 ```
 
 ```python
-# 📁 backend/app/core/scheduler_lock.py
+# 📁 backend/app/core/scheduler_lock.py (condensed)
 LOCK_NAMESPACE = "experimently.scheduler."
 
 def try_acquire(conn: Connection, name: str) -> bool:
@@ -531,7 +531,7 @@ no open transaction to be idle in.
 The tick itself — skip → record → classify → re-raise:
 
 ```python
-# 📁 backend/app/core/scheduler_tick.py
+# 📁 backend/app/core/scheduler_tick.py (condensed)
     async with async_scheduler_lock(name, engine=engine) as acquired:
         if not acquired:
             completed_at = datetime.now(timezone.utc)
@@ -564,7 +564,7 @@ Scheduler health — is it running (activity in the last 30 minutes), what was t
 status, how many consecutive failures:
 
 ```python
-# 📁 backend/app/services/scheduler_health_service.py
+# 📁 backend/app/services/scheduler_health_service.py (condensed)
 _RUNNING_THRESHOLD_MINUTES = 30
 ...
     def get_health(self, db: Session, scheduler_name: SchedulerName) -> SchedulerHealthResponse:

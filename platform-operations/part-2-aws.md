@@ -132,7 +132,7 @@ The stacks and their dependencies, in the order the file declares them (construc
 arguments abridged):
 
 ```python
-# 📁 infrastructure/cdk/app.py
+# 📁 infrastructure/cdk/app.py (condensed)
 auth_stack = AuthenticationStack(
     app, f"experimentation-auth-{env_name}", environment=env_name, env=env
 )
@@ -235,7 +235,7 @@ private tasks reach S3, DynamoDB, ECR, CloudWatch Logs and Secrets Manager witho
 the NAT:
 
 ```python
-# 📁 infrastructure/cdk/stacks/vpc_stack.py
+# 📁 infrastructure/cdk/stacks/vpc_stack.py (condensed)
         self.vpc = ec2.Vpc(
             self,
             "ExperimentationVPC",
@@ -408,9 +408,14 @@ at task start — the image never contains them and CloudFormation never sees th
 ```
 
 Why the *complete* ARN — the one ending in the six-character suffix Secrets Manager adds when
-it creates a secret? Importing by name renders a *partial* ARN into the task definition's
-`valueFrom`, which Secrets Manager does not resolve for these secrets, so no task would ever
-start. Nothing can derive the suffix at synth, so the operator supplies it:
+it creates a secret? Importing by name renders a *partial* ARN (no suffix) into the task
+definition's `valueFrom`. Secrets Manager resolves a partial ARN unless the name's last hyphen-separated
+word is exactly six characters long, because that word is then parsed as the suffix. Of the
+three, `jwt-secret` is the one that fails ("secret" is six characters), and every task needs
+it, so no task would start; `first-superuser-password` and `audit-hmac-key` would resolve.
+(That is also why a check that the complete ARN is right needs a *wrong* suffix as its
+negative control, not a missing one; see the deploying guide.) Nothing can derive the suffix
+at synth, so the operator supplies it:
 `JWT_SECRET_ARN` and `FIRST_SUPERUSER_PASSWORD_SECRET_ARN` always, `AUDIT_HMAC_KEY_SECRET_ARN`
 for the full profile (it signs the audit log; a core image never reads it, and naming a
 secret that does not exist would stop ECS starting the task). `stacks/secret_arns.py` checks
@@ -455,6 +460,9 @@ task: pull the image, write logs, inject the secrets).
             )
         self.backend_image_tag = image_tag
 ```
+
+(`#82` in that message is a pre-move issue number from the old tracker; it does not refer to
+issue #82 in this repository.)
 
 `bootstrap` is a tag the pipeline never writes, so it cannot drift. `latest` is refused
 outright, and so is an empty `-c backend_image_tag=` that would otherwise have pinned nothing
@@ -860,8 +868,10 @@ a disposable environment should not leave behind.
 35 days is the most Aurora allows; the value is set explicitly in every environment rather
 than left to CloudFormation's default of 1, and lowering it later discards the older backups.
 *Restoring* from any of these is an incident procedure with its own runbook in the app
-repository (`docs/deployment/disaster-recovery.md`, `docs/deployment/rollback-runbook.md`; pending #789);
-Part IV says when you would reach for it, and this book does not reproduce its commands.
+repository (`docs/deployment/disaster-recovery.md`, `docs/deployment/rollback-runbook.md`). Its
+restart step does not work on the CodeDeploy-controlled API service (pending #789), so until
+that is fixed, stop and escalate to whoever owns the environment rather than run it. Part IV
+says when you would reach for it, and this book does not reproduce its commands.
 
 **Redis** — a replication group with failover when there's more than one node, encrypted in
 transit and at rest, nightly snapshots:

@@ -39,7 +39,10 @@
 12 lessons in 4 Parts, the usual rhythm: **What & why → How Experimently does it (real
 code/config) → Try It Yourself → Key takeaways**, with a Workshop per Part. Configuration
 and infrastructure files are quoted with `# 📁 path` like source code — because they are
-source code. Most Try-It-Yourself sections are things you can do on a laptop with Docker;
+source code. A tagged block is an excerpt: `...` marks lines or text left out, and everything
+else is the file's own. A tag that ends in `(condensed)` marks a summary instead: the names
+are real, but lines have been joined or shortened and the trailing comments are the book's.
+Most Try-It-Yourself sections are things you can do on a laptop with Docker;
 the AWS ones are written so you can follow them with `cdk synth` and reading, without an
 account.
 

@@ -43,7 +43,7 @@ before it will deploy a tag (Hour 11). It runs on pull requests **and on every p
 The PR gate's shape — a classifier first, then one job per reason to exist:
 
 ```yaml
-# 📁 .github/workflows/pr-qa-gate.yml
+# 📁 .github/workflows/pr-qa-gate.yml (condensed)
 name: PR QA Gate
 
 on:
@@ -110,7 +110,7 @@ The Docker smoke is the job that most resembles a customer — it builds the ima
 the same path a self-hoster would:
 
 ```yaml
-# 📁 .github/workflows/pr-qa-gate.yml
+# 📁 .github/workflows/pr-qa-gate.yml (condensed)
   docker-smoke:
     name: Docker Smoke
     runs-on: ubuntu-latest
@@ -229,7 +229,7 @@ own, and the development compose file pins another. Deterministic, not identical
 **Security scans** run on push, on pull requests and weekly, and their summary is required:
 
 ```yaml
-# 📁 .github/workflows/security-scan.yml
+# 📁 .github/workflows/security-scan.yml (condensed)
   python-security:     # bandit over backend/app (and modules/backend/app when present); pip-audit
   frontend-security:   # npm audit
   semgrep:             # semgrep scan (SAST) → report artifact
@@ -948,8 +948,9 @@ a different thing: they are rotated in the dashboard and hashed at rest (SDK boo
 **Rotation, restore and restart are not in this book.** The app's secrets-management,
 rollback and disaster-recovery documents keep the rotation schedule and the procedures for
 rotating a secret, restoring the database to a point in time, and restarting the API
-service. Those procedures are being revised (pending #789); use the app's runbooks as they
-stand when you need them, and this book quotes none of their commands.
+service. Their restart steps do not work on the CodeDeploy-controlled API service (pending
+#789). Until that is fixed, do not run them: stop and escalate to whoever owns the
+environment. This book quotes none of their commands.
 
 **Backups.** What protects the data (`docs/deployment/disaster-recovery.md`):
 
