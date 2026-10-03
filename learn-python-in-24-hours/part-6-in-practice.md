@@ -33,38 +33,85 @@ them up is a real bug class.
 - **`random` / NumPy's `default_rng`** — pseudo-random for statistics, always **seeded** in
   this codebase so results are reproducible.
 
-#### Why three different hash-to-number recipes
+#### Why there is more than one hash-to-number recipe
 
-You've now seen three ways the codebase turns MD5 output into a bucket, and they are
-deliberately different functions:
+You've now seen several ways the codebase turns MD5 output into a bucket, and they are
+deliberately different functions. `backend/app/core/consistent_hash.py` keeps the list in
+its docstring; the ones this book has met:
 
-| Use                          | Recipe                                                     | Where                                  |
-| ---------------------------- | ---------------------------------------------------------- | -------------------------------------- |
-| Variant assignment           | `int(hexdigest, 16) % 100` (whole 128-bit digest)          | `assignment_service._hash_user_to_variant` |
-| Flag rollout, rule rollout   | same, salted with `flag.key` / `rule.id`                   | `feature_flag_service`, `rules_engine` |
-| Holdout, MEG, SDK utility    | first 4 bytes, `struct.unpack("<I")`, `% 100` or `/ 2**32` | `global_holdout_service`, `mutual_exclusion_service`, every SDK |
+| Use                       | Recipe                                                                 | Where |
+| ------------------------- | ---------------------------------------------------------------------- | ----- |
+| Experiment assignment     | `MD5("{user}:{experiment.key}")`, first 4 bytes LE ÷ 2³², × 100 (UUID only when `key` is empty) | `assignment_service._hash_user_to_variant` via `consistent_hash.bucket_of` |
+| SDK hash utility          | the same function, as a float in `[0, 1)`                             | every SDK; pinned by `tests/sdk-contract/golden-vectors.json` |
+| Flag rollout              | `MD5("{user}:{flag.key}")`, whole 128-bit digest, `% 100`              | `feature_flag_service._evaluate_percentage_rollout` |
+| Rule rollout              | `MD5("{user}:{rule.id}")`, whole digest, `% 100`                       | `rules_engine.should_include_in_rollout` |
+| Bandit routing            | `MD5("{user}:{experiment.id}:bandit")`, whole digest, `% 10000`        | `endpoints/tracking.py` |
+| Holdout                   | `MD5("{user}:{HOLDOUT_SALT}")`, first 4 bytes LE, `% 100`              | `global_holdout_service` |
+| Mutual-exclusion group    | `MD5("{user}:{salt}")`, first 4 bytes LE, ÷ 2³²                        | `mutual_exclusion_service` |
 
 They're all deterministic and uniform; they're just not the same function, and the salts
-(`experiment.id`, `flag.key`, `HOLDOUT_SALT`, the group's salt) make them independent. The
-"first four bytes little-endian ÷ 2³²" recipe is the one pinned across fifteen languages by
-golden vectors, because it's the one every language can implement without a big-integer
-type.
+make them independent. The "first four bytes little-endian ÷ 2³²" recipe is the contract one
+because every language can implement it without a big-integer type.
+
+Experiment assignment used to be a whole-digest `% 100` over `"{user}:{experiment.id}"`
+too. That was a bug, fixed in commit `b46e5259`, and a silent one: for `user-123`/`my-flag`
+the whole-digest reading gives bucket **79** and the contract gives **69**, and the old code
+hashed the experiment's UUID, which no SDK has. An SDK evaluating locally and the API could
+put one user in two different variants, with no error anywhere. Now the server assigns with
+the contract function, salted with the experiment's public `key`. (The flag-rollout function
+was not changed: changing any of these re-buckets users, so each moves only as a deliberate,
+stated change.)
 
 ### In the wild
 
-Whole-digest bucketing:
+The contract function — `struct` doing the one step that is easy to get wrong:
 
 ```python
-# 📁 backend/app/services/assignment_service.py
-        hash_input = f"{user_id}:{experiment.id}"
+# 📁 backend/app/core/consistent_hash.py
+def hash_user(user_id: str, key: str) -> float:
+    """A stable float in [0.0, 1.0) for *user_id* under *key*.
+
+    ``key`` is whatever namespaces the decision -- a flag key, an experiment
+    key, a holdout salt. The same user under two different keys gets two
+    unrelated positions, which is what stops every experiment bucketing the
+    same users together.
+
+    >>> round(hash_user("user-123", "my-flag"), 16)
+    0.6927449859213084
+    """
+    digest = hashlib.md5(
+        f"{user_id}:{key}".encode("utf-8"), usedforsecurity=False
+    ).digest()
+    (uint32,) = struct.unpack_from("<I", digest[:4])
+    return uint32 / HASH_DIVISOR
+
+
+def bucket_of(user_id: str, key: str) -> int:
+    """The same position as an integer in [0, 100).
+    ...
+    """
+    return int(hash_user(user_id, key) * BUCKET_COUNT)
+```
+
+The `>>>` lines in the docstring are a **doctest**: an example that is also a checkable
+claim (`python -m doctest` runs it). `HASH_DIVISOR` and `BUCKET_COUNT` are annotated
+`Final[int]`, which tells a type checker they must never be reassigned.
+
+Whole-digest bucketing — the flag rollout:
+
+```python
+# 📁 backend/app/services/feature_flag_service.py
+        hash_input = f"{user_id}:{flag.key}"
         hash_value = int(
             hashlib.md5(hash_input.encode(), usedforsecurity=False).hexdigest(), 16
         )
-        ...
+
+        # Get bucket (0-99)
         bucket = hash_value % 100
 ```
 
-First-four-bytes bucketing — the cross-SDK form:
+First-four-bytes bucketing, read as `% 100` — the holdout — and the SDK's own copy of the
+contract function:
 
 ```python
 # 📁 backend/app/services/global_holdout_service.py
@@ -134,7 +181,9 @@ _SEED_MASK = (1 << 63) - 1
 
 
 def derive_seed(experiment_id: object, bucket: str, n_samples: int) -> int:
-    """Derive the deterministic RNG seed for a Monte Carlo computation."""
+    """Derive the deterministic RNG seed for a Monte Carlo computation.
+    ...
+    """
     key = f"{experiment_id}|{bucket}|{int(n_samples)}".encode("utf-8")
     digest = hashlib.blake2b(key, digest_size=8).digest()
     return int.from_bytes(digest, "big") & _SEED_MASK
@@ -155,7 +204,7 @@ production validators demand:
 
 ```python
 # 📁 backend/app/core/config.py
-                    "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+                    'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
 ```
 
 > **Watch Out!** `random.random()` and an unseeded `np.random` are fine for a demo
@@ -185,15 +234,29 @@ production validators demand:
 >>> int.from_bytes(hashlib.blake2b(b"exp|2026-09-11|10000", digest_size=8).digest(), "big") & ((1 << 63) - 1)
 ```
 
-Then run the golden vectors: `python -m pytest tests/sdk-contract/test_python_sdk.py -q -o
-addopts=""` — and open `tests/sdk-contract/golden-vectors.json` to see what "pinned across
-fifteen languages" looks like.
+For `user-42`/`hero_banner` the three readings give 74 (whole digest `% 100`), 91 (first four
+bytes `% 100`, the holdout reading) and 0.1705… (÷ 2³²), so `bucket_of` gives 17. Same digest,
+three numbers.
+
+Then run the golden vectors, from the repository root with the venv active:
+
+```bash
+python -m pytest tests/sdk-contract -q -o addopts=""        # the harness's own tests
+python tests/sdk-contract/hash_contract.py python           # the Python SDK against the vectors
+```
+
+The second prints `python: OK -- 9/9 hash vectors, 2/2 rollout vectors, 9/9 md5 digests`.
+(`make test-sdk` runs both, plus the JavaScript, edge, React Native and Go SDKs, which need
+their toolchains.) Open `tests/sdk-contract/golden-vectors.json` to see what the contract
+pins. Five SDKs run against it in the `SDK Contract Tests` job; iOS and Android check their
+own hash in their unit tests, and `hash_contract.py --list` names the rest and why they are
+not run there.
 
 ### Common mistakes
 
 - **Hashing a `str`.** `.encode()` first.
-- **Using the whole-digest recipe to predict an SDK bucket** (or vice versa). Different
-  functions; check which one the caller uses.
+- **Using the whole-digest recipe to predict an experiment or SDK bucket** (or the contract
+  recipe to predict a flag rollout). Different functions; check which one the caller uses.
 - **`random` for tokens.** `secrets`.
 - **`==` on secrets.** `hmac.compare_digest`.
 
@@ -201,8 +264,9 @@ fifteen languages" looks like.
 
 - `hashlib` = pure functions of bytes: MD5 (bucketing, `usedforsecurity=False`), SHA-256
   (API keys), BLAKE2b (seeds).
-- `struct.unpack("<I", digest[:4])` is the cross-SDK integer; `int(hex, 16)` the
-  whole-digest one; salts make buckets independent.
+- `struct.unpack("<I", digest[:4])` is the cross-SDK integer, and experiment assignment uses
+  it (`bucket_of`, salted with `experiment.key`); `int(hex, 16)` is the whole-digest one that
+  flag rollout uses; salts make buckets independent.
 - `secrets` for keys and settings secrets; `hmac.compare_digest` to check them.
 - Seeded `default_rng` everywhere randomness is shown to a user.
 
@@ -215,7 +279,7 @@ fifteen languages" looks like.
 **NumPy** gives Python fast arrays: `np.ndarray` holds numbers in contiguous memory, and
 operations are _vectorised_ — `Y - theta * (X - E_X)` runs over a million elements in C
 without a Python loop. **SciPy** builds on it: `scipy.stats` has the distributions and
-tests (`fisher_exact`, `norm.cdf`, `chi2.sf`, `ttest_ind`) the results engine calls.
+tests (`fisher_exact`, `norm.cdf`, `chi2.sf`, `ttest_ind`) the statistics services call.
 **pandas** appears at the edges (daily results, export) for tabular data.
 
 The four things you need to read the statistics services:
@@ -229,7 +293,7 @@ The four things you need to read the statistics services:
 3. **The RNG.** `np.random.default_rng(seed)` returns a `Generator`; `rng.beta(a, b,
    size=...)` draws arrays. Always seeded here.
 4. **SciPy tests return tuples or result objects.** `stats.fisher_exact(table)` →
-   `(odds_ratio, p_value)`; `stats.ttest_ind(...)` → an object with `.pvalue`;
+   `(odds_ratio, p_value)` (in SciPy 1.17 a `SignificanceResult` that unpacks like a tuple); `stats.ttest_ind(...)` → an object with `.pvalue`;
    `stats.norm.cdf(z)` and `chi2.sf(stat, dof)` are plain floats.
 
 ### In the wild
@@ -257,8 +321,17 @@ CUPED's θ — `asarray`, `var`, `cov`, and a guard against a constant covariate
         return float(cov_yx / var_x)
 
     @staticmethod
-    def apply_cuped(Y: np.ndarray, X: np.ndarray, theta: float, E_X: float) -> np.ndarray:
-        """Y_cuped = Y - θ * (X - E[X])"""
+    def apply_cuped(
+        Y: np.ndarray,
+        X: np.ndarray,
+        theta: float,
+        E_X: float,
+    ) -> np.ndarray:
+        """Apply the CUPED transformation to a set of observations.
+
+        Y_cuped = Y - θ * (X - E[X])
+        ...
+        """
         Y = np.asarray(Y, dtype=float)
         X = np.asarray(X, dtype=float)
         return Y - theta * (X - E_X)
@@ -272,25 +345,27 @@ Monte Carlo with a seeded generator, `argmax` over an axis, and a boolean-mean t
 
 ```python
 # 📁 backend/app/services/bayesian_service.py
-def _draw_posterior_samples(posteriors: List[Dict[str, float]], n_samples: int, seed: Optional[int]) -> np.ndarray:
+def _draw_posterior_samples(
+    posteriors: List[Dict[str, float]],
+    n_samples: int,
+    seed: Optional[int],
+) -> np.ndarray:
     """Draw ``n_samples`` from each Beta posterior; shape ``[n_variants, n_samples]``."""
-    rng = make_rng(resolve_seed(seed, n_samples))
-    return np.array([
-        rng.beta(float(p["alpha"]), float(p["beta"]), n_samples)
-        for p in posteriors
-    ])
+    rng = make_rng(resolve_seed(seed, n_samples, posteriors))
+    return np.array(
+        [rng.beta(float(p["alpha"]), float(p["beta"]), n_samples) for p in posteriors]
+    )
 
 
-def compute_probability_to_be_best(posteriors, n_samples: int = DEFAULT_N_SAMPLES, seed: Optional[int] = None) -> List[float]:
-    ...
-    # Draw samples from each posterior (shape: [n_variants, n_samples])
-    samples = _draw_posterior_samples(posteriors, n_samples, seed)
-
-    # For each sample, find which variant is the winner
+def _ptbb_from_samples(samples: np.ndarray) -> List[float]:
+    """Probability to be best per variant from an already-drawn sample matrix."""
     winner = np.argmax(samples, axis=0)  # shape: [n_samples]
-
-    return [float(np.mean(winner == i)) for i in range(len(posteriors))]
+    return [float(np.mean(winner == i)) for i in range(samples.shape[0])]
 ```
+
+(`compute_probability_to_be_best` draws the samples with the first function — or takes a
+matrix a caller already drew, so two statistics can share one set of draws — and returns
+`_ptbb_from_samples(samples)`.)
 
 `np.argmax(samples, axis=0)` — for each of the `n_samples` columns, the index of the
 largest row (variant); `winner == i` is a boolean array; its mean is the fraction of
@@ -316,14 +391,24 @@ The same idea shaped for the bandit, with `bincount` instead of a loop of means:
 `n × k` matrix; `axis=1` argmaxes across each row; `bincount` counts occurrences of each
 index; `.tolist()` converts back to Python floats for JSON.
 
-SciPy tests — three different return shapes in one service:
+SciPy tests — three different return shapes. The results endpoint analyses every metric as
+a proportion (converting users over assigned users) with Fisher's exact test, which returns a
+tuple:
 
 ```python
-# 📁 backend/app/services/analysis_service.py
-                # Run Fisher's exact test
-                try:
-                    odds_ratio, p_value = stats.fisher_exact(contingency_table)
+# 📁 backend/app/services/sufficient_stats_analysis.py
+            contingency_table = [
+                [variant_conversions, variant_non_conversions],
+                [control_conversions, control_non_conversions],
+            ]
+
+            try:
+                odds_ratio, p_value = stats.fisher_exact(contingency_table)
+                is_significant = p_value < alpha
 ```
+
+The analysis service also carries a z-test (a plain float from `norm.cdf`) and Welch's t-test
+(a result object with `.pvalue`):
 
 ```python
 # 📁 backend/app/services/analysis_service.py
@@ -331,10 +416,23 @@ SciPy tests — three different return shapes in one service:
         p_value = 2.0 * (1.0 - float(stats.norm.cdf(abs(z))))
         return min(1.0, max(0.0, p_value))
 
-    def welch_t_test(self, control_values: List[float], treatment_values: List[float]) -> float:
+    def welch_t_test(
+        self,
+        control_values: List[float],
+        treatment_values: List[float],
+    ) -> float:
+        """Welch's t-test for two independent groups (unequal variances).
+
+        Returns the two-tailed p-value. Returns NaN when the within-group
+        variance is zero (identical data), which callers should handle.
+        """
         result = stats.ttest_ind(control_values, treatment_values, equal_var=False)
         return float(result.pvalue)
 ```
+
+(Welch's test on means is what the warehouse module, part of the full profile and in beta,
+runs — from summary statistics, with `stats.ttest_ind_from_stats` — not the core results
+endpoint.)
 
 ```python
 # 📁 backend/app/services/srm_service.py
@@ -363,8 +461,8 @@ stored.
 > in `float(...)` or `.tolist()` for this reason. Do the same.
 
 > **Did You Know?** The versions are pinned together for a reason: `numpy==1.26.4` because
-> `scipy==1.17.1` needs ≥ 1.26 and NumPy 2.x is a separate major bump; `pandas==2.2.3`
-> because `statsmodels` needs ≥ 2.2. A Dependabot grouped update once tried to move them
+> `scipy==1.17.1` needs ≥ 1.26 and NumPy 2.x is a separate major bump; `pandas==2.3.3`
+> because `statsmodels==0.15.0` needs ≥ 2.2. A Dependabot grouped update once tried to move them
 > independently and was unresolvable; the pins in `backend/requirements.txt` carry comments
 > saying so.
 
@@ -403,7 +501,7 @@ the Build book's Day 19 exercise — and confirm two runs give byte-identical ou
   summaries.
 - SciPy: `fisher_exact` (tuple), `ttest_ind(...).pvalue`, `norm.cdf`, `chi2.sf`; clamp and
   `float()` every p-value.
-- Pins are coupled: numpy 1.26 / scipy 1.17 / pandas 2.2.
+- Pins are coupled: numpy 1.26 / scipy 1.17 / pandas 2.3 / statsmodels 0.15.
 
 ---
 
@@ -425,10 +523,16 @@ five features this codebase leans on:
 4. **`monkeypatch`.** A fixture that sets attributes/environment for one test and reverts
    automatically. `unittest.mock.patch`/`MagicMock` for fakes with call recording.
 5. **Markers.** `@pytest.mark.asyncio` (run on an event loop), `@pytest.mark.unit`,
-   `regression`, `slow` — declared in `pyproject.toml`.
+   `regression`, `slow`, `smoke`, `modules`, `benchmark` — declared in `pyproject.toml`.
+   With `asyncio_mode = "auto"` set there, pytest-asyncio runs any `async def` test on an
+   event loop even without the marker; the marker is still written, for readers.
 
-Plus the harness facts from the FastAPI book: the venv, `APP_ENV=test TESTING=true`, a
-database per process, no truncation, unique data, `-p no:cov -q` for speed.
+Plus the harness facts from the FastAPI book: the venv, `APP_ENV=test TESTING=true` (the
+current name for the first is `ENVIRONMENT=test`; `APP_ENV` still works and logs a
+deprecation warning), a database per process, no truncation, unique data, `-p no:cov -q` for
+speed. Running everything collects some 16,300 tests at the reference commit (13,227 under
+`backend/tests`, 3,075 under `modules/backend/tests`; measured with
+`pytest --collect-only -q`).
 
 ### In the wild
 
@@ -558,11 +662,14 @@ An async test, and `pytest.raises` as a context manager:
 
 ```python
 @pytest.mark.asyncio
-async def test_viewer_cannot_update_flag(viewer_user, feature_flag):
+async def test_viewer_cannot_create_flag(viewer_user):
     with pytest.raises(HTTPException) as exc:
-        await deps.can_update_feature_flag(feature_flag=feature_flag, current_user=viewer_user)
+        await deps.can_create_feature_flag(current_user=viewer_user)
     assert exc.value.status_code == 403
 ```
+
+(Use a non-superuser of each role: the "admin" fixtures are usually superusers, which
+bypass every permission check, so a test with one proves nothing about the role table.)
 
 The set-comprehension assertion for "all the same," and the pattern of _reading the
 database back_ as the oracle:
@@ -588,10 +695,12 @@ python -m pytest backend/tests --cov=backend.app --cov-report=term     # coverag
 ```toml
 # 📁 pyproject.toml
 [tool.pytest.ini_options]
-testpaths = ["backend/tests"]
+...
+testpaths = ["backend/tests", "modules/backend/tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 python_classes = "Test*"
+asyncio_mode = "auto"
 # Coverage is NOT in addopts: it slows every run and silently produces no
 # report under some plugin combinations. Ask for it explicitly:
 #   pytest --cov=backend.app --cov-report=term
@@ -601,8 +710,17 @@ markers = [
     "integration: integration tests (require the database)",
     "e2e: end-to-end tests (require the full stack)",
     "regression: guards a specific past bug",
+    "modules: needs the modules package; skipped in a core build",
+    "smoke: wiring checks that must hold for any build of this tree",
     "slow: slow running tests",
+    "benchmark: absolute wall-clock check; skipped unless RUN_BENCHMARKS=1 (backend/tests/benchmark_gate.py)",
+    ...
 ```
+
+`modules/backend/tests` is the optional modules' suite; in a core checkout the directory is
+absent. The `benchmark` marker exists because a test that asserts one wall-clock timing
+(`assert duration < 0.1`) is flaky on a busy CI runner; timings are taken as the best of
+several runs, and absolute ones run only when asked.
 
 > **Watch Out!** `patch.object(SomeClass, "__new__")` permanently breaks the class's
 > constructor slot in CPython and caused cross-suite failures here — patch methods or use
@@ -610,8 +728,10 @@ markers = [
 > another mock, which is exactly how `get_counters` passed its tests.
 
 > **Did You Know?** The `regression` marker exists so a test that guards a specific past
-> bug can say so: `@pytest.mark.regression` with the PR number in the docstring. Grep for
-> it when you're about to "simplify" something.
+> bug can say so: `@pytest.mark.regression` with the pull request number in the docstring.
+> Every bug fix carries one, and CI checks the habit: the `regression-guard` job fails a pull
+> request labelled `bug` that changes no test file. Grep for the marker when you're about to
+> "simplify" something.
 
 ### Try It Yourself
 
@@ -672,17 +792,64 @@ m.get_counters` — `AttributeError`.
 ### What & why
 
 Twenty-three hours of conventions, collected as the checklist a reviewer applies. The
-tooling enforces the mechanical half:
+tooling enforces the mechanical half, and one tool does the Python part of it: **ruff**,
+which replaced `black` (formatting), `isort` (import order) and `flake8` (lint):
 
 ```toml
 # 📁 pyproject.toml
-[tool.black]
+[tool.ruff]
+# Ruff replaces black (format), isort (import order) and flake8 (lint).
+# `make lint` and the `lint` CI job run exactly what is configured here.
 line-length = 88
+target-version = "py311"
+...
+[tool.ruff.lint]
+...
+select = [
+    "F",      # pyflakes — real errors (undefined names, unused imports/vars)
+    "E4",     # import placement/shadowing
+    "E7",     # statement-level errors (comparisons, ambiguous names)
+    "E9",     # syntax / IO errors
+    "W",      # trailing whitespace, missing newline at EOF
+    "I",      # import sorting (replaces isort)
+    "C4",     # flake8-comprehensions
+    "PIE",    # misc lints (duplicate class fields, unnecessary placeholders)
+    "RET501", # `return None` when None is the only return
+    "RUF010", # f-string conversions: use !r / !s instead of repr()/str()
+    "RUF022", # __all__ kept sorted
+    "RUF100", # noqa comments that no longer suppress anything
+    "T20",    # no print()/pprint() in shipped code (scripts are exempt below)
+    "EXE",    # shebang present iff the file is executable
+    "LOG",    # logging misuse
+    "PLE",    # pylint errors
+    "UP032",  # str.format() that should be an f-string
+]
+...
+ignore = [
+    # `== None` / `== True` build SQL expressions in SQLAlchemy; ruff's
+    # suggestion (`is None` / `is True`) evaluates in Python and produces
+    # `WHERE false`, silently returning no rows.
+    "E711",
+    "E712",  # `== True` is how SQLAlchemy builds a boolean filter expression
+    "E741",  # `l`/`I` appear in statistical code where they match the formula
+    "F403",  # star imports in a handful of aggregating modules
+]
+```
 
-[tool.isort]
-profile = "black"
-line_length = 88
+`make format` runs `ruff format` and `ruff check --fix` over `backend/ modules/ scripts/`.
+`make lint` runs everything the `lint` CI job runs: `ruff check` and `ruff format --check`
+on the same three directories, `lint-imports` (the `[tool.importlinter]` contracts from
+Hour 9), `reuse lint` (every file carries a licence), the requirements-lock check, and, for
+the rest of the repository, `eslint` + `tsc`, `hadolint` and `actionlint`. Read the
+comments in the `select` list: each family maps to an Hour — `T20` (no `print` in shipped
+code; log instead), `LOG`, `C4` (comprehensions, Hour 7), `I` (import order, Hour 9),
+`RUF100` (no stale `noqa`, Hour 13) — and the `ignore` list is the SQLAlchemy exception to
+Hour 2's `is None` rule.
 
+**`mypy` is configured but not gated.** The same file carries a strict `[tool.mypy]` block:
+
+```toml
+# 📁 pyproject.toml
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = true
@@ -700,17 +867,19 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 ```
 
-`make lint` runs `black --check`, `isort --check`, `mypy` and `flake8`; `make format` fixes
-what's fixable. `disallow_untyped_defs = true` is the line that makes Hour 12 mandatory:
-every function in `backend/app` needs annotations, or `mypy` fails the gate (tests are
-exempt). `no_implicit_optional` means `x: int = None` is an error — write `Optional[int]`.
+No CI job, `make` target or pre-commit hook runs it, and `mypy backend/app/` reports 931
+errors in 140 files at the reference commit. So `disallow_untyped_defs = true` states the
+goal — every function in `backend/app` annotated — not something a pull request is refused
+for. Treat it as a tool you run on the file you're changing: new code should be clean under
+it, even though the tree isn't. `no_implicit_optional` means `x: int = None` is an error —
+write `Optional[int]`.
 
 ### The style guide
 
 **Language and layout**
 
-- Python 3.11; `black` (88 columns) and `isort` (black profile) decide formatting — don't
-  argue with them.
+- Python 3.11; `ruff format` (88 columns) decides formatting and ruff's `I` rules decide
+  import order — don't argue with them. `make format` before you push.
 - snake_case functions and variables, PascalCase classes, SCREAMING_CASE module constants,
   `_leading_underscore` for internal names. Named constants over magic strings
   (`REASON_HOLDOUT`, `LOCK_NAMESPACE`, `_SEED_MASK`).
@@ -723,7 +892,8 @@ exempt). `no_implicit_optional` means `x: int = None` is an error — write `Opt
 **Imports**
 
 - Fully qualified from the repository root: `from backend.app.…`. Never `from app.`,
-  never relative in new code. New models registered in `backend/app/models/__init__.py`.
+  never relative in new code. A new core model goes into `CORE_MODEL_MODULES` in
+  `backend/app/models/__init__.py`; nothing in `backend/app` imports `modules` (`lint-imports`).
 - Import the defining module, not a re-export. Local (in-function) imports only to break a
   cycle or defer a heavy dependency, with a comment.
 - Run from the repository root; `python -m module` for scripts; behaviour under
@@ -755,8 +925,9 @@ exempt). `no_implicit_optional` means `x: int = None` is an error — write `Opt
 
 **Functions and classes**
 
-- Type hints on every signature (`mypy` is strict); `Optional[X] = None` for optional;
-  `Any` is a confession; `# type: ignore[code]` names the code.
+- Type hints on every signature (the `[tool.mypy]` config is strict, though no gate runs it);
+  `Optional[X] = None` for optional; `Any` is a confession; `# type: ignore[code]` names the
+  code.
 - Keyword arguments for long calls; keyword-only (`*`) parameters for anything with a
   default that shouldn't be positional; `None` defaults for containers.
 - Services: constructor-injected `db`, composed services, `add → flush → commit → refresh`.
@@ -771,21 +942,28 @@ exempt). `no_implicit_optional` means `x: int = None` is an error — write `Opt
   handler; `except asyncio.CancelledError: raise` in task loops; never a bare `except:`.
 - Broad catches are loud (log at warning/error, count a metric) and tested against the
   real collaborator. `raise New(...) from exc` when translating.
+- An endpoint's catch-all is `raise unexpected_failure(e, "<operation>", "<sentence>",
+  db=db, logger=logger)`: rollback, the exception type and traceback in the log under the
+  request ID, a fixed sentence to the caller. Never `detail=str(e)` on a 500, and log the
+  exception's type rather than its text where the text can carry user data.
 - Domain exceptions (`InvalidTokenError`, `AccountLockedError`) with data, not strings to
   parse.
 
 **Time and randomness**
 
 - Naive means UTC; normalise at comparisons (`_as_utc`); write naive to naive columns; ISO
-  strings always carry `+00:00`; `perf_counter`/`monotonic` for durations.
+  strings always carry `+00:00` (`normalize_event_timestamp`, enforced by the
+  `UTCTimestampString` column type); a local wall-clock time is read in its `zoneinfo` zone
+  and converted to UTC before comparing; `perf_counter`/`monotonic` for durations.
 - `hashlib` for determinism (`usedforsecurity=False` on MD5), `secrets` for keys,
   `hmac.compare_digest` to check them, seeded `default_rng` for Monte Carlo; `float()`/`.tolist()`
   on every NumPy value that leaves a function.
 
 **Concurrency**
 
-- `async def` only awaits; blocking work goes to `to_thread`/`run_in_threadpool`; `def`
-  endpoints for heavy handlers; consistent per module.
+- `async def` only awaits; blocking work goes to `to_thread`/`run_in_threadpool` (the
+  scheduler lock does, through `async_scheduler_lock`); `def` endpoints for heavy handlers;
+  consistent per module.
 - Tasks are owned by the lifespan; `cancel()` then `await`; let `CancelledError`
   propagate; sessions never cross a thread boundary.
 - `threading.Lock`/`RLock` for cross-thread structures (short critical sections, `deque`
@@ -800,18 +978,25 @@ exempt). `no_implicit_optional` means `x: int = None` is an error — write `Opt
   tables, `monkeypatch` for seams and settings, `MagicMock(spec=...)`, `@pytest.mark.asyncio`
   and `await` for async deps.
 - Mock what you don't own; drive what you do; the database is the oracle; unit tests name
-  their integration twin; `regression` marker for bug guards.
+  their integration twin; a `@pytest.mark.regression` test with every bug fix (the
+  `regression-guard` job checks a `bug`-labelled pull request changes a test).
 
 ### Try It Yourself
 
 Run the gate on the real code and read one finding of each kind:
 
 ```bash
-make lint 2>&1 | tail -20
-black --check backend/app | head -5
-mypy backend/app/core/stats_engine.py backend/app/services/event_matching.py
-flake8 backend/app/core/scheduler_lock.py
+ruff check backend/ modules/ scripts/           # "All checks passed!" on a clean tree
+ruff format --check backend/ modules/ scripts/  # "... files already formatted"
+lint-imports                                    # "Contracts: 3 kept, 0 broken."
+mypy backend/app/core/stats_engine.py           # not a gate: read what it says, and why
 ```
+
+(`make lint` runs the first three and more, including the frontend's `eslint` and `tsc`,
+which need `npm install` run in `frontend/` first.) Then give ruff something to find — a scratch file with
+`print(x)` and `if x == None: return None` in a function. `ruff check scratch.py` reports
+`T201` for the `print` and `RET501` for the `return None`, and says nothing about `x == None`:
+that rule is switched off for SQLAlchemy's sake (Hour 2).
 
 Then review the most recent merged PR (`gh pr list --state merged --limit 1`) against the
 guide, section by section, and write down each item it touches and whether it complied.
@@ -819,8 +1004,8 @@ That review is what you'll be asked to do on every pull request from now on.
 
 ### Key takeaways
 
-- The mechanical half is tooling (`black`, `isort`, `mypy` strict, `flake8`); the
-  judgement half is this list.
+- The mechanical half is tooling: `ruff` (format, import order, lint) and `lint-imports`,
+  run by `make lint` and CI; `mypy` is configured, not gated. The judgement half is this list.
 - Every item traces to an Hour, and most trace to a bug the platform actually had.
 - Review against it; ship when `make lint` and `make test` are green.
 
@@ -828,10 +1013,14 @@ That review is what you'll be asked to do on every pull request from now on.
 
 ## Part VI Workshop
 
-**Q1. Three MD5-to-bucket recipes exist. Which one does an SDK implement, and why that one?**
+**Q1. Several MD5-to-bucket recipes exist. Which one does an SDK implement, and why that
+one?**
 First four bytes, little-endian unsigned int, divided by 2³² — because it needs no
-big-integer type and is pinned across fifteen languages by golden vectors. The server's
-variant hash (whole digest `% 100`) is a different function on purpose.
+big-integer type, and `tests/sdk-contract/golden-vectors.json` pins it (five SDKs are run
+against the vectors in CI; iOS and Android test their own hash in their unit tests). It is
+also the server's **experiment-assignment** hash (`consistent_hash.bucket_of`, salted with
+the experiment's `key`), so an SDK and the API put a user in the same variant. It is _not_
+the flag-rollout function, which reads the whole digest `% 100`.
 
 **Q2. Why SHA-256 for API keys but bcrypt for passwords?**
 Keys are random 128-bit values looked up on every SDK request — no brute-force risk, fast
@@ -856,9 +1045,13 @@ function.
 An error: `no_implicit_optional = true` forbids a `None` default on a non-Optional type.
 Write `x: Optional[int] = None`.
 
-**Quiz.** Which two modules are exempt from `disallow_untyped_defs`, and why?
+**Quiz.** Which modules are exempt from `disallow_untyped_defs`, and does that exemption
+change what a pull request must pass?
 → `tests.*` (an override in `pyproject.toml`): test functions are short, fixture-injected
-and read better untyped; the application code has no such exemption.
+and read better untyped; the application code has no such exemption. It changes nothing a
+pull request must pass, because no gate runs `mypy`. (Running it also prints
+`unused section(s): module = ['tests.*']`: the test files live under `backend/tests`, so the
+pattern matches no module.)
 
 ---
 
@@ -867,7 +1060,7 @@ and read better untyped; the application code has no such exemption.
 **E6.1 — Two hashes.** Implement both bucket recipes (`whole_digest_bucket` and
 `first_four_le_bucket`) and find, over 10,000 user ids and one salt, the fraction of ids
 where they disagree. What does that number tell you about "use the SDK hash to predict a
-variant"?
+flag rollout"?
 
 **E6.2 — Reproducible Monte Carlo.** Write `ptbb(conversions, totals, n_samples, seed)`
 using `default_rng`, Beta(1+c, 1+n−c) posteriors, `argmax` and `bincount`, and assert two
@@ -922,9 +1115,12 @@ disagree = sum(whole_digest_bucket(u, "s") != first_four_le_bucket(u, "s") for u
 print(disagree)     # ≈ 0.99 — they agree only by chance (1 in 100)
 ```
 
-They're unrelated functions of the same digest; the SDK utility predicts _flag rollout_
-buckets only where the server also uses the first-four-bytes recipe (holdout, MEG) and never
-the variant hash. Call `/tracking/assign`.
+They're unrelated functions of the same digest. The SDK hash agrees with the server's
+_experiment assignment_ (which uses the contract function, `bucket_of`) but not with its flag
+rollout, which reads the whole digest — for flags, ask the server
+(`GET /api/v1/feature-flags/evaluate/{key}`). And for an experiment, call `/tracking/assign`
+anyway: assignment is sticky, and holdouts, mutual exclusion and targeting can make a user
+ineligible before any hash is consulted.
 
 **S6.2**
 
@@ -950,7 +1146,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 from backend.app.core.rollout_scheduler import _as_utc
 
-@pytest.mark.regression   # PR #65: naive DB timestamps vs aware now() raised on every rollout tick
+@pytest.mark.regression   # commit 56c49e4f: naive DB timestamps vs aware now() raised on every rollout tick
 @pytest.mark.parametrize("value", [
     datetime(2026, 9, 11, 12, 0, 0),
     datetime(2026, 9, 11, 12, 0, 0, tzinfo=timezone.utc),
@@ -967,7 +1163,7 @@ def test_as_utc_returns_aware_utc_for_the_same_instant(value):
 
 ```python
 from unittest.mock import MagicMock
-from backend.app.services.dynamodb_counter_service import DynamoDBCounterService
+from modules.backend.app.services.dynamodb_counter_service import DynamoDBCounterService  # a full checkout
 
 def test_scheduler_reads_counters():
     svc = MagicMock(spec=DynamoDBCounterService)
@@ -979,13 +1175,16 @@ def test_scheduler_reads_counters():
 With `spec=`, `svc.get_counters` raises `AttributeError` — the test now fails if the
 production code calls a method the real service doesn't have.
 
-**S6.5** — Violations: `from app.` import (fully qualify); no type hints (`mypy` strict);
+**S6.5** — Violations: `from app.` import (fully qualify); no type hints (the house rule, and what the `[tool.mypy]` config asks for);
 `id` shadows a builtin; mutable default `tags=[]`; `active == True` (use `if active`);
 comparing an ORM enum to a string (`e.status == ExperimentStatus.ACTIVE`); `e` may be
 `None` (guard it); mutating the caller's `tags`; `datetime.utcnow()` stringified without an
 offset (use `datetime.now(timezone.utc).isoformat()` for a computed timestamp); a bare
-`except: pass` swallowing everything; single-letter names; `black` would reformat the
-spacing.
+`except: pass` swallowing everything; `datetime` used but never imported; single-letter
+names. Tooling catches only some of these: `ruff check` reports `I001` (import block),
+`F821` (undefined `datetime`) and `E722` (bare `except`), and `ruff format` would fix the
+spacing — but it says nothing about `active == True`, because `E712` is ignored for
+SQLAlchemy's sake. The rest is review.
 
 ```python
 from datetime import datetime, timezone

@@ -34,8 +34,9 @@ Python has the best ecosystem in the world for the "judgement" part — NumPy, S
 and a mature web stack (FastAPI, SQLAlchemy) for the glue. The costs — it's slower than Go
 or Java per line, and dynamic typing lets mistakes wait — are real, and the platform pays
 them deliberately: hot paths are short database reads, heavy maths is NumPy (which is C
-underneath), and every function is type-annotated so `mypy` catches what the interpreter
-won't.
+underneath), and functions are type-annotated so a checker like `mypy` can catch what the
+interpreter won't. (Annotations are the convention, not a gate: `mypy` is configured in
+`pyproject.toml` but no CI job runs it. Hour 12.)
 
 #### The method that didn't exist
 
@@ -55,12 +56,14 @@ months the bandit scheduler ran, logged a warning nobody read, and never learned
 Every bandit experiment behaved like a fixed split. The tests were green because they mocked
 the counter service and the mock cheerfully answered `get_counters`.
 
-The fix (PR #65) renamed the call, added a PostgreSQL fallback, and — the part that matters
+The fix (commit `56c49e4f`) renamed the call, added a PostgreSQL fallback, and — the part that matters
 for this Hour — the team's testing policy now requires driving such paths against the real
 collaborator. But the deeper lesson is the thesis of this book:
 
-> Python will let you write almost anything. The discipline — type hints checked by `mypy`,
-> tests against real objects, explicit exceptions — is what makes "almost anything" safe.
+> Python will let you write almost anything. The discipline — type hints a checker like `mypy`
+> can read, tests against real objects, explicit exceptions — is what makes "almost anything"
+> safe. (In this repository `mypy` is configured but no CI gate runs it; the tests are the
+> enforcement. Hour 12 says more.)
 
 ### In the wild
 
@@ -73,14 +76,24 @@ The corrected call, and the type hints that would have made the mistake visible 
     ) -> Optional[Dict[str, VariantStats]]:
         """Read counters from DynamoDB; ``None`` when the service is unavailable."""
         try:
-            counters = self.counter_service.get_experiment_counters(str(experiment_id))
+            # Inside the try: the provider resolves the class at each call and
+            # can raise (an import that fails mid-process); that is a reason to
+            # fall through to PostgreSQL, not to abandon the tick.
+            counter_service_cls = self._load_counter_service_class()
+            if counter_service_cls is None:
+                return None
+            counter_service = counter_service_cls()
+            counters = counter_service.get_experiment_counters(str(experiment_id))
         ...
 ```
 
 Read the signature: `experiment_id: UUID`, `variant_ids: List[str]`, returns
 `Optional[Dict[str, VariantStats]]`. Those annotations don't change what runs — Python
-ignores them at runtime — but `mypy` reads them, and if `counter_service` is annotated as a
-`DynamoDBCounterService`, a call to a method it doesn't have is a type error at your desk.
+ignores them at runtime — but `mypy` reads them, and when a variable's type is known, a call
+to a method it doesn't have is a type error at your desk. (Here the counter service is part
+of the optional modules, so the core looks its class up at run time and gets back a plain
+`type` — exactly the situation where a checker can no longer help and a test against the
+real class has to.)
 
 ### Running Python
 
@@ -101,7 +114,7 @@ repository root without `cd`: `backend.app.db.bootstrap` is resolved the same wa
 
 > **By the Way.** The **virtualenv** (`venv/`) is a private copy of the interpreter plus the
 > exact package versions in `backend/requirements.txt` (`fastapi==0.141.1`, `pydantic==2.13.5`,
-> `SQLAlchemy==2.0.52`…). Activating it puts that `python` first on your `PATH`. Every
+> `SQLAlchemy==2.0.54`…). Activating it puts that `python` first on your `PATH`. Every
 > "works on my machine" story in this repo's history ends with someone running the system
 > Python. `CLAUDE.md` says it in capitals: activate the venv first.
 
@@ -142,7 +155,7 @@ Then, with the venv active, import something real and look at it:
 - Python is high-level, dynamically typed, interpreted — fast to write, and mistakes wait
   until runtime.
 - The platform chose it for the scientific ecosystem and the web stack, and tames the cost
-  with type hints + `mypy` + tests against real objects.
+  with type hints (readable by `mypy`) and tests against real objects.
 - `get_counters` is the canonical "valid Python, wrong program" story.
 - Always the venv; `python -m module` from the repo root.
 
@@ -178,35 +191,58 @@ Types tell you _what kind_ of value, not _what unit_. `traffic_allocation` is an
 the API and the database, meaning a **percentage 0–100**; the Lambda functions under
 `backend/lambda/` use a `float` **fraction 0.0–1.0** for the same concept. Both are numbers;
 neither type system objects; a value of `50` passed where `0.5` was expected is "everyone in
-the experiment," and `0.5` where `50` was expected is "nobody." `CLAUDE.md` lists this as a
-known inconsistency, and it's the Python version of a lesson every typed language teaches:
+the experiment," and `0.5` where `50` was expected is "nobody." Nothing in the code reconciles
+the two; it's the Python version of a lesson every typed language teaches:
 **a number's type is not its meaning.** When you read a percentage in this codebase, check
 the docstring or the constraint (`ge=0, le=100`) before you do arithmetic with it.
 
 ### In the wild
 
-Integer percentages, a modulo bucket, and comparison — the whole variant hash is scalar
-arithmetic:
+Integer percentages, a modulo bucket, and comparison — bucketing is scalar arithmetic. Here
+is the feature-flag rollout function:
 
 ```python
-# 📁 backend/app/services/assignment_service.py
-        hash_input = f"{user_id}:{experiment.id}"
+# 📁 backend/app/services/feature_flag_service.py
+        # Create a hash using user ID and flag key for deterministic assignment
+        hash_input = f"{user_id}:{flag.key}"
         hash_value = int(
             hashlib.md5(hash_input.encode(), usedforsecurity=False).hexdigest(), 16
         )
-        ...
-        # Normalize hash to be within range [0, 100)
+
+        # Get bucket (0-99)
         bucket = hash_value % 100
 
-        # Find the assigned variant
-        for threshold, variant_id in distribution:
-            if bucket < threshold:
-                return variant_id
+        # User is in the rollout if their bucket is less than the percentage
+        return bucket < percentage
 ```
 
 `int(hex_string, 16)` parses a hexadecimal string into an arbitrary-precision integer —
 MD5's 128 bits become one Python `int` with no overflow — and `% 100` reduces it to
-`0..99`. Compare with the Lambda's fraction:
+`0..99`.
+
+Experiment assignment uses a _different_ function, the one every SDK implements. It reads
+only the first four bytes of the digest, turns them into a float in `[0.0, 1.0)`, and only
+then scales to a percentage bucket:
+
+```python
+# 📁 backend/app/core/consistent_hash.py
+def bucket_of(user_id: str, key: str) -> int:
+    """The same position as an integer in [0, 100).
+
+    For allocations expressed as percentages. Derived from :func:`hash_user`
+    rather than computed separately, so the two can never disagree about which
+    side of a boundary a user falls on.
+
+    >>> bucket_of("user-123", "my-flag")
+    69
+    """
+    return int(hash_user(user_id, key) * BUCKET_COUNT)
+```
+
+A fraction (`hash_user`) and a percentage (`bucket_of`) side by side, converted in one
+explicit place. For the same input, `user-123`/`my-flag`, the rollout function above gives
+bucket 79 and `bucket_of` gives 69: two valid-looking numbers from two readings of one
+digest (Hour 21 explains why). Compare with the Lambda's fraction:
 
 ```python
 # 📁 backend/lambda/shared/consistent_hash.py
@@ -241,17 +277,21 @@ Booleans and the `bool` subclass gotcha, guarded explicitly:
 ```python
 # 📁 backend/app/core/safety_scheduler.py
 def _rollback_target_percentage(config: Any) -> int:
+    ...
     value = getattr(config, "rollback_percentage", None)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
-    return max(0, min(100, int(value)))
+    clamped = max(0, min(100, int(value)))
+    if not 0 <= value <= 100:
+        logger.warning(...)   # abridged: names the flag and the stored value
+    return clamped
 ```
 
 `isinstance(True, int)` is `True` — so a config where someone wrote `rollback_percentage:
 true` would otherwise become `1%`. The explicit `isinstance(value, bool)` check comes first.
 `max(0, min(100, x))` is the idiom for clamping.
 
-> **Did You Know?** Python integers are arbitrary precision, so the results engine can do
+> **Did You Know?** Python integers are arbitrary precision, so the flag rollout can do
 > `int(md5_hex, 16)` — a 39-digit number — and `blake2b` seeds are masked to 63 bits with
 > `& ((1 << 63) - 1)` not because they'd overflow Python, but because they must fit a
 > PostgreSQL `BIGINT` and NumPy's seed. The mask is about _other_ systems' limits.
@@ -272,7 +312,11 @@ False
 >>> max(0, min(100, 250)), max(0, min(100, -3))
 (100, 0)
 >>> import hashlib
->>> int(hashlib.md5(b"user-42:exp-1").hexdigest(), 16) % 100
+>>> int(hashlib.md5(b"user-42:exp-1").hexdigest(), 16) % 100      # the flag-rollout reading
+54
+>>> from backend.app.core.consistent_hash import bucket_of          # venv, repo root
+>>> bucket_of("user-42", "exp-1")                                   # the experiment reading
+99
 ```
 
 Now the trap: compute `50 / 100` and `0.5 * 100`, and decide which of the two unit
@@ -281,7 +325,10 @@ traffic_allocation`.
 
 ### Common mistakes
 
-- **`x == None`** — works but is wrong (`==` is overridable); `x is None`.
+- **`x == None`** — works but is wrong (`==` is overridable); `x is None`. The one exception
+  is a SQLAlchemy filter: `Model.column == None` is _meant_ to be overridden — it builds
+  `IS NULL` — while `Model.column is None` is plain Python `False` and silently matches no
+  rows. That is why `pyproject.toml` tells ruff to ignore `E711`/`E712`.
 - **Assuming `/` gives an int.** It never does; `//` floors.
 - **Trusting a number's type for its unit.** Read the docstring; clamp with `max/min`.
 - **Forgetting `bool` is an `int`** when checking `isinstance(x, int)`.
@@ -301,7 +348,7 @@ traffic_allocation`.
 ### What & why
 
 Python's control flow is indentation-delimited: a colon opens a block, and the block is
-whatever's indented beneath it (four spaces, by `black`). There are no braces and no
+whatever's indented beneath it (four spaces, enforced by `ruff format`). There are no braces and no
 `end`. That makes structure visible at a glance and makes a misindented line a logic
 change, not a syntax error — worth knowing when you paste code.
 
@@ -348,30 +395,34 @@ to bottom without nesting:
 eligibility["eligible"]:` is truthiness on a `bool`. Both are idiomatic because the falsy
 case is exactly the "absent/false" case you mean.
 
-A `for` over a cumulative distribution, with a fallthrough after the loop:
+A `for` over a running cumulative sum, with a guard before it and a fallthrough after it:
 
 ```python
 # 📁 backend/app/services/assignment_service.py
-        total = 0
-        distribution = []
-        for variant in variants:
-            total += variant.traffic_allocation
-            distribution.append((total, variant.id))
+        if not experiment.variants:
+            raise ValueError(f"Experiment {experiment.id} has no variants")
 
-        bucket = hash_value % 100
+        namespace = experiment.key or str(experiment.id)
+        bucket = bucket_of(user_id, namespace)
 
-        for threshold, variant_id in distribution:
-            if bucket < threshold:
-                return variant_id
+        # Cumulative distribution over allocations expressed 0-100.
+        cumulative = 0
+        for variant in experiment.variants:
+            cumulative += variant.traffic_allocation
+            if bucket < cumulative:
+                return variant.id
 
-        # Fallback to last variant (should not happen if allocations sum to 100)
-        return variants[-1].id if variants else None
+        # Allocations summing to less than 100 leave a tail; the last variant
+        # takes it, which is what the previous implementation did too.
+        return experiment.variants[-1].id
 ```
 
-`for threshold, variant_id in distribution` **unpacks** each `(total, id)` tuple into two
-names — Hour 5. The line after the loop is the `for ... else` idea without the keyword: it
-runs only if no `return` fired. And `variants[-1].id if variants else None` is the
-**conditional expression** (`A if cond else B`), Python's ternary.
+`if not experiment.variants:` is truthiness on a list: an empty list is falsy, so the guard
+raises before the loop could ever fall through with nothing to return. The `for` keeps a
+running total and returns the first variant whose cumulative share is above the bucket. The
+line after the loop is the `for ... else` idea without the keyword: it runs only if no
+`return` fired. And `experiment.key or str(experiment.id)` is the falsy-default idiom from
+Hour 2: an experiment with no public `key` (`None` or `""`) falls back to its UUID.
 
 `zip` to compare neighbours — "non-decreasing" in one expression:
 
@@ -456,7 +507,7 @@ one branch in your head as nested `if`/`else` and notice how much worse it reads
 ### Common mistakes
 
 - **Mixing tabs and spaces** or copying code with a different indent — a logic change with
-  no error. `black` fixes it; run it.
+  no error. `ruff format` (`make format`) normalises the indentation; run it.
 - **`if x:` when `0` is valid.** Compare explicitly.
 - **Modifying a list while iterating over it.** Build a new one (Hour 7's comprehensions).
 - **`for i in range(len(xs))`** to get elements — use `for x in xs` or `enumerate`.
@@ -722,7 +773,8 @@ without overflow.
 ## Exercises
 
 **E1.1 — Bucket math.** Write `bucket(user_id: str, salt: str) -> int` returning the
-0–99 bucket used by the platform (MD5 of `f"{user_id}:{salt}"`, parsed as hex, `% 100`),
+0–99 bucket the platform's feature-flag rollout uses (MD5 of `f"{user_id}:{salt}"`, parsed as
+the whole hex digest, `% 100`; experiment assignment uses a different reading, Hour 21),
 and `in_rollout(user_id, salt, percentage) -> bool` with the 0 and 100 short-circuits.
 
 **E1.2 — Clamp and coerce.** Write `as_percentage(value) -> int` that returns 0 for `None`,

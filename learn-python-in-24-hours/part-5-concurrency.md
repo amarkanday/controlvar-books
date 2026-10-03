@@ -117,19 +117,31 @@ coroutine must call blocking code:
 ```
 
 The async dependencies that must be awaited (or `Depends`-ed) — the `CLAUDE.md` rule in
-code:
+code. The flag-create route depends on this one:
 
 ```python
 # 📁 backend/app/api/deps.py
-async def can_update_feature_flag(
-    feature_flag: FeatureFlag = Depends(get_feature_flag_access),
+async def can_create_feature_flag(
     current_user: User = Depends(get_current_user),
 ) -> bool:
+    """Check if user can create a feature flag."""
+    if not check_permission(current_user, ResourceType.FEATURE_FLAG, Action.CREATE):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=get_permission_error_message(
+                ResourceType.FEATURE_FLAG, Action.CREATE
+            ),
+        )
+    return True
 ```
 
-Called by hand, `deps.can_update_feature_flag(...)` returns a coroutine and checks nothing;
-`await deps.can_update_feature_flag(...)` runs it. That's the "forgotten `await`" trap in
-its most dangerous form — a permission check that silently passes.
+Called by hand, `deps.can_create_feature_flag(current_user=u)` returns a coroutine and
+checks nothing; `await deps.can_create_feature_flag(current_user=u)` runs it. That's the
+"forgotten `await`" trap in its most dangerous form — a permission check that silently
+passes. (The per-flag routes decide with `can_act_on_feature_flag(user, owner_id, action)`
+in `backend/app/core/permissions.py`, a plain `def` that returns a `bool` — nothing to
+forget to await. `deps.py` still has `can_update_feature_flag` and
+`can_delete_feature_flag`, but no route uses them; don't build on them.)
 
 `asyncio.run` at the top level of a script or a shell, to drive a coroutine from sync code:
 
@@ -222,7 +234,9 @@ Three facts about tasks that the scheduler code depends on:
 
 `asyncio.to_thread(fn, *args)` runs a synchronous function in a worker thread and returns
 an awaitable — the escape hatch for CPU-bound or blocking work inside a coroutine. It's
-what the bandit runner uses for Monte Carlo and its database work.
+what the bandit runner uses for Monte Carlo and its database work, and what
+`async_scheduler_lock` (Hour 15) uses to take and release the advisory lock, so a database
+that hangs blocks a worker thread rather than the event loop.
 
 ### In the wild
 
@@ -259,12 +273,19 @@ The task lifecycle, start to stop:
         """Run the scheduler loop."""
         while self.is_running:
             try:
-                await run_locked_tick(SCHEDULER_NAME, self.process_scheduled_experiments)
+                # One tick under the advisory lock; records the run and
+                # skips when another replica holds the lock.
+                await run_locked_tick(
+                    SCHEDULER_NAME, self.process_scheduled_experiments
+                )
+
+                # Wait for the next interval
                 await asyncio.sleep(self.interval_minutes * 60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in experiment scheduler: {str(e)}")
+                logger.error(f"Error in experiment scheduler: {e!s}")
+                # Wait a bit before trying again
                 await asyncio.sleep(60)
 ```
 
@@ -279,7 +300,7 @@ The runner that keeps cancellation clean through a lock and a database write:
 
 ```python
 # 📁 backend/app/core/scheduler_tick.py
-    with scheduler_lock(name, engine=engine) as acquired:
+    async with async_scheduler_lock(name, engine=engine) as acquired:
         ...
         try:
             raw = await tick()
@@ -290,7 +311,8 @@ The runner that keeps cancellation clean through a lock and a database write:
             raise
 ```
 
-`raise` inside the `with` → the context manager's `finally` releases the advisory lock →
+`raise` inside the `async with` → the context manager's `finally` releases the advisory lock
+(in a worker thread, via `asyncio.to_thread`) →
 the exception continues up to the scheduler loop. No "failed" run is recorded for a
 shutdown.
 
@@ -358,10 +380,13 @@ _awaits_, not threads, that create the race.
 > silently. The scheduler loops catch everything and keep going precisely so the task never
 > dies; if you write a fire-and-forget task, wrap its body in `try/except` with a log.
 
-> **Did You Know?** `BaseHTTPMiddleware`, `run_in_threadpool` and `asyncio.to_thread` all use
-> the same default thread pool (sized by `anyio`), so a burst of threadpool endpoints plus a
-> bandit pass compete for workers. It's another reason the platform runs one worker per
-> container and scales containers: the pool is per process.
+> **Did You Know?** There are two thread pools in the process. `run_in_threadpool` and
+> FastAPI's plain `def` endpoints use `anyio`'s worker threads (capped at 40 by default);
+> `asyncio.to_thread` uses the event loop's default executor (`min(32, cpu_count + 4)`
+> threads). Each is per process, so a burst of threadpool endpoints competes for one pool
+> and the scheduler offloads for the other — and adding uvicorn workers multiplies both. The
+> image starts one worker by default (`--workers ${WEB_CONCURRENCY:-1}` in
+> `backend/Dockerfile`) and scales by running more containers.
 
 ### Try It Yourself
 
@@ -449,7 +474,12 @@ class EvaluationCache:
     ...
     """
 
-    def __init__(self, max_size: int = 10000, default_ttl: float = 300.0):
+    def __init__(
+        self,
+        max_size: int = 10000,
+        default_ttl: float = 300.0,  # 5 minutes default
+    ):
+        ...
         self.max_size = max_size
         self.default_ttl = default_ttl
 
@@ -602,9 +632,11 @@ with lock:
 > anything.
 
 > **Did You Know?** `RLock` lets the same thread acquire twice — necessary when a locked
-> method calls another locked method on the same object (`set` → `_evict` in the evaluation
-> cache). With a plain `Lock`, that's a deadlock: the thread waits for a lock it already
-> holds.
+> method calls another locked method on the same object. With a plain `Lock`, that's a
+> deadlock: the thread waits for a lock it already holds. `EvaluationCache` uses an `RLock`,
+> though today none of its locked methods calls another (`set` evicts inline, with
+> `popitem(last=False)`, inside its one `with self._lock:` block). The `RLock` is insurance
+> against a future refactor that adds such a call, bought for a little overhead per acquire.
 
 ### Try It Yourself
 
@@ -657,8 +689,8 @@ the same `RLock` as `get`.
 
 ## Part V Workshop
 
-**Q1. `deps.can_update_feature_flag(feature_flag=f, current_user=u)` is called without
-`await`. What happens?**
+**Q1. `deps.can_create_feature_flag(current_user=u)` is called without `await`. What
+happens?**
 A coroutine object is created and discarded; the permission check never runs; Python
 warns "coroutine … was never awaited" at garbage collection. The call silently passes.
 

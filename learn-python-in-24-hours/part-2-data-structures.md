@@ -22,50 +22,26 @@ count from the end (`xs[-1]` is the last), slices make copies (`xs[1:]`, `xs[:80
 `append`, `extend`, `pop`, `insert`, `sort()` (in place) vs `sorted()` (new list),
 `reversed`, `len`, `in`.
 
-A **tuple** is an ordered, _immutable_ sequence: `(total, variant.id)`. Tuples are for
+A **tuple** is an ordered, _immutable_ sequence: `(variant.id, weight)`. Tuples are for
 fixed-shape records — a pair, a triple — where the position _means_ something; lists are for
 homogeneous collections of any length. Because tuples are immutable they can be dictionary
 keys and set members; lists can't.
 
-**Unpacking** is the feature that makes tuples pleasant: `threshold, variant_id = pair`;
+**Unpacking** is the feature that makes tuples pleasant: `variant_id, weight = pair`;
 `inside, outside = f()`; `for a, b in zip(...)`; `first, *rest = xs`.
 
-#### Why the distribution is a list of tuples
+#### Why the bandit weights are a list of tuples
 
-The variant hash needs "for each variant, the cumulative threshold and the id" — a fixed
-2-shape per element, any number of elements. A list of `(int, UUID)` tuples says that
-exactly. A dict `{threshold: id}` would lose ordering guarantees you'd have to re-sort, and
-would break if two variants had the same threshold (a 0% variant). Lists of tuples are the
-house shape for "ordered records"; dataclasses (Hour 11) take over when the record grows
-beyond two or three fields.
+A multi-armed bandit experiment routes new users by weights the scheduler learns. The router
+needs "for each variant, its id and its weight" — a fixed 2-shape per element, any number of
+elements, in a stable order. A list of `(UUID, float)` tuples says that exactly. A dict
+`{id: weight}` would carry the pairs too, but the walk below depends on _order_, and the code
+sorts and filters the pairs as a sequence. Lists of tuples are the house shape for "ordered
+records"; dataclasses (Hour 11) take over when the record grows beyond two or three fields.
 
 ### In the wild
 
-Building and walking the distribution:
-
-```python
-# 📁 backend/app/services/assignment_service.py
-        # Create cumulative distribution based on traffic allocation
-        total = 0
-        distribution = []
-        for variant in variants:
-            total += variant.traffic_allocation
-            distribution.append((total, variant.id))
-
-        # Normalize hash to be within range [0, 100)
-        bucket = hash_value % 100
-
-        # Find the assigned variant
-        for threshold, variant_id in distribution:
-            if bucket < threshold:
-                return variant_id
-
-        # Fallback to last variant (should not happen if allocations sum to 100)
-        return variants[-1].id if variants else None
-```
-
-`variants[-1]` — the last element, the fallthrough. The bandit version sorts first so the
-walk is reproducible, and builds pairs with a comprehension (Hour 7) before filtering:
+Building, filtering and walking the weights:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/tracking.py
@@ -79,7 +55,12 @@ walk is reproducible, and builds pairs with a comprehension (Hour 7) before filt
     total = sum(w for _, w in weighted)
     if not weighted or total <= 0.0:
         return None
-    ...
+
+    digest = hashlib.md5(
+        f"{user_id}:{experiment.id}:bandit".encode(), usedforsecurity=False
+    ).hexdigest()
+    bucket = int(digest, 16) % 10_000 / 10_000
+
     cumulative = 0.0
     for variant_id, weight in weighted:
         cumulative += weight / total
@@ -88,6 +69,13 @@ walk is reproducible, and builds pairs with a comprehension (Hour 7) before filt
     # Floating-point tail: bucket landed at/after the last threshold.
     return weighted[-1][0]
 ```
+
+The pairs are built with a comprehension (Hour 7), filtered with another, summed, and then
+walked with a running total; `weighted[-1][0]` is the fallthrough. Experiment assignment for
+fixed-split experiments (Hour 3) does the same walk _without_ building a list: it keeps one
+running integer and returns at the first match, because it needs nothing else from the pairs.
+Build the list when you have to sort, filter or reuse it; keep a running value when you only
+walk once.
 
 Three list idioms in ten lines: `sorted(xs, key=lambda v: ...)` for a stable order by a
 derived key; `experiment.variants or []` so a `None` relationship becomes an empty list; `_`
@@ -175,7 +163,8 @@ find which variant buckets 24, 25 and 99 land in.
 - Lists: ordered, mutable, homogeneous; index/slice/`append`/`sorted(key=)`; `[-1]` is
   last.
 - Tuples: ordered, immutable records; unpack them; `_` for ignored fields; `(x,)` for one.
-- The cumulative distribution is a list of `(threshold, id)` tuples walked in order.
+- The bandit router's weights are a list of `(id, weight)` tuples walked in order with a
+  running cumulative sum.
 - `sorted(...)` new vs `.sort()` in place; `range(lo, hi + 1)` for consecutive checks.
 
 ---
@@ -255,13 +244,18 @@ The recursive flatten that produces dotted keys:
 # 📁 backend/app/core/targeting_adapter.py
 def _flatten_into(out: Dict[str, Any], value: Dict[str, Any], prefix: str) -> None:
     for key, item in value.items():
-        dotted = f"{prefix}{key}"
-        out[dotted] = item
+        if not isinstance(key, str):
+            key = str(key)
+        full_key = f"{prefix}{key}" if prefix else key
+        out.setdefault(full_key, item)
         if isinstance(item, dict):
-            _flatten_into(out, item, prefix=f"{dotted}.")
+            _flatten_into(out, item, prefix=f"{full_key}.")
 ```
 
-`out[dotted] = item` — assignment creates or overwrites. A dict passed into a function is
+`out.setdefault(full_key, item)` — the same "first writer wins" rule again: a dotted key the
+caller already has is never overwritten by a flattened one. JSON keys are always strings,
+but a Python caller can pass `{1: "x"}`, so a non-`str` key is coerced with `str(key)`
+before it is glued into a dotted name. A dict passed into a function is
 passed by reference, so `_flatten_into` fills the caller's dict in place and returns
 `None`; the type hint `-> None` says so.
 
@@ -309,7 +303,9 @@ Building a dict from another with a comprehension (Hour 7) and merging with `**`
 ```python
 # 📁 backend/app/core/logger.py
 def bind_log_context(**kwargs: Any) -> None:
-    """Merge *kwargs* into the current async-task log context."""
+    """Merge *kwargs* into the current async-task log context.
+    ...
+    """
     current = _log_context.get().copy()
     current.update(kwargs)
     _log_context.set(current)
@@ -339,8 +335,12 @@ constructor:
 # 📁 backend/app/services/experiment_service.py
         # Extract nested objects
         variants_data = obj_data.pop("variants", [])
-        metrics_data = obj_data.pop("metrics", [])
+        metrics_data = _with_stored_metric_types(obj_data.pop("metrics", None) or [])
 ```
+
+`pop("metrics", None) or []` rather than `pop("metrics", [])`: the default covers a missing
+key, and the `or []` also covers a key that is present with the value `None` (a client
+sending `"metrics": null`).
 
 > **Watch Out!** `d.get("key")` returns `None` for a missing key _and_ for a key whose value
 > is `None`. If you need to tell them apart, use `"key" in d`. And `d["key"]` on a JSON
@@ -584,7 +584,7 @@ string: `.lower()`, `.strip("-")`, `.split(",")`, `", ".join(parts)`, `.startswi
 `.partition(".")`, slicing `s[:80]`. Because strings are immutable they're hashable — dict
 keys, set members — and safe to share.
 
-**f-strings** (`f"{user_id}:{experiment.id}"`) are the only string formatting you'll write:
+**f-strings** (`f"{user_id}:{flag.key}"`) are the only string formatting you'll write:
 expressions in braces, evaluated at runtime, with an optional format spec (`{p:.2%}`,
 `{n:4d}`) and a debug form (`{x!r}` for `repr`). The two older forms — `%` and `.format` —
 appear only in logging calls, where `logger.info("... %s", value)` defers formatting until
@@ -630,14 +630,22 @@ Key validation with `re.match` and a message better than the raw pattern:
 
 ```python
 # 📁 backend/app/schemas/feature_flag.py
-    @field_validator("key")
+    @field_validator("key", check_fields=False)
     @classmethod
     def validate_key(cls, v: str) -> str:
+        """Keys are lowercase letters, digits, hyphens and underscores, and
+        start with a letter or a digit."""
         import re
+
         if not re.match(r"^[a-z0-9][a-z0-9_-]*$", v):
-            raise ValueError("Key must be lowercase alphanumeric characters, hyphens, or underscores only")
+            raise ValueError(
+                "Key must be lowercase alphanumeric characters, hyphens, or underscores only"
+            )
         return v
 ```
+
+(`check_fields=False` lets the validator live on a shared base class whose subclasses may not
+all declare `key`.)
 
 `re.match` anchors at the start; the `$` anchors the end; `[a-z0-9_-]*` is "zero or more of
 these." A compiled pattern at module level for something used on every request:
@@ -654,7 +662,9 @@ _NUMERIC_PATTERN: re.Pattern = re.compile(r"/\d+")
 
 
 def normalize_path(path: str) -> str:
-    """Replace dynamic path segments with ``{id}`` for stable metric labels."""
+    """Replace dynamic path segments with ``{id}`` for stable metric labels.
+    ...
+    """
     path = _UUID_PATTERN.sub("/{id}", path)
     path = _NUMERIC_PATTERN.sub("/{id}", path)
     return path
@@ -711,9 +721,9 @@ If the log level would drop the line, the formatting never happens; with an f-st
 always would. It also lets structured-log processors see the arguments separately.
 
 > **Watch Out!** Building SQL or shell commands with f-strings is how injection happens.
-> The one f-string that touches SQL in this codebase interpolates a schema name from a
-> fixed internal source and carries a `nosemgrep` comment explaining that; every _value_ is
-> a bound parameter. If you find yourself writing `f"... WHERE id = '{id}'"`, stop.
+> The few places in this codebase that build SQL text with an f-string interpolate
+> identifiers or settings from a fixed internal source (a schema name, a lock timeout), and
+> each carries a `nosemgrep` comment saying why; every _value_ is a bound parameter. If you find yourself writing `f"... WHERE id = '{id}'"`, stop.
 
 > **Did You Know?** `str.format` and `%` are still the right tools in two places: logging
 > (`%s`, deferred) and templates where the format string comes from _data_ (a message
@@ -765,11 +775,13 @@ numeric one.
 
 ## Part II Workshop
 
-**Q1. Why is the variant distribution a list of tuples rather than a dict keyed by
-threshold?**
-Order is essential (the walk must be in allocation order) and thresholds can repeat (a 0%
-variant). A list of `(threshold, id)` tuples keeps order and allows duplicates; a dict would
-silently drop one.
+**Q1. Why are the bandit weights built as a list of `(id, weight)` tuples rather than kept
+as the `{id: weight}` dict they are stored in?**
+The walk depends on order, and the code has to sort the pairs (by `str(v.id)`, so every call
+walks them the same way) and filter out zero weights before walking. A list of tuples is the
+shape that sorts, filters and walks in order. (A dict keyed by _cumulative threshold_ would
+be worse still: two variants can share a threshold when one has weight 0, and a dict would
+silently keep only one.)
 
 **Q2. What does `flat.setdefault("user.country", value)` do if `"user.country"` was sent
 explicitly by the SDK?**
@@ -784,9 +796,12 @@ The loop body adds keys to `flat`; iterating a dict while its size changes raise
 `set()` — `{}` is a dict. The union is `{"a", "b"}`.
 
 **Q5. `logger.info(f"Assigned {user_id}")` vs `logger.info("Assigned %s", user_id)` — which
-does the codebase prefer and why?**
+should you write, and why?**
 The `%s` form: formatting is deferred until the line is emitted (skipped entirely below the
-log level) and structured-log processors receive the argument separately.
+log level) and structured-log processors receive the argument separately. It is the intent,
+not an enforced rule: plenty of modules still log with f-strings, and no lint rule selected in
+`pyproject.toml` flags them. (Also: don't log the user id at all on a hot path; evaluation
+and assignment stopped doing so.)
 
 **Q6. What's wrong with `hashlib.md5(f"{user_id}:{key}")`?**
 Hashes take bytes; a `str` is a `TypeError`. `.encode()` first — and pass

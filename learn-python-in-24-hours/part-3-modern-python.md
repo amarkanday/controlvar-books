@@ -5,10 +5,10 @@
 [← Part II](./part-2-data-structures.md) · [Contents](./README.md) · [Part IV →](./part-4-idioms.md)
 
 Parts I and II were the language a script is written in. This Part is the language a
-_codebase_ is written in: how 66,000 lines are split into modules and why the import spelling
+_codebase_ is written in: how some 70,000 lines of `backend/app` are split into modules and why the import spelling
 matters (Hour 9), classes and the three kinds of method (Hour 10), the two lightweight ways
-to give data a shape — dataclasses and enums (Hour 11), the type-hint vocabulary that `mypy`
-and Pydantic read (Hour 12), and how errors are raised, caught, chained and — most
+to give data a shape — dataclasses and enums (Hour 11), the type-hint vocabulary that
+Pydantic enforces and `mypy` can check (Hour 12), and how errors are raised, caught, chained and — most
 importantly — _not_ swallowed (Hour 13).
 
 ---
@@ -46,57 +46,88 @@ The rule, applied — every import in a service names the full path:
 
 ```python
 # 📁 backend/app/services/assignment_service.py
+from backend.app.core.consistent_hash import bucket_of
+from backend.app.core.log_once import EVALUATION_NOTES
 from backend.app.core.targeting_adapter import (
+    _is_dashboard_rules_shape,
     expand_context,
     normalise_targeting_rules,
 )
-from backend.app.models.experiment import Experiment, Variant, ExperimentStatus
 from backend.app.models.assignment import Assignment
+from backend.app.models.experiment import Experiment, ExperimentStatus, Variant
+from backend.app.schemas.targeting_rule import TargetingRules
 from backend.app.services.event_service import EventService
 from backend.app.services.global_holdout_service import GlobalHoldoutService
 from backend.app.services.mutual_exclusion_service import MutualExclusionService
 from backend.app.services.rules_evaluation_service import RulesEvaluationService
-from backend.app.schemas.targeting_rule import TargetingRules
 ```
 
-The one place relative imports survive, and why it's tolerable: models importing their own
-package's `base`. It works because the module is only ever imported by its full name, so
-`.base` resolves to exactly one module. New code still writes the full path.
+The alphabetical order is not taste: ruff's `I` rules (they replaced `isort`) sort every
+import block, and `make lint` fails on one that isn't.
+
+The one place relative imports survive, and why it's harmless: models importing their own
+package's `base`. A relative import is resolved against the importing module's _own_ full
+name, so inside `backend.app.models.experiment`, `.base` is `backend.app.models.base` — the
+same module object, not a second address. The defect is an import _rooted at `app`_, not a
+relative one. New code still writes the full path.
 
 ```python
 # 📁 backend/app/models/experiment.py
-from .base import Base, BaseModel
 from backend.app.core.database_config import get_schema_name
+
+from .base import Base, BaseModel
 ```
 
-The package `__init__` that exists so a standalone script can configure every mapper —
-importing the package imports every model module (once):
+The package `__init__` is the **core model registry**: it exists so a standalone script can
+configure every mapper, and it names the model modules in one tuple instead of relying on
+import side effects (abridged):
 
 ```python
 # 📁 backend/app/models/__init__.py
-# Centralized model imports and initialization
+import importlib
+from typing import Any
 
-from .base import Base, BaseModel, BaseModelMixin
-from .user import (User, Role, Permission, user_role_association, role_permission_association, UserRole)
-from .experiment import (Experiment, Variant, Metric, ExperimentStatus, ExperimentType, MetricType)
-from .feature_flag import FeatureFlag, FeatureFlagOverride, FeatureFlagStatus
-from .event import Event, EventType
-from .assignment import Assignment
+from .analysis_snapshot import AnalysisKind, AnalysisSnapshot
 from .api_key import APIKey
+from .assignment import Assignment
 ...
 from .metrics.metric import (
-    RawMetric,
-    AggregatedMetric,
-    ErrorLog,
     MetricType as MetricsMetricType,
-    AggregationPeriod,
 )
+...
+CORE_MODEL_MODULES = (
+    "analysis_snapshot",
+    "api_key",
+    "assignment",
+    ...
+    "user",
+)
+
+
+# `Any`, not `DeclarativeMeta`: `declarative_base()` is the legacy API and its
+# stubs return Any, so a narrower annotation only produces a no-any-return.
+def register_core_models() -> Any:
+    """Register every core model on ``Base.metadata``; returns ``Base``.
+    ...
+    """
+    for module_name in CORE_MODEL_MODULES:
+        importlib.import_module(f"{__name__}.{module_name}")
+    return Base
 ```
 
-Note `MetricType as MetricsMetricType` — two modules define a `MetricType` (the experiment
-metric kind and the raw-metric kind), and `as` renames one to avoid a clash. That's the
-only re-export the package does, and it's for mapper configuration, not for importing from
-(`CLAUDE.md`: avoid re-exports; import from the defining module).
+`importlib.import_module` is `import` as a function call: it takes the module's name as a
+string, so a loop over a tuple of names can import them all. The bootstrap, alembic's
+`env.py` and the test `conftest.py` call `register_core_models()` rather than importing the
+package for its side effect, so what they depend on is written down. A new core model goes
+into `CORE_MODEL_MODULES`. Note `MetricType as MetricsMetricType` — two modules define a
+`MetricType` (the experiment metric kind and the raw-metric kind), and `as` renames one to
+avoid a clash. The names the package imports are for mapper configuration, not for importing
+from (`CLAUDE.md`: avoid re-exports; import from the defining module).
+
+The optional modules under `modules/` (present in a full checkout, absent in a core one)
+register _their_ models from outside: `modules/backend/app/register.py` calls
+`hooks.register_model_module()`. The arrow points one way — `modules/` imports `backend/`,
+never the reverse — because the core has to build and pass its tests with `modules/` deleted.
 
 Module-level singletons, created at import:
 
@@ -117,7 +148,14 @@ heavy dependency until needed:
 
 ```python
 # 📁 backend/app/core/scheduler_tick.py
-def _persist_run(name, started_at, completed_at, status, result, error) -> None:
+def _persist_run(
+    name: str,
+    started_at: datetime,
+    completed_at: datetime,
+    status: str,
+    result: TickResult,
+    error: Optional[str],
+) -> None:
     """Best-effort write of the run record; never raises."""
     try:
         from backend.app.db.session import SessionLocal
@@ -130,9 +168,17 @@ def _persist_run(name, started_at, completed_at, status, result, error) -> None:
 general and a tool in particular; when you see one in this repo, there's a cycle or a
 laziness reason nearby.
 
-The guard that keeps the rule enforced: `python standardize_metrics_imports.py --check` at
-the repository root scans for the forbidden spellings, and `backend/tests/unit/metrics/
-test_metrics_imports.py` asserts every import of `RawMetric` resolves to one class.
+Checking the rule is one command, run from the repository root:
+
+```bash
+grep -rnE '^\s*(from|import) app\.' backend/ modules/ --include='*.py'
+```
+
+No output means the rule holds; any hit is the defect. (There is no dedicated script or test
+for this one rule.) The _package_ boundary is enforced by a tool: `lint-imports`, configured
+by the `[tool.importlinter]` contracts in `pyproject.toml` and run by `make lint` and the
+`lint` CI job, fails if anything in `backend.app` imports the `modules` package or
+`backend.tests`.
 
 > **Watch Out!** `__name__ == "__main__"` is how a module knows it's being run as a script
 > rather than imported. `python -m backend.app.db.bootstrap` sets `__name__` to
@@ -164,8 +210,11 @@ True
 
 Now simulate the trap without breaking anything: `sys.path.insert(0, "backend")` then
 `from app.models.metrics.metric import RawMetric as C` — and compare `C is A`. Remove the
-path entry afterwards (`sys.path.pop(0)`) and never do this in real code. Finally, run the
-guard: `python standardize_metrics_imports.py --check`.
+path entry afterwards (`sys.path.pop(0)`) and never do this in real code. On the current
+tree you won't even get as far as comparing: the second import of the models package
+re-declares its tables on the shared metadata and raises
+`InvalidRequestError: Table '...' is already defined for this MetaData instance` — the same
+defect, failing early. Finally, run the `grep` above and confirm it prints nothing.
 
 ### Common mistakes
 
@@ -182,8 +231,9 @@ guard: `python standardize_metrics_imports.py --check`.
   singletons.
 - Two spellings → two modules → two classes → SQLAlchemy errors. Fully qualified imports
   from the repository root, always.
-- `backend/app/models/__init__.py` imports every model so mappers configure; it's the one
-  sanctioned re-export.
+- `backend/app/models/__init__.py` is the core model registry: `CORE_MODEL_MODULES` plus
+  `register_core_models()`. Module models register through `hooks.register_model_module()`;
+  `lint-imports` keeps `backend.app` from importing `modules`.
 - Local imports break cycles; `__main__` guards script behaviour; run from the root.
 
 ---
@@ -376,7 +426,10 @@ class TestSettings(Settings):
 > "anything with `.send(method, url, headers, data, timeout)`" is a `Transport` in the Python
 > SDK, and `FakeTransport` in tests satisfies it by having the method (duck typing). Where a
 > contract needs to be _stated_, `typing.Protocol` or an `abc.ABC` with `@abstractmethod`
-> exists; the SDK's `Transport` is an ABC.
+> exists. The SDK's `Transport` is a `Protocol` (`class Transport(Protocol)` in
+> `sdk/python/experimentation/transport.py`): it _states_ the `send` signature for type
+> checkers, yet `FakeTransport` never inherits from it — matching the method is enough. That
+> is structural typing, the checked form of duck typing.
 
 ### Try It Yourself
 
@@ -492,7 +545,9 @@ dataclass with a `to_dict` for the boundary and a property doing arithmetic:
 # 📁 backend/app/services/srm_service.py
 @dataclass
 class SRMResult:
-    """Outcome of a sample-ratio-mismatch test."""
+    """Outcome of a sample-ratio-mismatch test.
+    ...
+    """
 
     chi2: float
     p_value: float
@@ -567,19 +622,45 @@ class UserRole(str, enum.Enum):
             return role
 ```
 
-Looking members up by name and by value — the service converts a string to the ORM enum
-with `[...]`, falling back on failure:
+Looking members up by name _or_ by value — the service resolves whatever string a client
+sent by iterating the enum, and returns `None` instead of raising on a miss:
+
+```python
+# 📁 backend/app/services/experiment_service.py
+    if isinstance(value, enum_cls):
+        return value
+    if value is None:
+        return None
+
+    text = str(getattr(value, "value", value)).strip().lower()
+    if not text:
+        return None
+
+    for member in enum_cls:
+        if str(member.value).lower() == text or member.name.lower() == text:
+            return member
+    return None
+```
+
+`for member in enum_cls` — iterating an enum class yields its members in definition order;
+each has `.name` (`"DRAFT"`) and `.value` (`"draft"`). `resolve_experiment_status(value)`
+wraps this, and the caller decides what an unknown status means:
 
 ```python
 # 📁 backend/app/services/experiment_service.py
         if "status" in obj_data and isinstance(obj_data["status"], str):
-            try:
-                # Convert string status (e.g., "draft") to enum (e.g., ExperimentStatus.DRAFT)
-                obj_data["status"] = ExperimentStatus[obj_data["status"].upper()]
-            except (KeyError, ValueError):
-                # Fallback to default if conversion fails
-                obj_data["status"] = ExperimentStatus.DRAFT
+            resolved_status = resolve_experiment_status(obj_data["status"])
+            if resolved_status is None:
+                logger.warning(
+                    "Unknown experiment status %r; defaulting to DRAFT",
+                    obj_data["status"],
+                )
+                resolved_status = ExperimentStatus.DRAFT
+            obj_data["status"] = resolved_status
 ```
+
+On create an unknown value becomes `DRAFT` with a warning; on update it is dropped and the
+status is left unchanged. Returning `None` instead of raising lets each caller choose.
 
 And the `str, Enum` payoff — comparing a member to a raw string works, which the flag
 service relies on because some code paths store the value rather than the member:
@@ -591,7 +672,7 @@ service relies on because some code paths store the value rather than the member
 
 > **Watch Out!** `ExperimentStatus["ACTIVE"]` (by name) and `ExperimentStatus("active")`
 > (by value) are different lookups, and both raise on a miss (`KeyError` vs `ValueError`).
-> The service catches both. And a plain `enum.Enum` member is _not_ equal to its value —
+> The service avoids both by iterating the members itself and returning `None`. And a plain `enum.Enum` member is _not_ equal to its value —
 > `ExperimentStatus.ACTIVE == "active"` is `False` — which is why the ORM enums and the
 > schema enums must be converted at the boundary, never compared across.
 
@@ -652,8 +733,9 @@ service relies on because some code paths store the value rather than the member
 A **type hint** annotates a name with the type it's meant to hold: `user_id: str`,
 `def f(x: int) -> bool`. Python ignores them at runtime. Three tools don't:
 
-- **`mypy`** (in the `make lint` gate) checks that calls match signatures — the tool that
-  would have caught `get_counters`.
+- **`mypy`** checks that calls match signatures — the tool that would have caught
+  `get_counters`. It is configured in `pyproject.toml` (`[tool.mypy]`) and installed in the
+  venv, but you run it yourself: no CI job, `make` target or pre-commit hook runs it.
 - **Pydantic** turns annotations into runtime validation on models.
 - **FastAPI** turns endpoint annotations into request parsing and documentation.
 
@@ -733,11 +815,14 @@ async def run_locked_tick(
 
 ```python
 # 📁 backend/app/core/pagination.py
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class Paginator(Generic[T]):
-    """A utility class for handling pagination in API endpoints."""
+    """
+    A utility class for handling pagination in API endpoints.
+    ...
+    """
 
     def __init__(self, skip: int = 0, limit: int = 100):
         self.skip = max(0, skip)
@@ -781,7 +866,9 @@ matters:
 
 ```python
 # 📁 backend/app/schemas/feature_flag.py
-    targeting_rules: Optional[Any] = None
+    targeting_rules: Optional[Any] = Field(
+        None, description=TARGETING_RULES_DESCRIPTION
+    )
 ```
 
 (Three stored shapes; the adapter normalises; `Any` is the honest type. Everywhere else,
@@ -792,11 +879,13 @@ matters:
 > for optional-with-default. Pydantic v2 is strict about this too: `Optional[str]` without
 > `= None` is a _required_ field that may be null.
 
-> **Did You Know?** `mypy` runs in `make lint` and the release gate, but the codebase is not
-> fully strict — `Dict[str, Any]` returns and a handful of `# type: ignore[...]` comments
-> exist where the ORM's dynamic attributes defeat the checker (`stats  # type:
-> ignore[return-value]` in the bandit scheduler). Each ignore names the error code, which is
-> the house rule: ignore the specific thing, say which.
+> **Did You Know?** `mypy` is _not_ a gate here, and the reason is a number: at the
+> reference commit `mypy backend/app/` reports 931 errors in 140 files. The `[tool.mypy]`
+> settings are strict on paper (`disallow_untyped_defs = true`), the code is not there yet,
+> and a gate that fails on every pull request would be switched off. What the codebase does
+> keep is the habit: where the ORM's dynamic attributes defeat the checker, an ignore names
+> its error code (`return dynamo_stats  # type: ignore[return-value]` in the bandit
+> scheduler). Ignore the specific thing, say which.
 
 ### Try It Yourself
 
@@ -821,9 +910,12 @@ def stats(c: Counters, experiment_id: str) -> Optional[dict]:
     return c.get_counters(experiment_id)      # the bug from Hour 1
 ```
 
-and run `mypy scratch_types.py` — it reports `"Counters" has no attribute "get_counters"`.
-That's the whole argument for hints in one command. Then run the real check:
-`mypy backend/app/core/scheduler_tick.py`.
+and run `mypy scratch_types.py` from the repository root (so it picks up the `[tool.mypy]`
+settings) — among its two errors is `"Counters" has no attribute "get_counters"
+[attr-defined]`. That's the whole argument for hints in one command. Then try a real file:
+`mypy backend/app/core/scheduler_tick.py`. It reports nothing in `scheduler_tick.py` itself,
+but mypy follows imports, so it prints a few hundred errors from the modules it pulled in —
+the 931 above, seen from one corner.
 
 ### Common mistakes
 
@@ -839,7 +931,8 @@ That's the whole argument for hints in one command. Then run the real check:
 - `Optional`/`Union`/typed containers/`Callable`/`Literal`/`Generic`/`Annotated` — the
   vocabulary the codebase uses; `typing` forms, matching the file.
 - `Optional[X]` ≠ default; `Any` is a confession; `# type: ignore[code]` names its reason.
-- `mypy` on `get_counters` would have caught it.
+- `mypy` on `get_counters` would have caught it — if someone ran it. It is configured, not
+  gated; tests are what the CI enforces.
 
 ---
 
@@ -890,11 +983,13 @@ class InvalidTokenError(ValueError):
 ```python
 # 📁 backend/app/services/local_auth_service.py
 class AccountLockedError(Exception):
-    """Raised when an address is locked out after too many failed attempts."""
+    """Raised when the address has exceeded the failed-login threshold."""
 
     def __init__(self, retry_after_seconds: int) -> None:
         self.retry_after_seconds = max(1, int(retry_after_seconds))
-        super().__init__(f"Too many failed login attempts; retry in {self.retry_after_seconds}s")
+        super().__init__(
+            f"Too many failed login attempts; retry in {self.retry_after_seconds}s"
+        )
 
 
 class InvalidCredentialsError(Exception):
@@ -942,22 +1037,72 @@ The re-raise idiom, and `finally` for cleanup:
         # Let deliberate 4xx responses through instead of wrapping them in a 500.
         raise
     except Exception as e:
-        logger.error(f"Error starting experiment: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise unexpected_failure(
+            e,
+            "Experiment start",
+            "Could not start the experiment",
+            db=db,
+            logger=logger,
+        )
 ```
+
+`unexpected_failure` (in `backend/app/core/logger.py`) is the house answer to "something I
+didn't plan for went wrong in an endpoint." It rolls the session back, logs the exception
+_type_ and full traceback under the request's ID, and returns an `HTTPException` whose
+`detail` is a fixed sentence plus that ID — never `str(e)`:
+
+```python
+# 📁 backend/app/core/logger.py
+    log = logger if logger is not None else logging.getLogger(__name__)
+    if db is not None:
+        try:
+            db.rollback()
+        except Exception:
+            log.warning("Rollback after a failed %s also failed", operation)
+    # What logger.exception() logs, from outside the except block: ERROR,
+    # with the traceback.
+    log.error("%s failed (%s)", operation, type(exc).__name__, exc_info=exc)
+    return HTTPException(status_code=status_code, detail=failure_detail(sentence))
+```
+
+Why not `detail=str(e)`? An exception's text is written for the developer, not the caller: a
+database error repeats the SQL and its parameters, a driver error can name a host. Putting it
+in a response body hands internals to whoever sent the request. The caller gets
+`"Could not start the experiment (request ID: <id>)."`; the operator finds the traceback in
+the log by that ID. Note also that the function _returns_ the exception and the caller
+writes `raise` — so the `raise` is visible at the call site and type checkers know the
+branch ends there. A failed rollback is logged, not raised, so it can't replace the original
+error.
+
+The scheduler isolates each row in its own **savepoint** (a nested transaction), so one row
+the database refuses is rolled back alone and the rest of the tick carries on:
 
 ```python
 # 📁 backend/app/core/scheduler.py
-        db = SessionLocal()
-        try:
-            ...
-            db.commit()
+            for experiment in experiments_to_activate:
+                experiment_id = experiment.id
+                savepoint = db.begin_nested()
+                try:
+                    ...
+                    db.flush()
+                    savepoint.commit()
+                except Exception:
+                    savepoint.rollback()
+                    failed_count += 1
+                    logger.exception("Error activating experiment %s", experiment_id)
+                    continue
+                activated_count += 1
+        ...
         except Exception as e:
-            logger.error(f"Error processing scheduled experiments: {str(e)}")
-            db.rollback()
+            failed_count += 1
+            logger.error(f"Error processing scheduled experiments: {e!s}")
         finally:
             db.close()
 ```
+
+`continue` inside the `except` skips to the next row; `logger.exception` logs at ERROR with the
+traceback. The outer `except` counts the failure (the tick reports `items_failed`), and
+`finally` closes the session whatever happened.
 
 The scheduler runner, which records a failure _and_ re-raises — and lets cancellation
 through without recording anything:
@@ -971,7 +1116,7 @@ through without recording anything:
             # Shutdown: release the lock (context manager) and propagate
             # without recording a bogus "failed" run.
             raise
-        except Exception as exc:  # noqa: BLE001 - recorded then re-raised
+        except Exception as exc:
             status = STATUS_FAILED
             error = str(exc) or exc.__class__.__name__
             exc_to_raise = exc
@@ -980,9 +1125,11 @@ through without recording anything:
         raise exc_to_raise
 ```
 
-`# noqa: BLE001` is the linter code for "blind except" — the comment acknowledges the broad
-catch and says why it's acceptable (recorded, then re-raised). `str(exc) or
-exc.__class__.__name__` handles exceptions with empty messages.
+The broad catch is acceptable because nothing is swallowed: the failure is recorded, then
+re-raised. (Older versions carried `# noqa: BLE001`, the "blind except" lint code. Ruff does
+not select that rule here, and its `RUF100` check removes `noqa` comments that suppress
+nothing, so the comment went.) `str(exc) or exc.__class__.__name__` handles exceptions with
+empty messages; this text goes to the scheduler's run record, not to an HTTP caller.
 
 A broad catch that's _correct_ — a best-effort side path that must never fail the main one:
 
@@ -995,8 +1142,14 @@ A broad catch that's _correct_ — a best-effort side path that must never fail 
                 ...
             except Exception as metrics_error:
                 # Don't let metrics collection errors affect flag evaluation
-                logger.error(f"Failed to record metrics: {str(metrics_error)}")
+                # The type only: a database error's text repeats the row's
+                # parameters, the user id among them.
+                logger.error(
+                    f"Failed to record metrics: {type(metrics_error).__name__}"
+                )
 ```
+
+Even the log line logs only `type(metrics_error).__name__`, for the reason the comment gives.
 
 and the `else` clause, rarely seen but exact — run this only if the `try` didn't raise:
 
@@ -1091,8 +1244,8 @@ No; it's required and may be `None`. `def f(x: Optional[int] = None)` is optiona
 
 **Q5. Why must `except HTTPException: raise` come before `except Exception`?**
 `HTTPException` is an `Exception`; without the earlier clause the generic handler would
-catch it and re-raise a 500 with the original message embedded — wrong status, wrong
-message.
+catch a deliberate 404 or 409 and turn it into `unexpected_failure`'s 500 — wrong status,
+and the caller loses the reason the code meant to give.
 
 **Q6. Does `except Exception` catch `asyncio.CancelledError`?**
 No (3.8+): it derives from `BaseException`. A bare `except:` or `except BaseException:`
@@ -1146,8 +1299,9 @@ git grep -nE "^\s*from (app\.|\.\.)" backend/app || echo "clean"
 
 A `from app.` line creates a second module object for the same file (two classes per
 table); a `from ..` relative import works only when the package is imported by one name and
-breaks the moment the module is run or imported another way — and both fail the
-`standardize_metrics_imports.py --check` guard.
+breaks the moment the module is run or imported another way. The repository's own check
+for the first kind is `grep -rnE '^\s*(from|import) app\.' backend/ modules/ --include='*.py'`
+(no output means clean).
 
 **S3.2**
 
@@ -1226,14 +1380,19 @@ async def run(tick: Callable[[], Awaitable[Any]], *, record: bool = True) -> Tic
     except RollbackNotAllowed as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
-        logger.error("rollback failed for %s: %s", flag_id, exc)
-        raise HTTPException(status_code=500, detail="Rollback failed")
+        raise unexpected_failure(
+            exc, "Flag rollback", "Could not roll back the feature flag", db=db, logger=logger
+        )
     return result
 ```
 
 `except Exception` doesn't catch `asyncio.CancelledError` (a `BaseException`), so
 cancellation passes through untouched; `HTTPException` is re-raised first so a deliberate
-refusal inside the service isn't downgraded.
+refusal inside the service isn't downgraded. The 500 goes through `unexpected_failure`, so
+the session is rolled back, the traceback is logged under the request ID, and the response
+carries a fixed sentence rather than the exception's text. (The 409 deliberately returns
+`str(exc)`: `RollbackNotAllowed` is _your_ exception, and its message is written for the
+caller.)
 
 ---
 
