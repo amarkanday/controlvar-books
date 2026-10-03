@@ -25,8 +25,9 @@ shell open — `from backend.app.schemas.experiment import ExperimentCreate` and
 A Pydantic **model** is a class whose annotated attributes are its fields. Constructing it
 validates: types are checked and _coerced_ where sensible (`"42"` → `42` for an `int` field
 in lax mode; a string → `UUID`; an ISO string → `datetime`), missing required fields raise,
-unknown fields are ignored by default, and the result is a plain object with typed
-attributes.
+unknown fields are ignored by default (`extra="ignore"`; a model can choose `"forbid"`
+instead, and this codebase's flag requests do — see below), and the result is a plain object
+with typed attributes.
 
 `Field(...)` attaches metadata to a field: a default (or `...` for required), numeric bounds
 (`ge`, `gt`, `le`, `lt`), string bounds (`min_length`, `max_length`, `pattern`), a
@@ -34,13 +35,20 @@ attributes.
 a FastAPI app: the constraints are **enforced** (a 422), and they are **published** (the
 OpenAPI schema shows `minimum: 0, maximum: 100`).
 
-#### Why the codebase's schemas are layered `Base → Create → Update → Response`
+#### Why most of the codebase's schemas are layered `Base → Create → Update → Response`
 
-Almost every resource has four models: a `Base` with the fields a client may set, a `Create`
-that adds what's required at creation, an `Update` where everything is optional, and a
-`Response` (or `InDB`) that adds server-owned fields (`id`, `created_at`) and reads from ORM
-objects. It's inheritance used for _shape reuse_, and the layering answers three questions
-at once: what may I send? what must I send? what will I get back?
+Most resources have four models: a `Base` with the fields a client may set, a `Create` that
+adds what's required at creation, an `Update` where everything is optional, and a `Response`
+that adds server-owned fields (`id`, `created_at`) and reads from ORM objects. It's
+inheritance used for _shape reuse_, and the layering answers three questions at once: what may
+I send? what must I send? what will I get back? The experiment schemas follow it
+(`ExperimentBase → ExperimentCreate`, a separate `ExperimentUpdate`, `ExperimentResponse`).
+
+Feature flags show where the layering stops being enough. Their request contract is strict —
+an unknown field is refused, an explicit `null` for a required column is refused — and a
+response model that inherited those rules would refuse a stored row and turn a read into a
+500. So the flag schemas split **requests** from the **response** completely, and that file is
+the better lesson in Pydantic.
 
 ### In the wild
 
@@ -81,48 +89,108 @@ and optional; `metric_type: MetricType` means the field accepts only the enum's 
 `ge=10` refuses a sample size that would make the statistics meaningless. The
 `json_schema_extra` example is what the docs page shows in the request body box.
 
-The `Base → Create → Update` layering, for flags:
+The flag request models share a private base, `_FeatureFlagRequest`, and nothing else:
 
 ```python
 # 📁 backend/app/schemas/feature_flag.py
-class FeatureFlagBase(BaseModel):
-    """Base model for feature flag data."""
-    key: str = Field(..., min_length=1, max_length=100)
-    name: str = Field(..., min_length=1, max_length=255)
-    description: Optional[str] = Field(None, max_length=2000)
-    is_active: bool = True
-    rollout_percentage: Optional[int] = Field(None, ge=0, le=100)
-    targeting_rules: Optional[Any] = None
-    default_value: Any = False
-    tags: Optional[List[str]] = None
-    model_config = ConfigDict(from_attributes=True)
+class _FeatureFlagRequest(BaseModel):
+    """What a create and an update have in common.  Never a response base."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Read-only: accepted so a GET body can be sent back, and ignored.
+    id: Any = Field(
+        None, description="Read-only; ignored.", json_schema_extra=_READ_ONLY
+    )
+    owner_id: Any = Field(
+        None, description="Read-only; ignored.", json_schema_extra=_READ_ONLY
+    )
     ...
 
 
-class FeatureFlagCreate(FeatureFlagBase):
-    """Model for creating a new feature flag."""
-    pass
+class FeatureFlagCreate(_FeatureFlagRequest):
+    """The body of a flag create. A field not listed here answers 422."""
+
+    key: str = Field(..., min_length=1, max_length=100)
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=2000)
+    is_active: bool = Field(
+        False, description="Create the flag on. Left out, the flag starts off."
+    )
+    rollout_percentage: int = Field(0, ge=0, le=100)
+    ...
+    default_value: StrictBool = Field(
+        False,
+        description=(
+            "What the flag serves when it is off. Only false is accepted for now."
+        ),
+    )
+    tags: Optional[List[str]] = None
 
 
-class FeatureFlagUpdate(FeatureFlagBase):
-    """Model for updating a feature flag."""
-    key: Optional[str] = None
-    name: Optional[str] = None
-    is_active: Optional[bool] = None
-    default_value: Optional[Any] = None
-
-
-class FeatureFlagInDBBase(FeatureFlagBase):
-    """Base model for feature flags in DB."""
-    id: UUID
-    created_at: datetime
-    updated_at: datetime
-    model_config = ConfigDict(from_attributes=True)
+class FeatureFlagUpdate(_FeatureFlagRequest):
+    ...
+    # The NOT_NULL_FIELDS default to None only to mean "not sent": pydantic
+    # does not validate a default, while an explicit null reaches refuse_null.
+    key: str = Field(None, min_length=1, max_length=100)
+    name: str = Field(None, min_length=1, max_length=100)
+    ...
 ```
 
-`FeatureFlagUpdate` overrides the required fields as `Optional[...] = None` so a `PUT` may
-send only what changed. The endpoint then uses `model_dump(exclude_unset=True)` (Hour 7) to
-tell "not sent" from "sent as null".
+Four decisions to read in it:
+
+- **`extra="forbid"`.** A misspelt field (`"rollout_percent": 50`) is a 422, not a silently
+  ignored key and a flag that did not change. On a public API that is the friendlier
+  behaviour: the client learns at once.
+- **Read-only fields are declared, not forbidden.** `id`, `owner_id`, `created_at`,
+  `updated_at` and `status` appear on the request models (marked `readOnly` in the OpenAPI
+  schema) so a client can `GET` a flag, change one field and `PUT` the whole body back. The
+  service drops them; a `status` that differs from the stored one is refused, with a message
+  pointing at `is_active`.
+- **`StrictBool`.** `default_value` accepts only a real JSON boolean — `"false"` is a 422,
+  where plain `bool` would coerce it — and a validator then accepts only `false` (a flag whose
+  off-value is `true` would keep serving `true` after being turned off).
+- **`FeatureFlagUpdate` types `key: str = Field(None, ...)`, not `Optional[str]`.** Pydantic
+  does not validate a default, so leaving `key` out still means "not sent"; but an explicit
+  `"key": null` is validated, and a `before` validator refuses it (Hour 6). The column is
+  `NOT NULL`, so `null` can never be a valid value.
+
+The response is a separate model that **shares no base** with the requests:
+
+```python
+# 📁 backend/app/schemas/feature_flag.py
+class FeatureFlagRead(BaseModel):
+    """A feature flag, as every flag route returns it.
+    ...
+    """
+    ...
+    model_config = ConfigDict(
+        from_attributes=True, json_schema_serialization_defaults_required=True
+    )
+
+    id: UUID
+    key: str
+    name: str
+    description: Optional[str] = None
+    status: Literal["active", "inactive", "archived"] = Field(
+        ..., description="The flag's status, lower-cased."
+    )
+    is_active: bool = Field(..., description='True exactly when status is "active".')
+    ...
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise(cls, data: Any) -> Any:
+        """Read a stored row (or a mapping), lower-case ``status`` and derive
+        ``is_active`` from it."""
+        ...
+```
+
+It holds types only — no key pattern, no length limit — because a response model that refuses
+a stored row turns a read into a 500. Its one piece of logic is a `mode="before"` model
+validator that reads the ORM row (or a dict), lower-cases `status` and derives `is_active`
+from it, so the two can never disagree. Every flag route answers with it through one
+function, `flag_to_read(flag)`.
 
 A pattern constraint that becomes a documented regex and a friendlier message than the raw
 `pattern` error:
@@ -159,8 +227,17 @@ MetricBase(name="Purchase", event_name="purchase", minimum_sample_size=5)   # Va
 MetricBase(name="Purchase", event_name="purchase", metric_type="CONVERSION")  # ValidationError: enum
 ExperimentBase(name="x", key="has space")                                  # ValidationError: pattern
 ExperimentBase(name="x").key                                              # None — generated later by the service
-MetricBase.model_json_schema()["properties"]["minimum_sample_size"]         # {'minimum': 10, 'default': 100, ...}
+MetricBase.model_json_schema()["properties"]["minimum_sample_size"]         # {'default': 100, 'maximum': 2147483647, 'minimum': 10, ...}
+
+from backend.app.schemas.feature_flag import FeatureFlagCreate, FeatureFlagUpdate
+FeatureFlagCreate(key="k", name="n", colour="red")             # ValidationError: extra_forbidden
+FeatureFlagCreate(key="k", name="n", default_value="false")    # ValidationError: bool_type (StrictBool)
+FeatureFlagUpdate(name=None)                                   # ValidationError: name cannot be null
+FeatureFlagUpdate(description=None).model_dump(exclude_unset=True)   # {'description': None}: clears it
 ```
+
+(The `maximum` is `INT32_MAX`: the column is a 32-bit integer, so a larger value is a 422
+rather than a database error.)
 
 Then find a field in `backend/app/schemas/rollout_schedule.py` with a `ge`/`le` pair and
 check that `POST /rollout-schedules` documents the same bounds.
@@ -172,18 +249,26 @@ check that `POST /rollout-schedules` documents the same bounds.
 - **Constraints in the handler instead of `Field`.** A bound on the field is enforced _and_
   documented; a check in the handler is neither, and it's a different error shape.
 - **`Any` where a model would do.** `targeting_rules: Optional[Any]` is a deliberate
-  exception (three stored shapes, normalised by the adapter); most JSON columns deserve a
-  model.
+  exception (the dashboard's rule-builder shape and the native rules shape, both normalised by
+  the targeting adapter) — but `Any` does not mean unchecked: a field validator runs the rules through the
+  same validation the evaluator uses, so rules it would not apply as written (an unknown key or
+  operator, a list of rules) answer 422 naming the place, e.g.
+  `groups[0].conditions[1].operator: unknown operator`. Most JSON columns deserve a model.
+- **A response model with request rules.** Inherit `extra="forbid"`, a pattern or a
+  `max_length` into a response and the first stored row that breaks it is a 500 on read.
+  Keep response models to types.
 - **Mutable defaults** (`tags: List[str] = []`). Pydantic copies defaults per instance so it's
   safe here, unlike plain dataclasses — but `None` + a validator is clearer about intent.
 
 ### Key takeaways
 
-- A model validates on construction: types coerced, required enforced, unknowns ignored.
+- A model validates on construction: types coerced, required enforced, unknowns ignored by
+  default — or refused with `extra="forbid"`, as the flag requests do.
 - `Field(default | ..., ge/le/min_length/max_length/pattern, description)` is enforced and
   published.
-- Layer `Base → Create → Update (all optional) → Response/InDB (server fields,
-  `from_attributes`)`.
+- Layer `Base → Create → Update (all optional) → Response (server fields,
+  `from_attributes`)` — and when requests are strict, give the response no shared base at all
+  (`FeatureFlagRead`).
 - Enum fields accept values, not names; the schema enums mirror the ORM enums by value.
 
 ---
@@ -256,24 +341,47 @@ Three details to copy: one validator can guard **several fields** (`"properties"
 _before_ the `Dict[str, Any]` type check; and `raise ... from exc` keeps the JSON error as the
 cause. The model validator returns `self` — mandatory in `mode="after"`.
 
-A field validator that **enforces a format** with a better message than `pattern` gives:
+A field validator that **enforces a format** with a better message than `pattern` gives, and
+one that **refuses an explicit null** — both on the flag requests' shared base, which declares
+neither field itself:
 
 ```python
 # 📁 backend/app/schemas/feature_flag.py
-    @field_validator("key")
+    @field_validator(*NOT_NULL_FIELDS, mode="before", check_fields=False)
+    @classmethod
+    def refuse_null(cls, value: Any, info: ValidationInfo) -> Any:
+        """Refuse an explicit null for a field stored in a NOT NULL column.
+
+        A ``before`` validator does not run for a field left out: pydantic does
+        not validate a default, so omission still means "not sent".
+        """
+        if value is None:
+            raise PydanticCustomError(
+                "null_not_allowed", f"{info.field_name} cannot be null"
+            )
+        return value
+
+    @field_validator("key", check_fields=False)
     @classmethod
     def validate_key(cls, v: str) -> str:
-        """Validate feature flag key format.
-        Keys must be lowercase alphanumeric with hyphens or underscores,
-        matching the pattern ^[a-z0-9][a-z0-9_-]*[a-z0-9]$|^[a-z0-9]$.
-        """
+        """Keys are lowercase letters, digits, hyphens and underscores, and
+        start with a letter or a digit."""
         import re
+
         if not re.match(r"^[a-z0-9][a-z0-9_-]*$", v):
             raise ValueError(
                 "Key must be lowercase alphanumeric characters, hyphens, or underscores only"
             )
         return v
 ```
+
+`check_fields=False` lets a validator on a base class name fields that only the subclasses
+declare (without it Pydantic refuses, at class definition, a validator for a field it cannot
+see). `refuse_null` is `mode="before"` so it sees the raw `None` before the `str` type check
+would turn it into a generic "Input should be a valid string". And it raises
+`PydanticCustomError("null_not_allowed", ...)` rather than `ValueError`: a custom error sets
+the error's `type` (what a client can branch on) and its message exactly, without the
+`"Value error, "` prefix a `ValueError` gets.
 
 A model validator with **three cross-field rules** and clear messages for each:
 
@@ -309,33 +417,60 @@ drift:
 # 📁 backend/app/schemas/experiment.py
 class ScheduleConfig(BaseModel):
     ...
+    time_zone: str = Field(
+        "UTC",
+        max_length=64,
+        ...
+    )
+    ...
     @field_validator("start_date")
     @classmethod
     def validate_start_date(cls, v: Optional[datetime]) -> Optional[datetime]:
-        """Validate that start_date is in the future if provided."""
-        if v and v < datetime.now(timezone.utc) - timedelta(minutes=10):  # Allow small buffer
+        """Validate that start_date is in the future if provided.
+
+        A date without an offset is checked in ``validate_dates``, once it has
+        been read in ``time_zone``.
+        """
+        if (
+            v
+            and v.tzinfo is not None
+            and v < datetime.now(timezone.utc) - timedelta(minutes=10)
+        ):  # Allow small buffer
             raise ValueError("Start date must be in the future")
         return v
-
+    ...
     @model_validator(mode="after")
     def validate_dates(self) -> "ScheduleConfig":
-        """Validate date relationships."""
+        """Read offset-less dates in ``time_zone``, then check them.
+        ...
+        """
+        zone = _zone(self.time_zone)
+        naive_start = self.start_date is not None and self.start_date.tzinfo is None
+        for name in ("start_date", "end_date"):
+            value = getattr(self, name)
+            if value is not None and value.tzinfo is None:
+                # Only a field the request carried can be naive, so this
+                # assignment does not mark an omitted field as set.
+                setattr(self, name, value.replace(tzinfo=zone).astimezone(timezone.utc))
+
+        if naive_start and self.start_date < datetime.now(timezone.utc) - timedelta(
+            minutes=10
+        ):  # Allow small buffer
+            raise ValueError("Start date must be in the future")
+
         if self.start_date and self.end_date and self.end_date <= self.start_date:
             raise ValueError("End date must be after start date")
-
-        # Minimum duration check
-        if self.start_date and self.end_date:
-            min_duration = timedelta(hours=1)
-            if self.end_date - self.start_date < min_duration:
-                raise ValueError(f"Experiment must run for at least {min_duration}")
-
+        ...
         return self
 ```
 
-(`v < datetime.now(timezone.utc)` only works because the field is parsed as an aware
-datetime from an ISO string with an offset. A naive input would raise `TypeError` inside the
-validator — which Pydantic reports as a 500-ish `ValidationError` of a different kind. The
-Python book's datetime hour has the full story.)
+Comparing a naive `datetime` with an aware one raises `TypeError`, so the field validator
+checks only dates that arrived with an offset (`Z`, `+02:00`). A date without one is wall-clock
+time in `time_zone` (an IANA name such as `America/Los_Angeles`, default `UTC`): the model
+validator — which sees `time_zone` regardless of declaration order — attaches the zone,
+converts to UTC, and only then compares. `"2030-01-01T09:00:00"` with
+`time_zone="America/Los_Angeles"` comes out as 17:00 UTC. The Python book's datetime hour has
+the full story.
 
 > **Watch Out!** Validators run in **declaration order**, and a `field_validator` sees
 > `info.data` containing only the fields declared _above_ it. `Settings.validate_secret_key`
@@ -343,26 +478,33 @@ Python book's datetime hour has the full story.)
 > Reorder the class and the guard silently stops guarding. Cross-field logic is safer in a
 > `model_validator(mode="after")`, which sees everything.
 
-> **By the Way.** The old `@validator("end_date")` with a `values` dict — you'll still find
-> one in `schemas/tracking.py::ExperimentMetrics` — is v1 style. It works through the shim but
-> `values` is a plain dict of previously validated fields and the decorator is deprecated. New
-> code uses `field_validator` + `ValidationInfo` or a `model_validator`.
+> **By the Way.** The v1 `@validator("end_date")` with a `values` dict is gone from
+> `backend/app` (`git grep -n "@validator(" backend/app` finds nothing). When you port one,
+> changing the decorator is not enough: under `@field_validator` the second argument is a
+> `ValidationInfo`, not a dict, so `"start_date" in values` raises `TypeError`. Read
+> `info.data` instead, or move the rule to a `model_validator`.
 
 ### Try It Yourself
 
 ```python
-from backend.app.schemas.tracking import EventRequest
-EventRequest(event_type="purchase", user_id="u", experiment_key="k", metadata='{"sku": "a"}').metadata   # parsed
-EventRequest(event_type="purchase", user_id="u", experiment_key="k", metadata='{not json')             # ValidationError, your message
-EventRequest(event_type="purchase", user_id="u")                                                      # ValidationError: either/or
+from backend.app.schemas.tracking import EventCreate, EventRequest
+EventCreate(event_name="purchase", user_id="u", experiment_id="e", metadata='{"sku": "a"}').metadata   # {'sku': 'a'}: parsed
+EventCreate(event_name="purchase", user_id="u", experiment_id="e", metadata='{not json')             # ValidationError: "must be a JSON object: ..."
+EventRequest(event_type="purchase", user_id="u")                                                    # ValidationError: either experiment_key or feature_flag_key
+EventRequest(event_type="purchase", user_id="u", experiment_key="k", metadata='{"sku": "a"}')        # ValidationError: dict_type
 
 from backend.app.schemas.rollout_schedule import RolloutScheduleCreate
 # build a schedule with stages 10 → 50 → 25 and read the message; then fix the order and gap the stage_order
 ```
 
+`EventCreate` inherits `parse_json_string` from `EventBase`; the public tracking API's
+`EventRequest` is a separate model (on `StorableTextModel`, Hour 3) without it, so it takes
+`metadata` only as a JSON object — the last line is a 422 over HTTP. Same field name,
+different contract: always check which model a route actually uses.
+
 Then write a validator: add (in a scratch subclass, not the repo) a `model_validator` to
-`ExperimentCreate` that requires exactly one `is_primary` metric, and confirm the API's
-`validateForm` on the dashboard already mirrors that rule client-side.
+`ExperimentCreate` that requires exactly one `is_primary` metric, and send a two-primary body
+to `POST /experiments/` to see what the API does today.
 
 ### Common mistakes
 
@@ -397,7 +539,7 @@ here:
 | Setting                  | Effect                                                                    | Used for                          |
 | ------------------------ | ------------------------------------------------------------------------- | --------------------------------- |
 | `from_attributes=True`   | `Model.model_validate(obj)` reads attributes, not just dict keys          | ORM object → response schema      |
-| `extra="ignore" / "forbid"` | drop / reject unknown fields                                           | `Settings` ignores; strict bodies could forbid |
+| `extra="ignore" / "forbid"` | drop / reject unknown fields                                           | `Settings` ignores; flag requests forbid |
 | `json_schema_extra`      | inject examples into the OpenAPI schema                                    | docs request bodies               |
 | `populate_by_name`       | accept both alias and field name                                           | camelCase clients                 |
 | `use_enum_values`        | store enum values instead of members                                       | when a plain string is wanted     |
@@ -574,8 +716,10 @@ Three ideas in Experimently's `core/config.py` that go beyond "read an env var":
 1. **A canonical environment name** with legacy aliases accepted and warned about.
 2. **Subclasses per environment** (`DevSettings`, `TestSettings`, `ProdSettings`) differing
    only in defaults, selected at import from the canonical name.
-3. **Validators that fail closed** — weak secrets and the dev bypass are refused in
-   production at construction time, so a misconfigured deployment never serves a request.
+3. **Validators that fail closed** — weak secrets and the dev bypass are refused in staging
+   and production at construction time, so a misconfigured deployment never serves a request.
+   And the refusal never repeats the value it refused (`hide_input_in_errors=True`), because a
+   settings error goes to a log, and the value may be a secret.
 
 ### In the wild
 
@@ -586,28 +730,55 @@ The base class and the two settings that trip newcomers — `NoDecode` and `extr
 class Settings(BaseSettings):
     """Base settings class."""
 
-    PROJECT_NAME: str = "Experimentation Platform"
-    VERSION: str = "1.0.0"
+    PROJECT_NAME: str = "Experimently"
+    ...
+    # The alias is the point.  As a plain field this read the bare ``VERSION``
+    # environment variable -- about the most generic name there is, exported by
+    # build scripts, base images and CI steps everywhere, ...
+    VERSION: str = Field(
+        default_factory=get_version, validation_alias="EXPERIMENTLY_VERSION"
+    )
     API_V1_STR: str = "/api/v1"
+    ...
     ENVIRONMENT: EnvironmentName = "development"
-    DEBUG: bool = False
-    SECRET_KEY: str = "default-secret-key-for-testing"  # Default for testing only
     ...
-    AUTH_PROVIDER: Literal["local", "cognito"] = "local"
-    DEV_AUTH_BYPASS: bool = False
-    ...
-    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
+    ALLOWED_HOSTS: Annotated[List[str], NoDecode] = []
+
+    # Plain strings, normalised by `cors_allowed_origins`: as `AnyHttpUrl`
+    # every entry rendered with a trailing slash that no browser `Origin`
+    # carries, so this setting matched nothing (#126), and one malformed entry
+    # failed settings validation and stopped the API starting.
+    BACKEND_CORS_ORIGINS: Annotated[List[str], NoDecode] = []
     # CORS_ORIGINS is a plain-string list version of BACKEND_CORS_ORIGINS that
     # can also be set via env var as a comma-separated string. NoDecode stops
     # pydantic-settings from JSON-decoding the raw value so the "before"
     # validator below receives it as-is.
     CORS_ORIGINS: Annotated[List[str], NoDecode] = []
     ...
+    DASHBOARD_ORIGINS: Annotated[List[str], NoDecode] = []
+    ...
     model_config = SettingsConfigDict(
         case_sensitive=True,
-        extra="ignore"  # Ignore unknown fields to catch typos
+        extra="ignore",  # Ignore unknown fields to catch typos
+        # A refused configuration says which setting and why, never the
+        # values it was given.
+        hide_input_in_errors=True,
     )
 ```
+
+Two fields here carry a lesson each. `VERSION` is read from the repository's `VERSION` file by
+a `default_factory`, and its environment variable is `EXPERIMENTLY_VERSION` via
+`validation_alias`: a field named `VERSION` would otherwise be overridden by any process that
+happens to export the most generic variable name there is, and the API would report the wrong
+version. And `BACKEND_CORS_ORIGINS` used to be `List[AnyHttpUrl]`, which renders every entry
+with a trailing slash — `http://localhost:3000/` — that no browser `Origin` header carries, so
+the setting matched nothing. A precise type is not always the right type: the comparison it
+feeds decides.
+
+The URL-shaped lists — `ALLOWED_HOSTS`, `BACKEND_CORS_ORIGINS`, `CORS_ORIGINS`,
+`DASHBOARD_ORIGINS` — are all `NoDecode`, and the hosts are derived where they can be:
+leave `ALLOWED_HOSTS` empty and the allow-list is `PUBLIC_BASE_URL`'s host, a default that
+cannot point at the wrong name.
 
 `NoDecode` is the fix for a real bug: pydantic-settings JSON-decodes the raw environment
 value of any `List` field _before_ validators run, so `CORS_ORIGINS=http://a,http://b` failed
@@ -631,7 +802,39 @@ receives the string and splits it:
         return []
 ```
 
-The fail-closed guard, in both flavours:
+The fail-closed guards, in three flavours. First a `mode="before"` **model** validator that
+refuses a combination outright, before any field is validated:
+
+```python
+# 📁 backend/app/core/config.py
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_testing_in_a_hardened_environment(cls, data: Any) -> Any:
+        """``TESTING`` belongs to the test runner, never to staging or production.
+        ...
+        """
+        environment: Any = None
+        if isinstance(data, dict):
+            environment = data.get("ENVIRONMENT")
+        if environment is None:
+            environment = cls.model_fields["ENVIRONMENT"].default
+        if isinstance(environment, str):
+            environment = canonical_environment_quiet(environment)
+        # The rule and its message are settings_rules', which the container's
+        # start-up check applies too.
+        refusal = testing_refusal(environment, os.environ.get("TESTING"))
+        if refusal:
+            raise ValueError(refusal)
+        return data
+```
+
+`TESTING=true` is what the test suite sets. In a staging or production process it can only be a
+mistake, so rather than let it change what those environments require, the settings refuse to
+exist. Being `mode="before"`, its message is the one an operator sees — not a confusing error
+from whichever setting `TESTING` would otherwise have affected.
+
+Then an `after` model validator for a rule over two fields, and a field validator for a
+secret:
 
 ```python
 # 📁 backend/app/core/config.py
@@ -649,21 +852,44 @@ The fail-closed guard, in both flavours:
             )
         return self
 
-    @field_validator("AUDIT_HMAC_KEY")
+    @field_validator("SECRET_KEY")
     @classmethod
-    def validate_audit_hmac_key(cls, v: str, info: ValidationInfo) -> str:
-        environment = (info.data or {}).get("ENVIRONMENT", "development")
-        is_testing = os.getenv("TESTING", "").lower() in ("1", "true", "yes")
-        if not is_testing and environment == "production":
-            weak_defaults = {"dev-audit-key-change-in-production", "", "changeme"}
-            if v in weak_defaults or len(v) < _MIN_SECRET_KEY_LENGTH:
+    def validate_secret_key(cls, v: str, info: ValidationInfo) -> str:
+        ...
+        if _hardening_required(info):
+            if _secret_is_placeholder(v) or len(v) < _MIN_SECRET_KEY_LENGTH:
                 raise ValueError(
-                    f"AUDIT_HMAC_KEY must be at least {_MIN_SECRET_KEY_LENGTH} characters "
-                    "and must not be the dev default in production. "
-                    "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+                    f"SECRET_KEY must be at least {_MIN_SECRET_KEY_LENGTH} characters "
+                    "and must not be a placeholder from the repository (docker-compose.yml, "
+                    ".env.example or the class default) in staging/production. "
+                    'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
                 )
         return v
 ```
+
+with the one helper every secret guard asks:
+
+```python
+# 📁 backend/app/core/config.py
+def _hardening_required(info: ValidationInfo) -> bool:
+    """Secrets must be real in staging/production.
+
+    ``TESTING`` does not relax this: ``Settings`` refuses ``TESTING`` together
+    with a staging or production environment before any field is validated
+    (``refuse_testing_in_a_hardened_environment``).
+    """
+    environment = (info.data or {}).get("ENVIRONMENT", "development")
+    return environment in HARDENED_ENVIRONMENTS
+```
+
+`HARDENED_ENVIRONMENTS` is `("staging", "production")`. Asking one helper instead of writing
+`environment == "production"` at each guard is what keeps staging hardened along with
+production, and makes an unrecognised environment name fail closed rather than match no
+`==` test. `validate_superuser_password` (`FIRST_SUPERUSER_PASSWORD`, which refuses the demo
+password and anything under 8 characters) has the same shape. The settings of the optional
+modules — the audit-log signing key, SSO, HIPAA, the warehouse connectors — are not on this
+class at all: they live on `ModulesSettings` in `modules/backend/app/settings.py`, so a core
+deployment never has to supply a module's secret to start.
 
 The assembly validators (`mode="before"`) that let operators set either a whole DSN or its
 parts, and the per-environment subclasses:
@@ -692,14 +918,25 @@ class TestSettings(Settings):
     ENVIRONMENT: EnvironmentName = "test"
     ENV: str = "test"
     TESTING: bool = True
-    LOG_LEVEL: str = "DEBUG"
+    LOG_LEVEL: str = (
+        "INFO"  # set LOG_LEVEL=DEBUG explicitly; DEBUG makes every library chatty
+    )
     ...
     POSTGRES_DB: str = "experimentation_test"
     POSTGRES_SCHEMA: str = "test_experimentation"
     CACHE_ENABLED: bool = False
-
-    model_config = SettingsConfigDict(env_file=".env.test", case_sensitive=True, extra="ignore")
+    ...
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILES["test"],
+        case_sensitive=True,
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 ```
+
+Note that a subclass's `model_config` replaces the parent's keys only where it names them —
+but each subclass here restates `hide_input_in_errors=True` anyway, so nobody has to know that
+rule to be safe.
 
 And the module-level selection that makes `from backend.app.core.config import settings` the
 same object everywhere:
@@ -721,10 +958,12 @@ attributes on it (`settings.AUTH_PROVIDER = "local"` in the root conftest) rathe
 re-importing; and code that reads `settings.X` at _call_ time (like `dev_auth_bypass_active`)
 sees the change, while code that captured the value at import doesn't.
 
-> **Watch Out!** `TESTING=true` relaxes the secret validators so the suite can construct
-> `ProdSettings()`. When you verify a guard by hand, clear it: `env -u TESTING -u APP_ENV
-> ENVIRONMENT=production SECRET_KEY=changeme python -c "import backend.app.core.config"`.
-> The dev-bypass guard is the exception — it ignores `TESTING` on purpose.
+> **Watch Out!** `TESTING` relaxes nothing. Combined with `ENVIRONMENT=staging` or
+> `production` it is refused outright ("TESTING is for the test runner and cannot be combined
+> with ENVIRONMENT=production"), so a test that wants to exercise a production guard
+> constructs `ProdSettings(...)` with explicit values, and a hand check clears it first:
+> `env -u TESTING -u APP_ENV ENVIRONMENT=production SECRET_KEY=changeme python -c "import
+> backend.app.core.config"`.
 
 > **By the Way.** `extra="ignore"` is why a misspelled variable does nothing and says
 > nothing. The comment claims it "catches typos"; it's the opposite. The trade is accepted
@@ -739,8 +978,10 @@ python -c "from backend.app.core.config import settings; print(type(settings).__
 APP_ENV=test python -c "from backend.app.core.config import settings; print(type(settings).__name__, settings.POSTGRES_SCHEMA)"
 # the comma-separated CORS list survives NoDecode
 CORS_ORIGINS="http://a:1,http://b:2" python -c "from backend.app.core.config import settings; print(settings.CORS_ORIGINS)"
-# the guards, with TESTING cleared
-env -u TESTING -u APP_ENV ENVIRONMENT=production SECRET_KEY=changeme python -c "import backend.app.core.config" 2>&1 | tail -2
+# the guards, with TESTING cleared: SECRET_KEY and FIRST_SUPERUSER_PASSWORD refused, no values echoed
+env -u TESTING -u APP_ENV ENVIRONMENT=staging SECRET_KEY=changeme python -c "import backend.app.core.config" > guard.txt 2>&1; grep -A1 "validation error" guard.txt
+# TESTING is not an escape hatch: refused before any field is checked
+env -u APP_ENV TESTING=true ENVIRONMENT=production python -c "import backend.app.core.config" > guard.txt 2>&1; grep "TESTING is" guard.txt
 ```
 
 Then add a hypothetical `WEBHOOK_SIGNING_SECRET` with a fail-closed validator in a scratch
@@ -753,7 +994,10 @@ subclass and prove it refuses in production and passes in development.
   the fields they depend on, or use a model validator.
 - **Re-importing `config` in a test to "reset" settings** — it's a singleton; set attributes
   or construct a subclass explicitly.
-- **Relying on `TESTING` to verify a production guard** — it relaxes most of them.
+- **Reading `TESTING` (or comparing `ENVIRONMENT == "production"`) inside a guard.** Ask
+  `_hardening_required(info)`; staging is hardened too, and `TESTING` is refused there anyway.
+- **Echoing the value in a settings error.** `hide_input_in_errors=True` keeps Pydantic from
+  doing it; do not put it back in your own message.
 
 ### Key takeaways
 
@@ -761,8 +1005,8 @@ subclass and prove it refuses in production and passes in development.
   `settings` is selected per canonical environment at import.
 - `NoDecode` + a `before` validator for comma-separated lists; `before` validators assemble
   DSNs from parts.
-- Validators fail closed in production; the bypass guard ignores `TESTING`, the secret guards
-  don't.
+- Validators fail closed in staging and production (`_hardening_required`); `TESTING`
+  relaxes nothing and is refused in those environments.
 - `extra="ignore"` drops typos silently — verify values in a shell.
 
 ---
@@ -789,17 +1033,19 @@ response schema is the allow-list of what leaves the server.
 `resp.model_dump_json()` or `resp.model_dump(mode="json")` (or `jsonable_encoder(resp)`)
 — `model_dump()` keeps `UUID`/`datetime` objects.
 
-**Q5. Why does `CORS_ORIGINS` need `NoDecode` but `HIPAA_ALLOWED_REGIONS: List[str]`
+**Q5. Why does `CORS_ORIGINS` need `NoDecode` but `COGNITO_ADMIN_GROUPS: List[str]`
 doesn't?**
-Both are lists; the difference is how operators set them. `HIPAA_ALLOWED_REGIONS` is expected
-as JSON (`["us-east-1"]`), which pydantic-settings decodes fine. `CORS_ORIGINS` is documented
-as comma-separated, which JSON decoding rejects — `NoDecode` hands the raw string to the
-validator.
+Both are lists; the difference is how operators set them. `COGNITO_ADMIN_GROUPS` is expected
+as JSON (`["Admins"]`), which pydantic-settings decodes fine (and `Admins,Ops` fails to parse).
+`CORS_ORIGINS` is documented as comma-separated, which JSON decoding rejects — `NoDecode`
+hands the raw string to the validator.
 
-**Q6. Which guard in `Settings` ignores `TESTING`, and why?**
-`forbid_dev_auth_bypass_outside_dev`. There's no production behaviour that depends on the
-bypass being on, so there's nothing to test by allowing it — and allowing it is one variable
-away from serving every request as admin.
+**Q6. What does `TESTING=true` change about the guards in a production process, and why?**
+Nothing gets relaxed: `refuse_testing_in_a_hardened_environment`, a `mode="before"` model
+validator, refuses `TESTING` together with staging or production before any field is checked.
+`TESTING` exists for the test runner; in a deployment it can only be a mistake, and if it
+relaxed the secret guards it would be one variable away from a production API signing tokens
+with the class-default key. The dev-bypass guard and the secret guards never consult it.
 
 **Quiz.** A client sends `{"metric_type": "CONVERSION"}`. What happens?
 → 422: `MetricType` accepts values (`"conversion"`), not names; the error lists the allowed
@@ -825,8 +1071,8 @@ requires `start_date` when `trigger_type == "time_based"` and forbids it for `"m
 returns for each and explain what a `PUT` handler should do differently with them.
 
 **E2.5 — A setting with a guard.** Add `RESULTS_CACHE_TTL_SECONDS: int = 300` with a validator
-that refuses values under 30 in production (relaxed by `TESTING`), and explain why a
-`field_validator` suffices here where the bypass rule needed a `model_validator`.
+that refuses values under 30 in the hardened environments, in the house style, and explain
+why a `field_validator` suffices here where the bypass rule needed a `model_validator`.
 
 ---
 
@@ -905,17 +1151,16 @@ destroying data on every partial update.
     @field_validator("RESULTS_CACHE_TTL_SECONDS")
     @classmethod
     def validate_results_ttl(cls, v: int, info: ValidationInfo) -> int:
-        environment = (info.data or {}).get("ENVIRONMENT", "development")
-        is_testing = os.getenv("TESTING", "").lower() in ("1", "true", "yes")
-        if not is_testing and environment == "production" and v < 30:
-            raise ValueError("RESULTS_CACHE_TTL_SECONDS must be at least 30 in production")
+        if _hardening_required(info) and v < 30:
+            raise ValueError("RESULTS_CACHE_TTL_SECONDS must be at least 30 in staging/production")
         return v
 ```
 
-A `field_validator` suffices because the rule concerns one field plus `ENVIRONMENT`, which is
-declared above it and therefore available in `info.data`. The bypass rule needed a
-`model_validator` for clarity and because it must run regardless of `TESTING` and read two
-fields as a unit — and, being `mode="after"`, it can't be defeated by declaration order.
+`_hardening_required` covers staging as well as production, and nothing reads `TESTING`
+(it is refused in those environments before this runs). A `field_validator` suffices because
+the rule concerns one field plus `ENVIRONMENT`, which is declared above it and therefore
+available in `info.data`. The bypass rule reads two fields as a unit, and as a `mode="after"`
+`model_validator` it can't be defeated by declaration order.
 
 ---
 

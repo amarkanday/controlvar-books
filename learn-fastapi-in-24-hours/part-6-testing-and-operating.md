@@ -37,8 +37,8 @@ endpoints returned shapes their response models refused, the safety service read
 nobody wrote to, and the bandit scheduler called a method that didn't exist on the DynamoDB
 client. Each path had tests that **mocked the collaborator** and asserted on the mock.
 
-The policy the team adopted (`docs/testing/testing-audit-2026-09.md`), in one line: **mock
-what you don't own; drive what you do.** External services (AWS via `moto`, Slack, SendGrid,
+The policy the team adopted after that audit, in one line: **mock what you don't own; drive
+what you do.** External services (AWS via `moto`, Slack, SendGrid,
 the LLM APIs) are mocked. Anything in `backend/app` is exercised for real — through
 `TestClient`, against a real database — at least once per hot path. Unit tests with mocks are
 still welcome for branch coverage, and they _name their integration twin_ in the docstring.
@@ -61,10 +61,23 @@ def client(db_session, monkeypatch):
 
     # Mock Cognito auth service
     def mock_get_user_with_groups(*args, **kwargs):
-        return {"username": "test_user", "attributes": {"email": "test@example.com"}, "groups": ["admin-group"]}
+        return {
+            "username": "test_user",
+            "attributes": {"sub": "sub-testuser", "email": "test@example.com"},
+            "groups": ["admin-group"],
+        }
 
-    monkeypatch.setattr("backend.app.services.auth_service.CognitoAuthService.get_user_with_groups", mock_get_user_with_groups)
-    ...
+    monkeypatch.setattr(
+        "backend.app.services.auth_service.CognitoAuthService.get_user_with_groups",
+        mock_get_user_with_groups,
+    )
+
+    # Mock security token decoder
+    def mock_decode_token(*args, **kwargs):
+        ...
+
+    monkeypatch.setattr("backend.app.core.security.decode_token", mock_decode_token)
+
     # Get or create a superuser for authentication
     user = db_session.query(User).filter(User.email == "test@example.com").first()
     if not user:
@@ -75,7 +88,7 @@ def client(db_session, monkeypatch):
             hashed_password="$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW",
             is_active=True,
             is_superuser=True,
-            role=UserRole.ADMIN
+            role=UserRole.ADMIN,
         )
         db_session.add(user)
         db_session.commit()
@@ -94,21 +107,37 @@ def client(db_session, monkeypatch):
     async def override_get_cache_control():
         return CacheControl(enabled=False, skip=True)
 
-    app.dependency_overrides[get_db] = override_get_db
+    def override_get_api_key():
+        return user
+
     app.dependency_overrides[deps.get_db] = override_get_db
     app.dependency_overrides[deps.get_current_user] = override_get_current_user
-    app.dependency_overrides[deps.get_current_active_user] = override_get_current_active_user
-    app.dependency_overrides[deps.get_current_superuser] = override_get_current_superuser
+    app.dependency_overrides[deps.get_current_active_user] = (
+        override_get_current_active_user
+    )
+    app.dependency_overrides[deps.get_current_superuser] = (
+        override_get_current_superuser
+    )
     app.dependency_overrides[deps.get_cache_control] = override_get_cache_control
+    app.dependency_overrides[deps.get_api_key] = override_get_api_key
 
-    with TestClient(app) as test_client:
-        yield test_client
+    # Create test client
+    test_client = TestClient(app)
 
+    yield test_client
+
+    # Clean up
     app.dependency_overrides.clear()
 ```
 
-Three things to notice. The overrides are keyed by the **function objects** the endpoints
-reference — both `get_db` spellings are overridden because both exist. The auth overrides
+Four things to notice. The overrides are keyed by the **function objects** the endpoints
+reference: the fixture overrides `deps.get_db`, so it reaches exactly the routes that declare
+`Depends(deps.get_db)`. A route that imported a different function object, even one with the
+same name and body, would not be overridden and would open a real session against whatever
+database the settings point at; that is one reason the house rule is to always depend on
+`deps.get_db`. The client is built **without** `with`, so the app's lifespan never runs in
+this fixture (no scheduler, no start-up checks). The API-key dependency is overridden too, so
+SDK routes called through this client authenticate as the test user. The auth overrides
 return a real `User` _row_ (with a real bcrypt hash, so nothing downstream trips on a
 null), so permission checks run for real against a superuser. And `dependency_overrides.clear()`
 in teardown — overrides are global on the app, and a leaked one poisons the next test.
@@ -194,14 +223,52 @@ driven directly; the DB-backed behaviour lives in
 """
 ```
 
-> **Watch Out!** `with TestClient(app) as test_client:` runs the **lifespan**. That's why the
-> lifespan skips the schedulers under `settings.is_test` — before that guard, a test that
-> used the client as a context manager started five background loops against the test
-> database. If you construct the app with non-test settings in a test, you'll start them.
+Some tests don't check behaviour at all; they check that a **rule can't be bypassed by
+adding code**. Hour 12's rule is that every route that changes a flag calls
+`can_act_on_feature_flag`. A rule like that fails silently: a new route that forgets the call
+works, passes its own tests, and lets a VIEWER change flags. So a smoke test pins the exact
+inventory of mutating routes and how each is guarded:
+
+```python
+# 📁 backend/tests/smoke/test_flag_change_routes_guarded.py
+pytestmark = [pytest.mark.smoke, pytest.mark.regression]
+
+PREFIXES = ("/api/v1/feature-flags", "/api/v1/rollout-schedules", "/api/v1/safety")
+MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+
+# How each route is guarded.
+FLAG_RULE = "calls can_act_on_feature_flag"
+ROLLOUT_RULE = "calls _require_update_on_flag (UPDATE on the schedule's flag)"
+CREATE_GATE = "role-gated via Depends(can_create_feature_flag)"
+...
+INVENTORY = {
+    ("POST", "/api/v1/feature-flags/"): CREATE_GATE,
+    ...
+    ("PUT", "/api/v1/feature-flags/{flag_id}"): FLAG_RULE,
+    ("DELETE", "/api/v1/feature-flags/{flag_id}"): FLAG_RULE,
+    ...
+```
+
+A new mutating route under those prefixes fails the suite until someone classifies it here,
+which forces the question "what guards this?" at review time instead of after an incident.
+
+Note the second marker in both `pytestmark` lists: **`regression`**. The house rule is that
+every bug fix carries a `@pytest.mark.regression` test that fails on the old code. The marker
+is declared in `pyproject.toml` (`"regression: guards a specific past bug"`), `pytest -m
+regression` runs just those, and a CI job (`regression-guard`) fails a pull request labelled
+`bug` that changes no test file.
+
+> **Watch Out!** `with TestClient(app) as test_client:` runs the **lifespan**; a bare
+> `TestClient(app)`, which is what the shared fixture builds, does not. A test that opts into
+> the context-manager form gets the lifespan's start-up checks, and the scheduler guard: the
+> lifespan skips the schedulers under `settings.is_test`, because before that guard such a test
+> started five background loops against the test database. If you construct the app with
+> non-test settings in a test and enter it as a context manager, you'll start them.
 
 > **Did You Know?** The `-x` flag on the CI unit job (stop at first failure) plus
-> `--tb=short` is a deliberate feedback-speed choice for a 3,700-test suite; the nightly run
-> drops `-x` so you see everything. Locally, `-p no:cov -q` is the fast form; coverage is
+> `--tb=short` is a deliberate feedback-speed choice for a suite of several thousand tests
+> (the app README counts 5,400+ backend tests); the nightly run drops `-x` so you see
+> everything. Locally, `-p no:cov -q` is the fast form; coverage is
 > explicit (`--cov=backend.app --cov-report=term`) and configured in `pyproject.toml`.
 
 ### Try It Yourself
@@ -231,6 +298,8 @@ Run both: `python -m pytest backend/tests/integration/api/<your file> backend/te
   endpoint, service and database, with only the leaves swapped.
 - Overrides are keyed by function object and must be cleared.
 - Mock what you don't own; drive what you do; unit tests name their integration twin.
+- Pin rules that new code could bypass (the flag-route inventory); every bug fix gets a
+  `@pytest.mark.regression` test.
 - Assert on rows, not just JSON; generate unique data.
 
 ---
@@ -267,7 +336,7 @@ The header that sets the process up:
 #   NOT exported: tests that construct ProdSettings()/DevSettings() directly
 #   must keep their class default, and the settings singleton already resolves
 #   APP_ENV=test to the canonical "test".
-# * Auth runs exactly as the Community Edition ships: AUTH_PROVIDER=local and
+# * Auth runs exactly as the core profile ships: AUTH_PROVIDER=local and
 #   the dev-admin bypass OFF (fail-closed).  ...
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("TESTING", "true")
@@ -351,21 +420,54 @@ tries to roll them back, producing "server closed the connection unexpectedly" t
 that cascade through subsequent tests. Read its docstring once; you'll recognise the
 symptom forever.
 
-Async tests, for the async dependencies:
+Async tests, for the one async dependency a flag route uses — the create gate:
 
 ```python
-# 📁 backend/tests/unit/api/test_feature_flag_permissions.py (shape)
-@pytest.mark.asyncio
-async def test_viewer_cannot_update_flag(viewer_user, feature_flag):
-    with pytest.raises(HTTPException) as exc:
-        await deps.can_update_feature_flag(feature_flag=feature_flag, current_user=viewer_user)
-    assert exc.value.status_code == 403
+# 📁 backend/tests/unit/api/test_permission_deps.py
+    @pytest.mark.asyncio
+    @patch("backend.app.api.deps.check_permission")
+    async def test_can_create_feature_flag_without_permission(
+        self, mock_check_permission, viewer_user
+    ):
+        """Test user without create permission cannot create a feature flag."""
+        # Arrange
+        mock_check_permission.return_value = False
+
+        # Act & Assert
+        with pytest.raises(HTTPException) as exc_info:
+            await can_create_feature_flag(viewer_user)
+
+        assert exc_info.value.status_code == 403
+        mock_check_permission.assert_called_with(
+            viewer_user, ResourceType.FEATURE_FLAG, Action.CREATE
+        )
 ```
 
-`pytest-asyncio` (0.23) runs `async def` tests marked `@pytest.mark.asyncio` on an event
-loop; sync dependencies are called directly in plain `def` tests. Mixing them — `await` on a
-sync function, or a sync call of an async one — is the error the async/sync rule in
-`CLAUDE.md` exists to prevent.
+`pytest-asyncio` (1.3 in `backend/requirements.txt`) runs `async def` tests on an event loop.
+`pyproject.toml` sets `asyncio_mode = "auto"`, so every `async def` test is collected as an
+asyncio test whether or not it carries `@pytest.mark.asyncio`; the marker you see on older
+tests is harmless and no longer required. Sync code is called directly in plain `def` tests.
+Mixing them — `await` on a sync function, or a sync call of an async one — is the error the
+async/sync rule in `CLAUDE.md` exists to prevent.
+
+And the sync rule every flag change goes through, `can_act_on_feature_flag`, is tested as a
+plain function — no event loop, no database, no `Depends`:
+
+```python
+# 📁 backend/tests/unit/core/test_feature_flag_access_rule.py
+pytestmark = [pytest.mark.unit, pytest.mark.regression]
+...
+def test_the_role_matrix_is_checked_before_ownership():
+    """Owning a flag never lets a read-only role change it."""
+    viewer = _user(UserRole.VIEWER)
+    anything = {UserRole.VIEWER: {Action.UPDATE: Scope.ANY}}
+    assert can_act_on_feature_flag(viewer, viewer.id, Action.UPDATE, anything) is False
+```
+
+Its integration twin drives the same rule through the HTTP routes with a non-superuser of
+each role: `backend/tests/integration/api/test_feature_flag_ownership.py` for the per-flag
+routes and `backend/tests/integration/api/test_flag_change_routes_access.py` for bulk-toggle
+and rollout schedules.
 
 `monkeypatch` for the seams you _don't_ own — here the Cognito service — and for settings
 on the singleton:
@@ -383,12 +485,12 @@ cross-suite pollution bugs the audit found.
 > **Watch Out!** `backend/tests/integration/auth/` is a special package: its own conftest
 > selects `AUTH_PROVIDER=cognito` and `moto`'s `mock_cognitoidp`, and its CI job has **no
 > Postgres service**. Any auth test that needs a database goes in `integration/api/`. moto is
-> 4.2.2 — `mock_cognitoidp`, `mock_dynamodb`, not the 4.3+ `mock_aws`.
+> pinned at 4.2.14 — still 4.x, so `mock_cognitoidp`, `mock_dynamodb`, not the 5.x `mock_aws`.
 
 > **By the Way.** The Lambda functions have their own test suites, each defining
 > `tests.conftest`, so they must run one directory at a time — CI loops over
-> `backend/lambda/{assignment,event_processor,feature_flag_evaluation,shared}` with a
-> separate `pytest` per directory. Running `pytest backend/lambda` in one go collides.
+> `backend/lambda/{event_processor,feature_flag_evaluation,shared}` with a separate `pytest`
+> per directory. Running `pytest backend/lambda` in one go collides.
 
 ### Try It Yourself
 
@@ -419,8 +521,8 @@ Then write a fixture in the house style — `make_flag(**overrides)` that insert
 - One database per process; no truncation; unique data; drop at next session.
 - `db_session`: `NullPool` engine, `expire_on_commit=False`, `search_path` set, rollback +
   close in teardown.
-- `@pytest.mark.asyncio` + `await` for async deps; `monkeypatch` for external seams and
-  settings; never `patch.object(..., "__new__")`.
+- `async def` + `await` for async deps (`asyncio_mode = "auto"` makes the marker optional);
+  `monkeypatch` for external seams and settings; never `patch.object(..., "__new__")`.
 
 ---
 
@@ -434,7 +536,7 @@ something you can review a pull request against.
 
 - **Structured logs** (`structlog`): JSON outside development (for CloudWatch Logs
   Insights), console in development; every line carries the request id, path and method
-  bound by the outermost middleware.
+  bound by the request-id middleware (the outermost layer after CORS).
 - **Prometheus `/metrics`**: HTTP latency histogram and counters, business counters
   (assignments, events, flag evaluations), rate-limit hits/rejections, scheduler ticks and
   last-success timestamps.
@@ -517,26 +619,37 @@ The probes, with the asymmetry that matters for orchestrators spelled out:
     reported but only fails readiness when ``REDIS_REQUIRED=true`` (the
     application degrades gracefully without Redis: rate limiting falls back to
     memory, caching is skipped). Disk space below 1 GB is reported as ``low``.
-    Returns 200 when ready, 503 otherwise.
-
-``GET /metrics``
-    Prometheus text exposition. When ``METRICS_TOKEN`` is set the request must
-    carry it (``Authorization: Bearer <token>`` or ``?token=<token>``);
-    when it is not set the endpoint is open in development/test only and
-    returns 403 elsewhere. ``METRICS_ENABLED=false`` disables it (404).
+    The profile the process runs (``core`` or ``full``) is reported as
+    ``profile`` and in ``checks.modules``, and never gates readiness. Returns
+    200 when ready, 503 otherwise.
+...
 """
+...
 
 
-def _safe_error(exc: BaseException) -> str:
-    """First line of the error without credentials (never echo a password)."""
-    text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
-    if "password" in text.lower():
-        return f"{exc.__class__.__name__}: authentication failed"
-    return text[:200]
+def _check_failed(check: str, exc: BaseException) -> Dict[str, Any]:
+    """The result of a check that raised: the error's type, never its text.
+
+    The text of a database, Redis or OS error names hosts, ports, users and
+    paths, and the readiness probe is unauthenticated, so the response
+    carries only the type; the full error goes to the server log.
+    """
+    logger.warning(
+        "Readiness check %s failed (%s)", check, type(exc).__name__, exc_info=exc
+    )
+    return {"status": "unhealthy", "error": type(exc).__name__}
 ```
 
-`_safe_error` is the kind of detail a style guide should call out: a probe that echoes a
-DSN with a password into an ALB log is a credential leak, and the platform scrubs it.
+`_check_failed` is the kind of detail a style guide should call out. The readiness probe is
+unauthenticated, and the text of a database or Redis error names hosts, ports, users — and
+psycopg2 quotes the whole DSN, password included. So the database, Redis and disk checks put
+only the exception's **type** in the response (`"error": "OperationalError"`) and send the
+full error to the server log, where it belongs. The one check that does report a message,
+the modules check, passes it through `_scrub` first: cut to one line of at most 200
+characters **before** any pattern runs (so a huge message can't make the regexes slow),
+then URL credentials, ARN account ids and `name=value` secrets are masked, and a line that
+mentions a password is dropped whole. The response also carries `profile` (`core` or
+`full`), which is how you tell, from outside, which build a process is running.
 
 ### The Experimently FastAPI style guide
 
@@ -549,21 +662,27 @@ it's a comment; if it violates several, it's a conversation.
   comment naming the epic.
 - Endpoint → service → model. Endpoints parse, authenticate, delegate, serialise. Logic lives
   in services. Models are tables.
-- Fully qualified imports: `from backend.app.<...> import <...>`. Never `app.`, never
-  relative. New models are imported in `backend/app/models/__init__.py`.
+- Fully qualified imports: `from backend.app.<...> import <...>`. Never rooted at `app.` —
+  `app.models.x` and `backend.app.models.x` are two different module objects, and SQLAlchemy
+  then sees two classes for one table. (A relative `from .base import Base` inside
+  `backend/app/models/` resolves to the same module and is fine.) A new core model is added to
+  `CORE_MODEL_MODULES` in `backend/app/models/__init__.py`, which `register_core_models()`
+  imports; a module's models are registered through the modules seam, never imported by core.
 
 **Requests and responses**
 
 - Inputs are declared (`Path`, `Query`, `Body`, `Depends`) with constraints and descriptions;
   nothing is parsed by hand except URL-encoded JSON in a query string, which raises the same
   422.
-- Schemas are Pydantic v2 (`field_validator`, `model_validator`, `ConfigDict`), layered
-  `Base → Create → Update → Response`; response models have `from_attributes=True`; updates
-  use `exclude_unset=True`.
+- Schemas are Pydantic v2 (`field_validator`, `model_validator`, `ConfigDict`). Request
+  models refuse what they don't understand (the flag requests use `extra="forbid"`); a
+  response model never refuses a stored row and has `from_attributes=True`; updates use
+  `exclude_unset=True`.
 - Invariants are on the schema (for the message) _and_ in the database (for the guarantee).
 - Refuse with `HTTPException(status, detail, headers)`; `except HTTPException: raise` before
-  any generic `except`; 200 + `reason` for normal negatives, 404 for unknown, 422 for
-  malformed, 423 + `Retry-After` for lockout.
+  any generic `except`, and the generic branch raises `unexpected_failure(...)`: a fixed
+  sentence plus the request id, never the exception's text; 200 + `reason` for normal
+  negatives, 404 for unknown, 422 for malformed, 423 + `Retry-After` for lockout.
 
 **Dependencies and auth**
 
@@ -571,8 +690,12 @@ it's a comment; if it violates several, it's a conversation.
   schedulers and scripts own theirs with `try/finally`.
 - Dashboard endpoints depend on `get_current_active_user` (or `get_current_superuser`); SDK
   endpoints on `get_api_key`. Never both.
-- Feature-flag and report checks are `async` `Depends`; experiment checks are sync calls.
-  READ before UPDATE/DELETE. Superuser and `ADMIN` are different bits.
+- Access is by **role**, never by who created the thing. Every route that changes a flag
+  calls the sync `can_act_on_feature_flag(user, flag.owner_id, action)` inline; only create is
+  an async `Depends(deps.can_create_feature_flag)`. Experiment routes use
+  `get_experiment_read_access` / `get_experiment_change_access(experiment, user, action)`.
+  A new flag-changing route is classified in `test_flag_change_routes_guarded.py`.
+  Superuser and `ADMIN` are different bits.
 - Security schemes use `auto_error=False`; the dependency decides what "missing" means.
 - Never call `core.security.decode_token` for validation.
 
@@ -585,8 +708,10 @@ it's a comment; if it violates several, it's a conversation.
   for bulk deletes; `joinedload` small collections, count large ones.
 - `text()` only when the builder can't; bound values; the schema is the only interpolated
   identifier; `nosemgrep` + `nosec` with a justification.
-- Migrations: autogenerate, read, minimal, `down_revision` id, nullable/additive, schema
-  helper. Fresh databases use the bootstrap.
+- Migrations: a full checkout has **two heads** (the core chain and the `modules` branch).
+  `upgrade heads`, plural; `revision --autogenerate --head <core head id>` (or
+  `--head modules@head`), then read it; minimal, `down_revision` id, nullable/additive, schema
+  helper. Never `alembic merge` the two heads. Fresh databases use the bootstrap.
 - Conversions match through `services/event_matching.py`. Targeting rules pass through
   `core/targeting_adapter.py`. No fourth format.
 
@@ -594,7 +719,7 @@ it's a comment; if it violates several, it's a conversation.
 
 - Long-lived tasks start in the lifespan, skip under test, run ticks via `run_locked_tick`,
   offload heavy sync work with `asyncio.to_thread`, let `CancelledError` propagate.
-- WebSockets authenticate at the handshake (subprotocol/header/`?token=`), accept-then-close
+- WebSockets authenticate at the handshake (the subprotocol, or a bearer header), accept-then-close
   with `4401`, release the auth session, use a session factory per snapshot.
 - Redis is optional everywhere: fallback limiter, disabled cache, readiness unaffected unless
   `REDIS_REQUIRED`. Cache keys include every input; every `set` has a TTL.
@@ -611,15 +736,27 @@ it's a comment; if it violates several, it's a conversation.
   `TestClient` against a real database; unit tests name their integration twin.
 - Env before import; unique data; `hashed_password` on test users; unit tests delete what
   they commit; DB-backed auth tests outside `integration/auth/`; Lambda suites one directory
-  at a time; `@pytest.mark.asyncio` for async deps.
+  at a time; `async def` tests for async deps (`asyncio_mode = "auto"`).
+- Every bug fix carries a `@pytest.mark.regression` test that fails on the old code.
 
 **Operations**
 
 - Every log line has a request id; every response echoes `X-Request-ID`.
 - New metrics go in `core/metrics.py` with bounded label cardinality.
 - `/health/live` never touches dependencies; `/health/ready` decides load-balancer
-  membership; errors are scrubbed.
-- A change is done when the PR gate, the release gate and the security scan are green and
+  membership; it reports an error's type, never its text.
+
+**Lint and format**
+
+- One tool: **ruff** (format, lint and import order; it replaced black, isort and flake8),
+  configured in `[tool.ruff]` in `pyproject.toml`, over `backend/ modules/ scripts/`.
+- `make format` rewrites in place; `make lint` runs everything the `lint` CI job runs:
+  `ruff check` and `ruff format --check`, the import-linter boundary between core and the
+  modules, `reuse lint` (every file carries a licence), the requirements-lock check, eslint and
+  `tsc` for the dashboard, hadolint for the Dockerfiles and actionlint for the workflows.
+- `mypy backend/app/` is available for local type checking, but no CI job runs it; it is not
+  part of what a pull request must pass.
+- A change is done when `make lint` is clean, the required pull-request checks are green and
   the review's findings are addressed.
 
 ### Try It Yourself
@@ -695,9 +832,10 @@ test (service sets `INACTIVE`, commits once), with the docstring cross-reference
 "tester@example.com")` and passes alone but fails in the full run with a unique-constraint
 error. Explain, and fix it in the house style.
 
-**E6.3 — Async or sync?** Write the test for `deps.get_experiment_access` refusing a viewer
-who doesn't own the experiment, and the test for `deps.can_delete_feature_flag` refusing an
-analyst. Mark them correctly.
+**E6.3 — Role, not owner.** Write unit tests that pin "access is by role, never by who
+created it": (a) `deps.get_experiment_change_access` refuses a VIEWER who **created** the
+experiment, and admits a DEVELOPER who didn't; (b) `can_act_on_feature_flag` refuses an
+ANALYST deleting a flag the analyst owns. Are these sync or async tests, and why?
 
 **E6.4 — A metric.** Add a counter for safety rollbacks (labelled by flag key and trigger
 type) to `core/metrics.py` with a recorder, and say where in the safety scheduler you'd call
@@ -717,27 +855,32 @@ Exception: return {"error": str(e)}`."_
 **S6.1**
 
 ```python
-# backend/tests/integration/api/test_feature_flags_lifecycle.py
+# backend/tests/integration/api/test_<your_name>.py
 def test_deactivated_flag_evaluates_inactive(client, api_key_header, db_session):
-    """API twin of tests/unit/services/test_feature_flag_service.py::test_deactivate_sets_inactive."""
+    """API twin of the unit test test_deactivate_sets_inactive."""
     key = f"lifecycle-{uuid.uuid4().hex[:8]}"
     created = client.post("/api/v1/feature-flags/", json={"key": key, "name": key, "rollout_percentage": 100}).json()
     assert client.post(f"/api/v1/feature-flags/{created['id']}/activate").status_code == 200
     assert client.post(f"/api/v1/feature-flags/{created['id']}/deactivate").status_code == 200
     resp = client.get(f"/api/v1/feature-flags/evaluate/{key}", params={"user_id": "u"}, headers=api_key_header)
     assert resp.status_code == 200 and resp.json() == {"key": key, "enabled": False, "config": None, "reason": "inactive"}
-    assert db_session.get(FeatureFlag, uuid.UUID(created["id"])).status == FeatureFlagStatus.INACTIVE
+    assert db_session.get(FeatureFlag, uuid.UUID(created["id"])).status == FeatureFlagStatus.INACTIVE.value
 
 
-# backend/tests/unit/services/test_feature_flag_service.py
-def test_deactivate_sets_inactive():
-    """Unit twin of integration/api/test_feature_flags_lifecycle.py::test_deactivated_flag_evaluates_inactive."""
+# backend/tests/unit/services/test_<your_name>.py
+@patch("backend.app.services.feature_flag_service.flag_to_read")
+def test_deactivate_sets_inactive(_to_read):
+    """Unit twin of the API test test_deactivated_flag_evaluates_inactive."""
     db = MagicMock()
-    flag = MagicMock(status=FeatureFlagStatus.ACTIVE)
+    flag = MagicMock(status=FeatureFlagStatus.ACTIVE.value)
     FeatureFlagService(db).deactivate_feature_flag(flag)
-    assert flag.status == FeatureFlagStatus.INACTIVE
+    assert flag.status == FeatureFlagStatus.INACTIVE.value
     db.commit.assert_called_once()
 ```
+
+(The service stores the status as its string value and returns `flag_to_read(flag)`, a
+response model built from the row; patching `flag_to_read` keeps the unit test about the
+transition and the commit, not about serialising a `MagicMock`.)
 
 **S6.2** — The session fixture doesn't truncate, so a previous test in the same process (or
 an earlier fixture) already inserted `tester@example.com`; the unique index on `users.email`
@@ -748,25 +891,45 @@ rejects the second. Fix: unique suffixes —
 **S6.3**
 
 ```python
-def test_experiment_access_refuses_non_owner_viewer():                       # sync
-    viewer = MagicMock(is_superuser=False, role=UserRole.VIEWER, id=uuid.uuid4())
-    experiment = MagicMock(owner_id=uuid.uuid4())
+from types import SimpleNamespace
+
+from backend.app.api import deps
+from backend.app.core.permissions import Action, can_act_on_feature_flag
+from backend.app.models.user import UserRole
+
+pytestmark = [pytest.mark.unit]
+
+
+def _user(role):
+    return SimpleNamespace(id=uuid.uuid4(), role=role, is_superuser=False)
+
+
+def test_viewer_cannot_change_an_experiment_it_created():                    # sync
+    viewer = _user(UserRole.VIEWER)
+    experiment = SimpleNamespace(id=uuid.uuid4(), owner_id=viewer.id)
     with pytest.raises(HTTPException) as exc:
-        deps.get_experiment_access(experiment, viewer)
+        deps.get_experiment_change_access(experiment, viewer, Action.UPDATE)
     assert exc.value.status_code == 403
 
 
-@pytest.mark.asyncio
-async def test_can_delete_flag_refuses_analyst():                           # async
-    analyst = MagicMock(is_superuser=False, role=UserRole.ANALYST, id=uuid.uuid4())
-    flag = MagicMock(owner_id=analyst.id)
-    with pytest.raises(HTTPException) as exc:
-        await deps.can_delete_feature_flag(feature_flag=flag, current_user=analyst)
-    assert exc.value.status_code == 403
+def test_developer_may_change_an_experiment_someone_else_created():         # sync
+    developer = _user(UserRole.DEVELOPER)
+    experiment = SimpleNamespace(id=uuid.uuid4(), owner_id=uuid.uuid4())
+    assert deps.get_experiment_change_access(experiment, developer, Action.UPDATE) is experiment
+
+
+def test_analyst_cannot_delete_a_flag_it_owns():                            # sync
+    analyst = _user(UserRole.ANALYST)
+    assert can_act_on_feature_flag(analyst, analyst.id, Action.DELETE) is False
 ```
 
-(The analyst owns the flag, so `get_feature_flag_access` would pass — but `DELETE` by role
-is refused. Called by hand, the chained dependency isn't run; that's fine for the unit.)
+All three are plain sync tests: `get_experiment_change_access` and `can_act_on_feature_flag`
+are ordinary functions that the routes call inline after loading the row, so there is no
+event loop and no `Depends` chain to run. Note the asymmetry in what they return: the
+experiment check **raises** 403 itself, while the flag rule **returns a bool** and the route
+turns `False` into the 403. Each test sets ownership the "wrong" way on purpose — the creator
+refused, the stranger admitted — because a test where owner and role agree can't tell a
+role rule from an ownership rule.
 
 **S6.4**
 
@@ -787,12 +950,13 @@ exhaust the registry — labels must be bounded sets (flag keys, trigger types).
 
 **S6.5** — (1) `SessionLocal()` in a handler — must be `Depends(deps.get_db)`. (2) Accepting
 bearer _or_ API key — one door per endpoint; reports are a dashboard resource →
-`get_current_active_user` (and the `REPORT` permission dependency, async). (3) An
+`get_current_active_user` plus a role check. (3) An
 f-string interpolating `id` into `text()` — SQL injection; bind it (`:id`), and use the
 builder anyway. (4) `response_model=Dict[str, Any]` for a known shape, and base64 in JSON for
 bytes — return a `StreamingResponse`/`Response(media_type="application/pdf")`. (5) `except
 Exception: return {"error": ...}` — swallows `HTTPException`s into 200s with an error body;
-use `except HTTPException: raise` and `HTTPException(500)` for the rest. (6) No test named;
+use `except HTTPException: raise`, and `raise unexpected_failure(...)` for the rest (a fixed
+sentence and the request id, never `str(e)`, which can carry a DSN or a query). (6) No test named;
 a hot-ish path needs an API test. Six comments, one conversation.
 
 ---
