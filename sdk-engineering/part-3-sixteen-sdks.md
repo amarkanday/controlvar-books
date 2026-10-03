@@ -507,7 +507,8 @@ side: the Cloudflare adapter is a KV-backed `EdgeStore` whose `get` / `put` map 
 
 ### What & why
 
-"The server decides" assumes there is one server. Until October 2026 there wasn't, quite.
+"The server decides" assumes there is one server. Until October 2026 the repository held a
+second decider.
 `backend/lambda/` held a second implementation of experiment assignment — a Python handler
 meant to run behind API Gateway with DynamoDB as its store, built for latency targets the
 FastAPI service could not promise — with its own consistent hash, its own targeting
@@ -522,9 +523,12 @@ agree by contract, or delete one of them. The project did both.
 
 ### How Experimently does it
 
-**Act 1 — the finding (#81).** Nobody had compared the bucketing functions with each other.
-When someone did, there were four, and they disagreed. The backend's hash module keeps the
-record in its docstring:
+**Act 1 — the hash finding.** Nobody had compared the bucketing functions with each other.
+When someone did, there were four, and they disagreed. The finding is recorded in the message
+of commit `b46e5259`, and the backend's hash module keeps the record in its docstring. (The
+`#81` in the quoted docstrings is a number from the project's tracker before it moved to
+`getexperimently/experimently`; on the current tracker the same number names another item, so
+read the commits instead.)
 
 ```python
 # 📁 backend/app/core/consistent_hash.py
@@ -570,7 +574,7 @@ nothing) uses the SDK byte order but a suffixed salt and the other divisor:
 
 Side by side, as they stood before the fixes:
 
-| | API assignment (before #282) | Lambda copy (deleted in #606) |
+| | API assignment (before `b46e5259`) | Lambda copy (deleted in #606) |
 |---|---|---|
 | Hash input | `"{user_id}:{experiment.id}"` (UUID) | `"{user_id}:{experiment_key}_variant"` (key + suffix) |
 | Normalisation | full 128-bit digest `% 100` | first 4 bytes LE ÷ (2³² − 1) |
@@ -601,7 +605,7 @@ while experiment `traffic_allocation` is 0.0–1.0, and nothing in the types tel
 A config copied from one to the other is silently wrong: a `0.5` rollout is 0%, a `50`
 allocation is "everyone, and then some".
 
-**Act 2 — make the API agree with the contract (#282).** The golden-vector hash already had
+**Act 2 — make the API agree with the contract (commit `b46e5259`).** The golden-vector hash already had
 the strongest claim: every SDK and the vectors file implemented it. So the API moved to it
 (commit `b46e5259`), over the experiment's public `key`:
 
@@ -684,7 +688,7 @@ Reproduce Act 1's numbers with nothing but `hashlib`:
 >>> int(d.hex(), 16) % 100                                            # the old API reading (and flag rollout today)
 79
 >>> lam = struct.unpack("<I", hashlib.md5(f"{user}:{key}_variant".encode()).digest()[:4])[0] / 0xFFFFFFFF
->>> old_api = int(hashlib.md5(f"{user}:{exp_id}".encode()).hexdigest(), 16) % 100   # UUID-salted, as before #282
+>>> old_api = int(hashlib.md5(f"{user}:{exp_id}".encode()).hexdigest(), 16) % 100   # UUID-salted, as before b46e5259
 ```
 
 Then read the two commits that closed it, and run the test that keeps it closed:
@@ -701,7 +705,7 @@ Exercise E3.5 measures the agreement rate between the two deciders.
 
 - Four bucketing functions existed for experiments and flags, and nothing compared them; the
   API and the Lambda copy chose the same variant about half the time.
-- The API adopted the golden-vector hash over the experiment's key (#282); stickiness meant
+- The API adopted the golden-vector hash over the experiment's key (commit `b46e5259`); stickiness meant
   nobody already assigned moved, and the backend's test now reads the SDKs' vector file.
 - The Lambda copy, which also skipped mutual exclusion and holdout, was deleted (#606). No
   stack deploys a handler from `backend/lambda/`; experiment assignment happens only in the
@@ -745,7 +749,7 @@ closed it?**
 Users got different variants per surface: the two deciders used independent hash functions,
 agreeing about half the time on a 50/50 split, and the Lambda copy also skipped mutual
 exclusion and holdout. Detection: an SRM per surface, and a join of the two assignment stores
-on `user_id`. What closed it: the API moved to the golden-vector hash (#282), then the second
+on `user_id`. What closed it: the API moved to the golden-vector hash (commit `b46e5259`), then the second
 decider was deleted (#606), so there is one assignment path.
 
 **Quiz.** Elixir runs `evaluate_flag` in the caller's process but `track` in the GenServer.

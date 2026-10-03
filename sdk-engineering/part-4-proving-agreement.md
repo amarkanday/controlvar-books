@@ -450,27 +450,43 @@ seeded flag is at 100%: the harness tests the flag path end to end, not just tha
 came back.
 
 And the run: last stdout line only (build tools chatter before it), stderr's last line as
-the failure detail, a per-SDK timeout that includes builds:
+the failure detail, a per-SDK timeout that includes builds. The subprocess part lives in
+`_run_command`, which returns a 3-tuple (status, detail, the parsed JSON object), so that
+other checks can reuse it; `run_one` adds the validation. Abridged where marked `...`:
 
 ```python
 # 📁 tests/sdk-contract/live/run_live_contract.py
-def run_one(sdk: str, command: str, env: dict[str, str], timeout: int) -> tuple[str, str]:
-    """Return (status, detail) where status is PASS / FAIL."""
+def _run_command(command: str, env: dict[str, str], timeout: int) -> tuple[str, str, dict]:
+    """Run a smoke command; (status, detail, the JSON object on its last stdout line)."""
+    started = time.time()
     ...
+    except subprocess.TimeoutExpired:
+        return "FAIL", f"timed out after {timeout}s", {}
+    elapsed = time.time() - started
     stdout_lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
     if proc.returncode != 0:
         tail = (proc.stderr.strip().splitlines() or stdout_lines or ["(no output)"])[-1]
-        return "FAIL", f"exit {proc.returncode}: {tail[:300]}"
+        return "FAIL", f"exit {proc.returncode}: {tail[:300]}", {}
     if not stdout_lines:
-        return "FAIL", "no JSON line on stdout"
+        return "FAIL", "no JSON line on stdout", {}
     try:
         payload = json.loads(stdout_lines[-1])
     except json.JSONDecodeError:
-        return "FAIL", f"last stdout line is not JSON: {stdout_lines[-1][:200]}"
+        return "FAIL", f"last stdout line is not JSON: {stdout_lines[-1][:200]}", {}
+    if not isinstance(payload, dict):
+        return "FAIL", f"last stdout line is not a JSON object: {stdout_lines[-1][:200]}", {}
+    return "PASS", f"{elapsed:.1f}s", payload
+
+
+def run_one(sdk: str, command: str, env: dict[str, str], timeout: int) -> tuple[str, str]:
+    """Return (status, detail) where status is PASS / FAIL."""
+    status, detail, payload = _run_command(command, env, timeout)
+    if status != "PASS":
+        return status, detail
     problems = validate(sdk, payload)
     if problems:
         return "FAIL", "; ".join(problems)
-    return "PASS", f"{payload['assign']['variant_name']} in {elapsed:.1f}s"
+    return "PASS", f"{payload['assign']['variant_name']} in {detail}"
 ```
 
 The fixtures come from one seed script — an ACTIVE experiment `sdk_contract_ab` with
