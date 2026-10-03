@@ -1,20 +1,23 @@
 # experimently-docs
 
 Internal Experimently documentation kept **out of the app repo**
-(`amarkanday/experimentation-platform`) — onboarding, learning paths, troubleshooting and
-usage guides for engineers joining the platform.
+([`getexperimently/experimently`](https://github.com/getexperimently/experimently), public, Apache-2.0):
+onboarding, operator guides, learning paths, troubleshooting and usage guides for engineers joining the
+platform.
 
 Experimently is an A/B-testing and feature-flag platform: a FastAPI backend (Python 3.11,
 SQLAlchemy, Pydantic v2, PostgreSQL, Redis), a Next.js dashboard (TypeScript, React,
-Tailwind), fifteen client SDKs that all speak one HTTP contract, AWS infrastructure defined in
-CDK, and a statistics engine (frequentist, sequential/mSPRT, CUPED, Bayesian, multi-armed
-bandits). ~66,000 lines of application Python, ~112,000 lines of backend tests (5,800+ test
-functions), ~25,000 lines of dashboard TypeScript, ~38,000 lines of SDK code.
+Tailwind), sixteen client SDKs (including two OpenFeature providers) that all speak one HTTP contract,
+optional `modules/` that turn the **core** profile into the **full** one, signed container images on GHCR,
+a Helm chart and a production compose file, AWS infrastructure defined in CDK, and a statistics engine
+(Fisher's exact test, sequential/mSPRT, Bayesian, multi-armed bandits; CUPED in beta). About 91,000 lines of
+application Python, 229,000 lines of backend tests (9,100+ test functions, 16,000+ tests collected), 52,000 lines of dashboard
+TypeScript and 44,000 lines of SDK code (measured at `2fe9da1e`, v0.17.0 plus unreleased).
 
-> **Being updated (issue #1).** The books and guides below describe the app as of 2026-09-11 and are being
-> brought up to date one pull request per book, each checked against a pinned app commit (`tools/REF`). Three
-> operator guides are being added: deploying, cutting a release, and running the open-source project. Until a
-> book's update merges, treat its specifics as historical and check them against the app.
+> **Updated 2026-10-03 (issue #1).** Every book and guide was audited claim by claim against the app and
+> rewritten where the code had moved on. Each book's README names the app commit it was checked against:
+> `a4a6dbd2` for most, `2fe9da1e` for *Experimentation Statistics* and *Learn Python* (both are v0.17.0 plus
+> unreleased work). When the app moves on, re-check against the newer commit before trusting a specific.
 
 ## Guides — read these first
 
@@ -26,6 +29,18 @@ functions), ~25,000 lines of dashboard TypeScript, ~38,000 lines of SDK code.
   SDK.
 - **[`guides/troubleshooting.md`](./guides/troubleshooting.md)** — symptom → cause → fix, for
   local setup, tests, the API, the dashboard, SDKs, schedulers and AWS.
+
+## Operator guides — for whoever runs the project
+
+- **[`guides/deploying.md`](./guides/deploying.md)** — choosing compose, Helm or AWS; the AWS path
+  step by step (sign-in, secrets by complete ARN, DNS and certificate, the deploy role, `cdk diff` and
+  `cdk deploy`), every later deploy, rollback and teardown. Founder-only steps are checklists.
+- **[`guides/releasing.md`](./guides/releasing.md)** — conventional titles, the release-please pull
+  request and how to check it, why `release.yml` must not be dispatched by hand after it, the docs site,
+  verifying image signatures and SBOMs, scanning before a package goes public, and SDK releases.
+- **[`guides/open-source.md`](./guides/open-source.md)** — running the public project: licensing and
+  DCO, branch protection and required checks, secret scanning and the leak guard, security advisories,
+  Dependabot, the package registries, the docs site and landing page, and how work is planned and reviewed.
 
 ## Learning path
 
@@ -50,26 +65,28 @@ product what it is.
    Jest and Playwright. The book that lets you _write_ screens, not just read them.
 4. **[`build-a-platform-in-28-days/`](./build-a-platform-in-28-days/README.md)** — the **whole
    Experimently architecture** end-to-end: the assign → track → analyse loop, the data model,
-   auth and RBAC, feature flags and the rules engine, the five background schedulers and their
-   advisory lock, safety auto-rollback, the statistics engine, the SDK contract, testing, CI,
-   containers, AWS. Assumes the three prior books. _After this capstone, you can read and
+   access by role, feature flags and the rules engine, the background schedulers and their
+   advisory lock, safety auto-rollback, the statistics engine, local evaluation, the core/modules split,
+   the SDK contract, testing and the required checks, signed containers, Helm, AWS. Assumes the three prior books. _After this capstone, you can read and
    extend the codebase._
 
 **Specializations — after the core path, in any order:**
 
 5. **[`experimentation-statistics/`](./experimentation-statistics/README.md)** — the maths the
-   product is built on and how the code implements it: SRM, z-tests and Fisher, power, the
-   peeking problem and mSPRT, CUPED, Beta-Binomial Bayesian analysis, Thompson Sampling and
-   UCB1 bandits, multiple-testing correction, and reproducible Monte Carlo (seeded RNG).
-6. **[`sdk-engineering/`](./sdk-engineering/README.md)** — one HTTP contract, fifteen SDKs:
-   the four endpoints, why the server (not the SDK) buckets users, the MD5 consistent hash and
-   its golden vectors, the anatomy of a client (transport, cache, 429 retry), the React SDK,
-   porting to new languages, the live contract harness, and the ShopLab/StreamPulse demo apps.
+   product is built on and how the code implements it: SRM, Fisher's exact test, power, the
+   peeking problem and the mSPRT confidence sequence, CUPED (beta), Beta-Binomial Bayesian analysis,
+   Thompson Sampling and UCB1 bandits, multiple-testing correction, warehouse analysis from summary
+   statistics, and reproducible Monte Carlo (seeded RNG).
+6. **[`sdk-engineering/`](./sdk-engineering/README.md)** — one HTTP contract, sixteen SDKs:
+   the endpoints, why the server buckets users and when an SDK may evaluate flags locally (beta), the MD5
+   consistent hash and its golden vectors, the anatomy of a client (transport, cache, 429 retry), the
+   React SDK, porting to new languages, the live contract harness, SDK releases, and the ShopLab/StreamPulse
+   demo apps.
 7. **[`platform-operations/`](./platform-operations/README.md)** — running it: the compose
-   stack and container entrypoint, bootstrap and seeds, the CDK stacks (VPC, Aurora, Redis,
-   ECS Fargate + ALB + blue/green, Lambda + Kinesis + Firehose + OpenSearch, Glue),
-   structured logging, Prometheus and health probes, alerting, the CI workflows, migrations
-   and rollback.
+   and production compose files, the container entrypoint, bootstrap and seeds, the Helm chart, the CDK
+   stacks (9 core + 3 module: VPC, Aurora, Redis, ECS Fargate + ALB + CodeDeploy blue/green, analytics,
+   Glue), secrets by complete ARN, structured logging, Prometheus and health probes, alarms, the deploy and
+   rollback workflows, the migration task as the only schema writer, and releases.
 
 ## Conventions used across every book
 
@@ -78,16 +95,19 @@ product what it is.
 - `# ✅` marks the idiom we want; `# ❌` marks the anti-pattern it replaces.
 - Sidebars — **By the Way**, **Watch Out!**, **Did You Know?** — run throughout.
 - Every Part ends with a **Workshop** (Q&A, a quiz, exercises with worked solutions).
-- You need a clone of `amarkanday/experimentation-platform` open alongside the books; the
+- You need a clone of `getexperimently/experimently` open alongside the books; the
   _Try It Yourself_ / _Build It_ exercises send you into it. Files move — if a path 404s,
   `git grep` the symbol. The _patterns_ outlast the line numbers.
 
-Snapshot date for every quoted snippet: **2026-09-11** (`main` at PR #68 plus the P0 open-core
-work: local auth, containers, the Community Edition compose stack).
+Snapshot for every quoted snippet: the app commit named in that book's README (see the note at the top).
+Commits made before development moved into the public repository (up to about 2026-09-24) carry the old
+private repository's PR numbers in their subjects, and those numbers mean something else on the public
+tracker. The books cite commit hashes for that period.
 
 ## Checking the docs
 
-Every claim the books make about the app is held to one pinned commit by six gates: banned terms, paths, quoted
-snippets, links, Try-It numbers and secrets. Run them with `make check`; see [`tools/README.md`](./tools/README.md).
+Six optional checks hold the books to a pinned app commit: banned terms, paths, quoted snippets, links,
+Try-It numbers and secrets. Run them with `make check` when you change a book; see
+[`tools/README.md`](./tools/README.md). They are a tool, not a merge gate.
 
 > Private repository. Not for external distribution.
