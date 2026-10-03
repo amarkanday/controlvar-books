@@ -5,12 +5,19 @@
 [← Part I](./part-1-foundations.md) · [Contents](./README.md) · [Part III →](./part-3-sharper-estimates.md)
 
 Everyone looks at results before the planned end. This Part is about why that quietly
-destroys the guarantees of Part I (Hour 4), the method the platform uses to make looking
+destroys the guarantees of Part I (Hour 4), the one method the platform uses to make looking
 safe — the mixture sequential probability ratio test, an evidence ratio you may inspect at
-any moment (Hour 5), and its two companions: confidence intervals that stay valid under
-continuous monitoring and the alpha-spending boundaries for teams that pre-plan their looks
-(Hour 6). By the end you'll know what `can_stop`, `always_valid_p_value` and
-`evidence_strength` on the Sequential tab actually promise.
+any moment (Hour 5) — and its companion, a confidence sequence that is the same test turned
+inside out, so the interval and the stop decision can never disagree (Hour 6). Hour 6 also
+covers the alpha-spending boundaries the platform used to report and no longer does, and
+why. By the end you'll know what `can_stop`, `always_valid_p_value`, `evidence_strength`,
+`recommended_action`, `at_risk` and the `beta` notice on the Sequential tab actually promise.
+
+> **Status.** The sequential analysis is **beta**: `GET /results/{id}/sequential` answers
+> `analysis_status: "beta"` and an `analysis_notice` saying that the stop/continue decision
+> is the mSPRT alone and that `alpha_spending` is always empty (issue #232). The mSPRT, its
+> always-valid p-value and the confidence sequence are computed exactly as this Part
+> describes; "beta" is about what is *not* there yet (a planned-looks mode).
 
 ---
 
@@ -22,22 +29,24 @@ A fixed-horizon test promises: _if there's no effect, a p-value below 0.05 happe
 time_. The promise holds for **one** look at the pre-planned sample size. Look every day
 and stop the first time p dips below 0.05, and the promise breaks: under the null, the
 running p-value wanders, and over 20 daily looks the chance that it dips below 0.05 _at
-least once_ is not 5% but something like 20–30%. Over unlimited looks it's certain — a random
-walk crosses any fixed line eventually.
+least once_ is not 5% but about 25% (the Try It below measures 0.247). Over unlimited looks
+it's certain — a random walk crosses any fixed line eventually.
 
 This isn't a subtle effect. It's the single most common way an experimentation program
 "finds" wins that don't replicate, and it happens without anyone doing anything that feels
 wrong: they just checked the dashboard.
 
-Three ways out, and the platform implements two of them:
+Three ways out:
 
 1. **Don't peek** (or peek and don't act). Culturally fragile.
 2. **Pre-plan the looks and spend α across them** — group sequential designs with alpha-
-   spending functions (O'Brien–Fleming, Pocock). Valid for the planned schedule, and the
-   platform computes the boundaries (Hour 6).
+   spending functions (O'Brien–Fleming, Pocock). Valid for the planned schedule, _if_ the
+   boundaries are computed properly and the looks are counted. **The platform does not
+   offer this.** It used to report a boundary table; the table did not hold its stated
+   level and nothing counted the looks, so it was removed (Hour 6).
 3. **Use a test that's valid at every look** — a sequential test whose error guarantee holds
-   for any stopping rule. The mixture SPRT (Hour 5) is the platform's default, and its
-   `always_valid_p_value` is the number to act on.
+   for any stopping rule. The mixture SPRT (Hour 5) is the platform's only sequential
+   method, and its `always_valid_p_value` is the number to act on.
 
 #### What "always valid" means
 
@@ -49,20 +58,40 @@ one at any single look. You pay a bit of power at a fixed n for the freedom to l
 
 ### How Experimently does it
 
-The experiment opts in with a method and its parameters, validated on the schema:
+The experiment opts in with `sequential_testing_enabled: true` and a configuration,
+validated on the schema:
 
 ```python
-# 📁 backend/app/schemas/experiment.py
+# 📁 backend/app/schemas/experiment.py  (descriptions abridged)
 class SequentialTestingConfigInput(BaseModel):
     """Configuration for enabling sequential testing on an experiment."""
 
-    method: str = Field(default="msprt", pattern="^(msprt|always_valid)$", description="Sequential testing method: 'msprt' or 'always_valid'.")
+    method: str = Field(default="msprt", pattern="^(msprt|always_valid)$",
+        description="Sequential testing method: 'msprt'. 'always_valid' is accepted as an alias of it; the analysis reports 'msprt'.")
+    alpha: float = Field(default=0.05, gt=0.0, le=0.2,
+        description="Significance level of the mSPRT, above 0 and at most 0.2; the stopping boundary is 1/alpha.")
     tau_squared: float = Field(default=0.001, gt=0.0, le=1.0, description="mSPRT mixing parameter.")
-    spending_function: str = Field(default="obrien_fleming", pattern="^(obrien_fleming|pocock)$", description="Alpha spending function.")
-    planned_looks: int = Field(default=10, ge=1, le=100, description="Number of planned interim analyses.")
+    spending_function: str = Field(default="obrien_fleming", pattern="^(obrien_fleming|pocock)$",
+        description="Alpha spending function. Accepted and stored, but no alpha-spending table is computed yet.")
+    planned_looks: int = Field(default=10, ge=1, le=100,
+        description="Number of planned interim analyses. Accepted and stored, but no alpha-spending table is computed yet.")
 ```
 
-and the enums that name what the service can classify:
+Four things to read off it:
+
+- **`alpha`** is the one significance knob, from just above 0 to 0.2, default 0.05. The
+  stopping boundary is `1/alpha` (20 at the default, 10 at 0.10). A request can override it
+  for one read: `GET /results/{id}/sequential?alpha=0.1` (same range). A stored value
+  outside (0, 0.2] — which the experiments API cannot write, but some other path could —
+  is not used silently: the route falls back to 0.05 and says so in the notice.
+- **`method: "always_valid"` is an alias**, not a second method. It is accepted so old
+  configurations still validate; the analysis runs the mSPRT, reports `method: "msprt"`,
+  and appends a sentence saying so to `analysis_notice`.
+- **`spending_function` and `planned_looks` are stored and ignored.** They are kept in the
+  schema so existing configurations stay valid; nothing reads them.
+- **`tau_squared`** is the mixing variance of Hour 5.
+
+The enums still name more than the analysis uses:
 
 ```python
 # 📁 backend/app/services/sequential_testing_service.py
@@ -84,15 +113,17 @@ class EvidenceStrength(str, Enum):
     STRONG_FOR_NULL = "strong_for_null"
 ```
 
-The sequential block is _additional_: the primary fixed-horizon result stays on the page,
-and the Sequential tab shows the trajectory. That's deliberate — the two answer different
-questions, and showing both makes the peeking trade visible rather than hidden.
+`SpendingFunction` survives only so the stored strings have a name; no code consumes it.
+
+The sequential block is _additional_: the primary fixed-horizon result stays on the results
+page, and the Sequential tab shows the mSPRT verdict. That's deliberate — the two answer
+different questions, and showing both makes the peeking trade visible rather than hidden.
 
 > **Watch Out!** The peeking problem applies to the **primary** p-value on the results
 > page. If sequential testing isn't enabled and you refresh daily, the primary p-value is the
-> classical one and its 0.05 line means less every day you look. Enable sequential testing
-> on any experiment you'll monitor — which is every experiment — and act on the Sequential
-> tab's verdict.
+> classical one and its line means less every day you look. Enable sequential testing on any
+> experiment you'll monitor — which is every experiment — and act on the Sequential tab's
+> verdict.
 
 > **Did You Know?** The mSPRT was popularised for A/B testing by Optimizely's "Stats Engine"
 > (Johari, Pekelis, Walsh, 2015/2017) precisely because their customers were peeking and
@@ -115,19 +146,20 @@ def ever_significant(n_looks=20, per_look=500, p=0.04):
         if se and 2 * (1 - stats.norm.cdf(abs((t/nt - c/nc) / se))) < 0.05:
             return True
     return False
-sum(ever_significant() for _ in range(2000)) / 2000      # ≈ 0.2–0.3, not 0.05
+sum(ever_significant() for _ in range(2000)) / 2000      # 0.247, not 0.05
 ```
 
-Then change `n_looks` to 1 and confirm ≈ 0.05.
+Then change `n_looks` to 1 and confirm ≈ 0.05 (0.049 continuing the same generator).
 
 ### Key takeaways
 
-- A fixed-horizon p-value's 5% promise holds for one planned look; daily peeking and
-  stopping at the first p < 0.05 inflates false positives to 20–30%+.
+- A fixed-horizon p-value's 5% promise holds for one planned look; 20 daily peeks with
+  stop-at-first-p<0.05 inflate it to about 25%.
 - Always-valid: P(ever p_t ≤ α) ≤ α under the null, for any stopping rule; more
   conservative per look, valid forever.
-- The platform offers mSPRT (default) and always-valid CIs, plus alpha-spending
-  boundaries for pre-planned looks; the sequential block sits beside the primary result.
+- The platform has one sequential method, the mSPRT, at a configurable `alpha` (≤ 0.2,
+  default 0.05, overridable per request). `always_valid` is an alias for it;
+  `spending_function` and `planned_looks` are stored and ignored. The route is beta.
 
 ---
 
@@ -157,24 +189,21 @@ Two properties make it a test you can watch:
 2. **`min(1, 1/Λ_n)` is an always-valid p-value.** It never goes below α before Λ crosses
    1/α, and once it does you may stop.
 
-τ² is the one knob: the variance of the prior on effect sizes. Small τ² concentrates the
-mixture near zero — more power for small effects, slower to declare large ones; large τ²
+τ² is the one shape knob: the variance of the prior on effect sizes. Small τ² concentrates
+the mixture near zero — more power for small effects, slower to declare large ones; large τ²
 the reverse. `0.001` (a standard deviation of ~3 percentage points on a difference of
-proportions) is a sensible default for conversion metrics.
+proportions) is the default for conversion metrics.
 
 ### How Experimently does it
 
 The core computation — quoted in full because the formula in the comment _is_ the method:
 
 ```python
-# 📁 backend/app/services/sequential_testing_service.py
+# 📁 backend/app/services/sequential_testing_service.py  (docstring abridged)
     def compute_msprt(self, control_successes: int, control_total: int, treatment_successes: int, treatment_total: int,
                       tau_squared: float = 0.001, alpha: float = 0.05) -> MSPRTResult:
         """
         Compute the mixture Sequential Probability Ratio Test (mSPRT).
-
-        The mSPRT uses a Gaussian mixture over possible effect sizes to
-        produce an evidence ratio (lambda) that can be monitored continuously.
         ...
         """
         boundary = 1.0 / alpha
@@ -201,7 +230,7 @@ The core computation — quoted in full because the formula in the comment _is_ 
         # mSPRT lambda: mixture likelihood ratio with Gaussian(0, tau^2) prior
         # Lambda_n = sqrt(V_n / (V_n + tau^2)) * exp(tau^2 * Z_n^2 / (2*(V_n + tau^2)))
         ratio = V_n / (V_n + tau_squared)
-        lambda_ratio = math.sqrt(ratio) * math.exp(tau_squared * Z_n ** 2 / (2.0 * (V_n + tau_squared)))
+        lambda_ratio = math.sqrt(ratio) * math.exp(tau_squared * Z_n**2 / (2.0 * (V_n + tau_squared)))
 
         can_stop = lambda_ratio >= boundary
         always_valid_p = min(1.0, 1.0 / lambda_ratio)
@@ -212,130 +241,192 @@ The core computation — quoted in full because the formula in the comment _is_ 
                            evidence_strength=evidence_strength, boundary=boundary)
 ```
 
-Read the shape of Λ. With no data (`Z_n = 0`) it's `√(V_n/(V_n+τ²)) < 1` — evidence slightly
-_for_ the null, because the mixture spreads probability over alternatives that predicted a
-difference and none appeared. As |Z_n| grows the exponential dominates and Λ climbs. As n
-grows, V_n shrinks and the prefactor shrinks too, so Λ can also fall below 1 — evidence
-_for_ the null accumulates as a persistent zero difference becomes informative. That
-two-sidedness is what `evidence_strength` classifies:
+Read the shape of Λ. With no difference (`Z_n = 0`) it's `√(V_n/(V_n+τ²)) < 1` — evidence
+slightly _for_ the null, because the mixture spreads probability over alternatives that
+predicted a difference and none appeared. As |Z_n| grows the exponential dominates and Λ
+climbs. As n grows, V_n shrinks and the prefactor shrinks too, so Λ can also fall below 1 —
+evidence _for_ the null accumulates as a persistent zero difference becomes informative.
+That two-sidedness is what `evidence_strength` classifies:
 
 ```python
 # 📁 backend/app/services/sequential_testing_service.py
-    def _classify_evidence(self, lambda_ratio: float, boundary: float) -> EvidenceStrength:
-        """Classify the strength of evidence given the lambda ratio and boundary."""
-        ...
-```
-
-— strong for the effect above the boundary, moderate as it approaches, inconclusive near 1,
-and moderate/strong for the null as Λ falls well below 1.
-
-`run_sequential_analysis` assembles the block the endpoint returns — the current mSPRT
-result, the confidence sequence (Hour 6), the trajectory over looks, a long-running-risk
-estimate and a recommended action — and `compute_evidence_trajectory` recomputes Λ at each
-cumulative look so the dashboard can plot it against the boundary:
-
-```python
-# 📁 backend/app/services/sequential_testing_service.py
-    def compute_evidence_trajectory(self, control_successes_over_time: List[int], control_totals_over_time: List[int],
-                                    treatment_successes_over_time: List[int], treatment_totals_over_time: List[int],
-                                    tau_squared: float = 0.001, alpha: float = 0.05) -> List[EvidencePoint]:
+    @staticmethod
+    def _classify_evidence(lambda_ratio: float, boundary: float) -> EvidenceStrength:
         """
-        Compute the evidence trajectory over sequential data looks.
+        Classify the strength of evidence from a lambda ratio.
 
-        Takes parallel lists of cumulative data at each look and returns
-        ...
+        Uses a calibration inspired by Jeffreys' scale for Bayes factors:
+        - lambda >= boundary        -> strong for effect
+        - lambda >= boundary / 3    -> moderate for effect
+        - lambda <= 1 / boundary    -> strong for null
+        - lambda <= 3 / boundary    -> moderate for null
+        - otherwise                 -> inconclusive
+        """
 ```
 
-The endpoint (`GET /results/{id}/sequential`) reads the cumulative counts from the two
-tables — the Week 1 join, per day — and the dashboard's `SequentialMonitor` draws Λ against
-`boundary` with the `can_stop` moment marked.
+#### What the route actually feeds it
+
+`GET /results/{id}/sequential` (404 unless the experiment has `sequential_testing_enabled`)
+reads **current totals**, not a history:
+
+- the **control** and the **first non-control variant** only — a third or fourth arm is not
+  analysed by this route;
+- on the experiment's **primary metric** (else its first metric);
+- `*_total` = assignment rows for the variant; `*_successes` = **converting users**, counted
+  exactly as `/results` counts them (`count_converting_users`, Part I Hour 2).
+
+`run_sequential_analysis` then assembles the block: the mSPRT result, the confidence
+sequence (Hour 6), an evidence "trajectory", the long-running-risk estimate and a
+recommended action. The trajectory is a **single point** — the current totals:
+
+```python
+# 📁 backend/app/services/sequential_testing_service.py
+        # 4. Evidence trajectory (single point for current data)
+        evidence_trajectory = [
+            EvidencePoint(
+                sample_size=total_sample,
+                lambda_ratio=msprt_result.lambda_ratio,
+                always_valid_p_value=msprt_result.always_valid_p_value,
+                can_stop=msprt_result.can_stop,
+            )
+        ]
+
+        # 5. Determine recommended action (mSPRT alone)
+        recommended_action = self._determine_action(msprt_result=msprt_result)
+```
+
+`compute_evidence_trajectory`, which recomputes Λ over a list of cumulative looks, still
+exists as a library function (the Try It and E2.2 use it), but the route does not call it.
+The dashboard's `EvidenceRatioChart` therefore plots one point against the boundary line, on
+a **linear** axis.
+
+#### The decision: `stop_for_effect` or `continue`, and an advisory `at_risk`
+
+```python
+# 📁 backend/app/services/sequential_testing_service.py
+    @staticmethod
+    def _determine_action(msprt_result: MSPRTResult) -> str:
+        """
+        Determine the recommended action from the mSPRT result.
+
+        - mSPRT crosses its boundary (Lambda >= 1/alpha) -> ``stop_for_effect``
+        - otherwise -> ``continue``
+
+        ``stop_for_futility`` stays in the response's value set but is not
+        emitted: the mSPRT has no futility boundary, and an experiment that
+        runs long is reported through the advisory ``at_risk`` flag instead.
+        """
+        if msprt_result.can_stop:
+            return "stop_for_effect"
+        return "continue"
+```
+
+`recommended_action` is exactly `stop_for_effect` when `can_stop` is true and `continue`
+otherwise. There is no futility stop and no `extend`. Separately, `estimate_long_running_risk`
+sets the top-level boolean **`at_risk`** (also inside `long_running_risk.is_at_risk`) when
+the experiment has run more than 1.5× its expected duration, or has used at least half its
+expected duration with less than half its required sample. The route reads
+`expected_duration_days` (default 30) and `required_sample_size` (default 10,000) from the
+stored config. It is **advice**, never a stopping rule: "running long is not evidence of no
+effect", as its own recommendation text says.
 
 > **Watch Out!** `can_stop` is a statement about the _false-positive_ guarantee: you may
 > stop and declare an effect with P(false positive) ≤ α. It says nothing about the effect's
-> _size_ — a Λ that crosses 20 early on a huge sample can correspond to a negligible lift
-> (Hour 2's effect size still applies), and nothing about _futility_ — Λ falling toward
-> "strong for null" is the signal to stop for that reason, and it's slower to arrive.
+> _size_ — a Λ that crosses 20 on a huge sample can correspond to a negligible lift
+> (Part I's effect size still applies). And there is no futility rule: Λ falling toward
+> "strong for null" is reported in `evidence_strength`, but `recommended_action` stays
+> `continue`. Deciding to give up on an experiment is a human call, informed by
+> `evidence_strength` and `at_risk`.
 
-> **Did You Know?** Λ's boundary `1/α` is exactly 20 at α = 0.05. The dashboard plots Λ on a
-> log scale for that reason: the interesting region spans from 0.1 (evidence for the null)
-> to 20 (stop for the effect), and the classical "p = 0.05" moment is where Λ = 20 — which
-> at any given look is _harder_ to reach than the classical test's threshold. That's the
-> price of validity.
+> **Did You Know?** Λ's boundary `1/α` is exactly 20 at α = 0.05. The interesting region
+> spans from about 0.05 (strong for the null) to 20 (stop for the effect), and the classical
+> "p = 0.05" moment is _not_ where Λ = 20 — at any given look Λ = 20 is harder to reach than
+> the classical test's threshold. That's the price of validity.
 
 ### Try It Yourself
 
-Recompute Λ and the always-valid p by hand, then watch how τ² changes the verdict:
+Recompute Λ and the always-valid p by hand, then watch how τ² and α change the verdict:
 
 ```python
 >>> import math
->>> from scipy import stats
 >>> from backend.app.services.sequential_testing_service import SequentialTestingService
 >>> svc = SequentialTestingService()
 >>> r = svc.compute_msprt(400, 10000, 520, 10000); r.lambda_ratio, r.always_valid_p_value, r.can_stop, r.evidence_strength
+(319.32..., 0.00313..., True, <EvidenceStrength.STRONG_FOR_EFFECT: 'strong_for_effect'>)
 >>> p_c, p_t = 0.04, 0.052; V = p_c*(1-p_c)/1e4 + p_t*(1-p_t)/1e4; Z = (p_t-p_c)/math.sqrt(V); tau2 = 0.001
 >>> math.sqrt(V/(V+tau2)) * math.exp(tau2*Z**2/(2*(V+tau2)))                      # the same Λ
->>> svc.z_test_proportions if hasattr(svc, "z_test_proportions") else None
+319.32...
 >>> [round(svc.compute_msprt(400, 10000, 520, 10000, tau_squared=t).lambda_ratio, 1) for t in (0.0001, 0.001, 0.01)]
+[538.8, 319.3, 108.1]
+>>> svc.compute_msprt(400, 10000, 520, 10000, alpha=0.10).boundary             # 1/alpha
+10.0
 >>> svc.compute_msprt(0, 5000, 0, 5000).evidence_strength     # degenerate: inconclusive
+<EvidenceStrength.INCONCLUSIVE: 'inconclusive'>
+>>> a = svc.run_sequential_analysis(400, 10000, 520, 10000, {"alpha": 0.05, "actual_days": 10, "expected_days": 30, "required_sample_size": 10000})
+>>> a.recommended_action, a.at_risk, a.alpha_spending, len(a.evidence_trajectory)
+('stop_for_effect', False, [], 1)
 ```
 
-Compare the classical two-sided p for the same counts (≈ 0.00006 from Hour 2) with the
-always-valid p — larger, on purpose.
+Compare the classical two-sided p for the same counts (≈ 0.00005 from Part I Hour 2) with the
+always-valid p of 0.0031 — larger, on purpose.
 
 ### Key takeaways
 
 - mSPRT: Λ_n = √(V/(V+τ²)) · exp(τ²Z²/(2(V+τ²))), a martingale under the null; stop when Λ ≥
   1/α; `min(1, 1/Λ)` is the always-valid p-value.
-- τ² is the prior variance on effect sizes; 0.001 is the default; smaller favours small
-  effects.
-- Λ moves both ways: above the boundary → stop for effect; well below 1 → evidence for the
-  null.
-- `can_stop` controls false positives at every look; it doesn't judge effect size or
-  futility.
+- τ² is the prior variance on effect sizes (default 0.001); α sets the boundary 1/α.
+- The route analyses current totals of converting users for the control and the first
+  treatment only; the "trajectory" is one point.
+- `recommended_action` is `stop_for_effect` (Λ ≥ 1/α) or `continue` — nothing else is
+  emitted; `at_risk` is advisory.
 
 ---
 
-## Hour 6 — Always-valid confidence sequences and alpha-spending boundaries
+## Hour 6 — Always-valid confidence sequences, and why there are no alpha-spending boundaries
 
 ### What & why
 
-Two companions to the mSPRT, for two different teams.
-
 A **confidence sequence** is to a confidence interval what an always-valid p-value is to a
 classical one: a sequence of intervals (CS_t) such that P(∃t: true δ ∉ CS_t) ≤ α. You may
-read it at any time and it's still a 95% interval. The mSPRT's mixture gives a simple
-approximate form: the margin is ρ·√(2·ln(1/α)) where ρ = √(V_n + τ²) is the effective
-standard deviation under the mixture. It's wider than the classical interval at any single
-look — again, the price of validity — and it shrinks as V_n does.
+read it at any time and it's still a (1 − α) interval.
 
-**Alpha spending** is for teams that _pre-plan_ their looks — "we'll analyse at 25%, 50%,
-75% and 100% of the planned sample." A spending function α*(t) says how much of the total α
-may be "spent" by information fraction t; the boundary at each look is set so the
-cumulative false-positive probability across looks stays at α. **O'Brien–Fleming** spends
-almost nothing early (very strict boundaries, so early stops need overwhelming evidence) and
-nearly all of it at the end; **Pocock** spends equally at every look (the same z boundary
-throughout, which makes each individual look stricter than 1.96). O'Brien–Fleming is the
-usual choice because it preserves most of the power for the final analysis while permitting
-an early stop for a very large effect.
+The cleanest way to build one is to **invert the test you already have**. The mSPRT tests
+"δ = 0". Run the same mixture test against every other candidate δ₀ instead, and keep the
+δ₀ values it would _not_ reject: Λ(δ₀) < 1/α. That set is an interval centred on δ̂, and with
+the plug-in variance V and the mixing variance τ² its half-width has a closed form:
+
+```
+half-width = √( V(V + τ²)/τ² · ( 2·ln(1/α) + ln((V + τ²)/V) ) )
+```
+
+Two properties follow directly, and both are the point:
+
+1. **It agrees with the stop decision.** 0 lies outside the sequence exactly when Λ(0) ≥ 1/α,
+   i.e. exactly when `can_stop` is true. The interval and the verdict cannot contradict each
+   other.
+2. **It keeps narrowing.** The half-width falls roughly like √(V·log(1/V)) — a little slower
+   than a classical interval's √V, which is the price of validity at every look.
 
 ### How Experimently does it
 
-The confidence sequence:
-
 ```python
-# 📁 backend/app/services/sequential_testing_service.py
+# 📁 backend/app/services/sequential_testing_service.py  (docstring abridged)
     def compute_always_valid_ci(self, control_successes, control_total, treatment_successes, treatment_total,
                                 alpha: float = 0.05, tau_squared: float = 0.001) -> ConfidenceSequence:
         """
         Compute an always-valid confidence interval (confidence sequence).
 
-        Uses the mSPRT mixing parameter to construct a CI that remains
-        valid under continuous monitoring.
+        The interval is the inversion of the same normal-mixture mSPRT that
+        ``compute_msprt`` runs (Johari et al. 2017; Howard et al. 2021) ...
+        Because V and tau^2 are the ones ``compute_msprt`` uses, 0 lies
+        outside this interval exactly when Lambda >= 1/alpha, i.e. exactly
+        when ``can_stop`` is true. ...
         """
         sample_size = control_total + treatment_total
+        unbounded = ConfidenceSequence(lower=-1.0, upper=1.0, width=2.0, sample_size=sample_size)
 
         if control_total == 0 or treatment_total == 0:
-            return ConfidenceSequence(lower=-1.0, upper=1.0, width=2.0, sample_size=sample_size)
+            return unbounded
 
         p_c = control_successes / control_total
         p_t = treatment_successes / treatment_total
@@ -343,128 +434,120 @@ The confidence sequence:
 
         V_n = p_c * (1 - p_c) / control_total + p_t * (1 - p_t) / treatment_total
 
-        # rho = sqrt(V_n + tau^2), the effective standard deviation under the
-        # mixture distribution
-        rho = math.sqrt(V_n + tau_squared)
+        if V_n <= 0:
+            # ln((V + tau^2) / V) is infinite: no finite interval.
+            return unbounded
 
-        # Approximate margin: rho * sqrt(2 * log(1/alpha))
-        margin = rho * math.sqrt(2.0 * math.log(1.0 / alpha))
+        margin = self.confidence_sequence_half_width(V_n, tau_squared, alpha)
 
-        lower = delta_hat - margin
-        upper = delta_hat + margin
+        lower = max(delta_hat - margin, -1.0)
+        upper = min(delta_hat + margin, 1.0)
         width = upper - lower
 
         return ConfidenceSequence(lower=lower, upper=upper, width=width, sample_size=sample_size)
-```
-
-`√(2·ln(20)) ≈ 2.45` versus the classical `1.96` — and ρ ≥ √V_n — so the sequence is
-always wider. With no data, the interval is `[-1, 1]`: "we know nothing," honestly.
-
-The two spending functions, with their formulas:
-
-```python
-# 📁 backend/app/services/sequential_testing_service.py
-    @staticmethod
-    def _obrien_fleming_spending(current_look: int, planned_looks: int, alpha: float) -> List[AlphaSpendingBoundary]:
-        """
-        Compute O'Brien-Fleming alpha spending boundaries.
-
-        The OBF spending function is:
-            alpha*(t) = 2 * (1 - Phi(z_{alpha/2} / sqrt(t)))
-
-        where t = i / planned_looks is the information fraction at look i.
-        The incremental spend at each look is alpha*(t_i) - alpha*(t_{i-1}).
-        """
-        z_alpha_half = stats.norm.ppf(1 - alpha / 2.0)
-        boundaries: List[AlphaSpendingBoundary] = []
-
-        for i in range(1, current_look + 1):
-            t_i = i / planned_looks
-            # Cumulative alpha spent through look i
-            cumulative_alpha = 2.0 * (1.0 - stats.norm.cdf(z_alpha_half / math.sqrt(t_i)))
-            # Ensure we don't exceed the total alpha budget
-            cumulative_alpha = min(cumulative_alpha, alpha)
-
-            boundary_z = z_alpha_half / math.sqrt(t_i)
-            boundary_p = 2.0 * (1.0 - stats.norm.cdf(boundary_z))
-
-            boundaries.append(AlphaSpendingBoundary(look_number=i, cumulative_alpha=cumulative_alpha,
-                                                    boundary_z=boundary_z, boundary_p=boundary_p))
-
-        return boundaries
 
     @staticmethod
-    def _pocock_spending(current_look: int, planned_looks: int, alpha: float) -> List[AlphaSpendingBoundary]:
-        """
-        Compute Pocock alpha spending boundaries.
+    def confidence_sequence_half_width(variance: float, tau_squared: float, alpha: float) -> float:
+        """Half-width of the normal-mixture confidence sequence, for V > 0.
 
-        Pocock uses equal alpha spending at each look:
-            incremental_alpha = alpha / planned_looks
-
-        All boundaries use the same z-value.
+        sqrt( V (V + tau^2) / tau^2 * (2 ln(1/alpha) + ln((V + tau^2) / V)) ).
         """
-        incremental_alpha = alpha / planned_looks
-        # The z-boundary is the same at every look (Pocock property)
-        boundary_z = stats.norm.ppf(1.0 - incremental_alpha / 2.0)
-        boundary_p = 2.0 * (1.0 - stats.norm.cdf(boundary_z))
-        ...
+        v_plus_tau = variance + tau_squared
+        return math.sqrt(variance * v_plus_tau / tau_squared
+                         * (2.0 * math.log(1.0 / alpha) + math.log(v_plus_tau / variance)))
 ```
 
-Read O'Brien–Fleming's boundary: `z_{α/2} / √t`. At the first of ten looks (t = 0.1) that's
-`1.96 / 0.316 ≈ 6.2` — you'd need a six-sigma difference to stop; at the last (t = 1) it's
-1.96, the classical threshold. Pocock at ten looks: `α/10 = 0.005` per look, `z ≈ 2.81` at
-every look — easier to stop early than OBF, but the final look is also stricter than 1.96.
+The result is intersected with [−1, 1], the range a difference of proportions can take, and
+it is exactly [−1, 1] when an arm is empty or the plug-in variance is 0 — the same cases in
+which `compute_msprt` reports Λ = 1. The route passes the same `alpha` and `tau_squared` to
+both, so the agreement holds at whatever level you asked for.
 
-The endpoint exposes both alongside the mSPRT so a team that pre-registered looks can read
-its boundaries, and `_determine_action` folds Λ, the sequence and the long-running-risk
-estimate into one recommendation (`stop_for_effect`, `stop_for_futility`, `continue`,
-`extend`):
+> **Watch Out!** If you read an older copy of this book, it gave the sequence as
+> δ̂ ± √(V + τ²)·√(2·ln(1/α)). That was the platform's formula before issue #231 was fixed.
+> It never narrowed below about ±0.078 at τ² = 0.001 however much data arrived, and it could
+> contain 0 while `can_stop` said stop. The inverted form above replaced it, in engine
+> version 1.2.0 (Part IV Hour 12).
 
-```python
-# 📁 backend/app/services/sequential_testing_service.py
-    def estimate_long_running_risk(self, ...) -> LongRunningRisk:
-        ...
-    @staticmethod
-    def _determine_action(...)
-```
+`backend/tests/unit/stats_validation/test_sequential_confidence_sequence.py` holds the
+replacement to its two properties: agreement with `can_stop` and narrowing as n grows.
 
-The long-running-risk estimate is the pragmatic companion to futility: an experiment whose
-Λ has sat near 1 for weeks while the sequence's width has stopped shrinking meaningfully is
-unlikely to resolve, and the platform says so rather than letting it run forever.
+#### Alpha spending: the theory, and why the platform does not compute it
+
+**Alpha spending** is for teams that _pre-plan_ their looks — "we'll analyse at 25%, 50%,
+75% and 100% of the planned sample." A spending function says how much of the total α may be
+"spent" by information fraction t, and the boundaries are set so the cumulative
+false-positive probability across the planned looks is α. **O'Brien–Fleming** boundaries
+have the shape c/√t — very strict early, near-classical at the end. **Pocock** uses one
+constant boundary c at every look, so each look is stricter than 1.96.
+
+The catch is in "set so the cumulative probability is α": the constant c has to be solved
+for the number of looks, because the looks are correlated. For two-sided α = 0.05:
+
+| Design (K looks)  | Correct constant c | What the naive shortcut uses        | Shortcut's real error rate |
+| ----------------- | ------------------ | ----------------------------------- | -------------------------- |
+| OBF, K = 4        | 2.024              | 1.96 (boundaries 1.96/√t)           | ~5.8% — too liberal        |
+| OBF, K = 10       | ~2.09              | 1.96                                | ~6.9% — too liberal        |
+| Pocock, K = 4     | 2.361              | z at α/K = 2.498                    | ~3.5% — too strict         |
+| Pocock, K = 10    | 2.555              | z at α/K = 2.807                    | ~2.6% — too strict         |
+
+(The error rates are 400,000-path simulations of a Brownian motion observed at K equally
+spaced looks; E2.4 reproduces them.)
+
+The platform used to return an `alpha_spending` table built from exactly those shortcuts,
+and it was indexed by a look number that nothing counted — the route has no record of how
+many times anyone has looked. Issue #232 removed it: `compute_alpha_spending`,
+`_obrien_fleming_spending` and `_pocock_spending` no longer exist, `alpha_spending` is
+always `[]` in the response (the field stays so the response shape is stable), and the
+dashboard's spending table only renders when the list is non-empty — which is never. The
+stop/continue decision is the mSPRT alone, which stays valid however often anyone looks.
 
 > **Watch Out!** Alpha spending is only valid for the **planned** schedule. Ten planned
 > looks with OBF boundaries, then an eleventh unplanned look at the classical 1.96, is the
-> peeking problem again. If you can't commit to a schedule, use the mSPRT — its guarantee
-> doesn't care when or how often you look.
+> peeking problem again. If you can't commit to a schedule and a system that counts the
+> looks, use the mSPRT — its guarantee doesn't care when or how often you look.
 
-> **Did You Know?** The interplay between the two methods is deliberate: a team can
-> _pre-register_ "we'll act at the OBF boundaries" for governance, and _also_ watch the mSPRT
-> daily for early signals. Both control α; they answer to different audiences (a review
-> board vs a product manager). The Sequential tab shows the trajectory, the boundary, the
-> sequence and the spending table together.
+#### What the Sequential tab shows
+
+`SequentialMonitor` renders the beta notice (`AnalysisNotice`, from `analysis_status` and
+`analysis_notice`), the recommendation, the `at_risk` warning, the evidence-ratio chart (the
+one current point against the boundary), and the confidence sequence. That is the whole
+promise: a stop/continue verdict whose false-positive rate is at most α at every look, an
+interval that agrees with it, and advice when the experiment is dragging.
 
 ### Try It Yourself
 
 ```python
->>> from backend.app.services.sequential_testing_service import SequentialTestingService, SpendingFunction
+>>> import math
+>>> from backend.app.services.sequential_testing_service import SequentialTestingService
 >>> svc = SequentialTestingService()
->>> cs = svc.compute_always_valid_ci(400, 10000, 520, 10000); (round(cs.lower, 4), round(cs.upper, 4)), cs.width
->>> import math; 1.96 * math.sqrt(0.04*0.96/1e4 + 0.052*0.948/1e4) * 2      # classical width for comparison
->>> [(b.look_number, round(b.boundary_z, 2), round(b.cumulative_alpha, 4)) for b in svc.compute_alpha_spending(10, 10)]
->>> [(b.look_number, round(b.boundary_z, 2)) for b in svc.compute_alpha_spending(10, 10, spending_function=SpendingFunction.POCOCK)][:3]
+>>> cs = svc.compute_always_valid_ci(400, 10000, 520, 10000); round(cs.lower, 4), round(cs.upper, 4), round(cs.width, 4)
+(0.0023, 0.0217, 0.0195)
+>>> V = 0.04*0.96/1e4 + 0.052*0.948/1e4; round(2 * 1.96 * math.sqrt(V), 4)    # classical width for comparison
+0.0116
+>>> [round(svc.compute_always_valid_ci(int(0.04*n), n, int(0.052*n), n).width, 4) for n in (1_000, 10_000, 100_000, 1_000_000)]
+[0.057, 0.0195, 0.0068, 0.0023]
+>>> # agreement: 0 outside the sequence exactly when can_stop
+>>> all(svc.compute_msprt(c, 10000, 520, 10000).can_stop == (lambda s: s.lower > 0 or s.upper < 0)(svc.compute_always_valid_ci(c, 10000, 520, 10000)) for c in range(300, 460, 2))
+True
+>>> hasattr(svc, "compute_alpha_spending")
+False
 ```
 
 Then fetch `/results/{id}/sequential` for a demo experiment with sequential testing enabled
-and match `confidence_sequence` and `alpha_spending` to these calls.
+and match `msprt_result` and `confidence_sequence` to these calls on the counts that
+`/results` reports for the control and the first treatment. Read `analysis_notice` and
+confirm `alpha_spending` is `[]`.
 
 ### Key takeaways
 
-- Confidence sequence: δ̂ ± ρ·√(2·ln(1/α)), ρ = √(V_n + τ²); valid at every look; wider than
-  the classical interval; `[-1, 1]` with no data.
-- Alpha spending for pre-planned looks: OBF (`z_{α/2}/√t`, strict early, classical at the
-  end) or Pocock (equal spend, one z throughout); valid only for the planned schedule.
-- The Sequential tab shows Λ vs boundary, the sequence, the spending table and a
-  recommended action including futility/long-running risk.
+- Confidence sequence = the inverted mSPRT: δ̂ ± √(V(V+τ²)/τ² · (2 ln(1/α) + ln((V+τ²)/V))),
+  clipped to [−1, 1]; [−1, 1] with no data. 0 is outside it exactly when `can_stop`.
+- It narrows as data arrives (≈ 0.0195 wide at 10,000 per arm in the example, 0.0023 at a
+  million), always somewhat wider than the classical interval.
+- Alpha spending (OBF, Pocock) is theory here: the platform computes no boundaries,
+  `alpha_spending` is always `[]`, and `spending_function`/`planned_looks` are ignored.
+- The Sequential tab shows the beta notice, the mSPRT verdict, `at_risk`, the one-point
+  evidence chart and the sequence.
 
 ---
 
@@ -472,14 +555,14 @@ and match `confidence_sequence` and `alpha_spending` to these calls.
 
 **Q1. You check a fixed-horizon test daily for 20 days and stop at the first p < 0.05. Under
 the null, roughly how often do you stop?**
-Around 20–30% of the time, not 5%. The 5% guarantee is for one planned look; a wandering
+About 25% of the time, not 5%. The 5% guarantee is for one planned look; a wandering
 p-value crosses a fixed line far more often than once.
 
 **Q2. State the always-valid guarantee in one inequality.**
 P(∃t: p_t ≤ α) ≤ α under the null — the p-value process crosses α at most with probability
 α, whatever the stopping rule.
 
-**Q3. What does Λ_n equal with no data, and why isn't it 1?**
+**Q3. What does Λ_n equal when the observed difference is zero, and why isn't it 1?**
 `√(V_n/(V_n+τ²)) < 1` — the mixture put prior mass on non-zero effects that predicted a
 difference; observing none is mild evidence for the null.
 
@@ -488,16 +571,20 @@ Validity at every look costs power at any single look; `1/Λ` is more conservati
 classical tail probability by construction (Λ must reach 1/α, a higher bar than a single
 z = 1.96 crossing).
 
-**Q5. OBF vs Pocock at ten looks: which lets you stop earlier on a moderate effect, and
-which preserves more power for the final look?**
-Pocock stops earlier (z ≈ 2.81 at every look vs OBF's ≈ 6.2 at look 1); OBF preserves more
-final-look power (its last boundary is the classical 1.96; Pocock's stays at 2.81).
+**Q5. An experiment's config says `method: "always_valid"`, `spending_function: "pocock"`,
+`planned_looks: 4`. What does `/sequential` compute?**
+The mSPRT at the configured `alpha`, with `method: "msprt"` in the response and a notice that
+`always_valid` is an alias. The spending function and planned looks are stored and ignored;
+`alpha_spending` is `[]`.
 
-**Q6. A team plans ten OBF looks, takes them, then peeks an eleventh time at 1.96. What
-happened?**
-The spending schedule was violated — the eleventh look is an unplanned classical test on top
-of a fully spent α, and the false-positive guarantee no longer holds. The mSPRT's guarantee
-would have.
+**Q6. The confidence sequence contains 0. What is `recommended_action`?**
+`continue`. 0 is inside the sequence exactly when Λ < 1/α, i.e. when `can_stop` is false —
+the two are the same test.
+
+**Q7. The response says `at_risk: true`. Should you stop for futility?**
+Not on that alone. `at_risk` says the experiment is running long or collecting slowly; it is
+not evidence of no effect, and the platform never emits `stop_for_futility`. Look at
+`evidence_strength` and the effect size you could still detect, then decide.
 
 **Quiz.** τ² = 0.001 vs 0.01 — which reaches the boundary first for a _small_ true effect?
 → 0.001: a tighter mixture around zero gives more power for small effects.
@@ -511,17 +598,20 @@ would have.
 
 **E2.2 — Trajectory.** Using daily cumulative counts you generate with a true 10% lift on a
 4% base (500 users/arm/day, `default_rng(3)`), compute Λ each day for 30 days and report the
-first day `can_stop` is true; repeat with no true effect and report whether it ever stops.
+first day `can_stop` is true; repeat with no true effect. Then repeat each case 500 times and
+report how often it stops within 30 days.
 
 **E2.3 — Sequence vs interval.** For the counts in E2.1, compute the confidence sequence and
-the classical 95% interval; state the ratio of widths.
+the classical 95% interval; state the ratio of widths and whether 0 is inside the sequence.
 
-**E2.4 — Boundaries.** Compute OBF and Pocock boundaries for four planned looks at α = 0.05;
-for an observed z of 2.5 at look 2, say whether each design stops.
+**E2.4 — Boundaries the platform does not compute.** For four planned looks at α = 0.05,
+compute the naive OBF boundaries `1.96/√t` and the α/K Pocock boundary, then simulate their
+real false-positive rates. For an observed z of 2.5 at look 2, say whether each design
+(naive and correct) stops.
 
 **E2.5 — Policy.** Write the two-sentence guidance you'd put on the Sequential tab for a
-product manager who asks "so can I ship?" when `can_stop` is true, the effect label is
-"negligible," and the sample-size meter is at 60%.
+product manager who asks "so can I ship?" when `recommended_action` is `stop_for_effect`, the
+effect label is "negligible," and the sample-size meter is at 60%.
 
 ---
 
@@ -529,7 +619,7 @@ product manager who asks "so can I ship?" when `can_stop` is true, the effect la
 
 **S2.1** — p_c = 0.04, p_t = 0.048, δ = 0.008; V_n = 0.04·0.96/7500 + 0.048·0.952/7500 ≈
 1.121e−5; Z_n ≈ 2.39; ratio = V/(V+τ²) ≈ 0.01109; Λ ≈ √0.01109 · exp(0.001·5.71/(2·0.0010112))
-≈ 0.1053 · exp(2.824) ≈ 1.77. `can_stop` False (1.77 < 20); always-valid p ≈ 0.56 —
+≈ 0.1053 · exp(2.824) ≈ 1.77. `can_stop` False (1.77 < 20); always-valid p ≈ 0.565 —
 inconclusive, while the classical two-sided p ≈ 0.017 would have "passed." That gap is Hour 4
 in one number.
 
@@ -538,33 +628,51 @@ in one number.
 ```python
 import numpy as np
 from backend.app.services.sequential_testing_service import SequentialTestingService
-svc = SequentialTestingService(); rng = np.random.default_rng(3)
-def first_stop(lift):
+svc = SequentialTestingService()
+def first_stop(rng, lift):
     c = t = 0
     for day in range(1, 31):
         c += rng.binomial(500, 0.04); t += rng.binomial(500, 0.04 * (1 + lift))
         if svc.compute_msprt(c, 500 * day, t, 500 * day).can_stop:
             return day
     return None
-first_stop(0.10), first_stop(0.0)
+rng = np.random.default_rng(3); first_stop(rng, 0.10), first_stop(rng, 0.0)      # (None, None)
+rng = np.random.default_rng(42); runs = [first_stop(rng, 0.10) for _ in range(500)]
+sum(d is not None for d in runs) / 500                                              # 0.112
+rng = np.random.default_rng(43); sum(first_stop(rng, 0.0) is not None for _ in range(1000)) / 1000   # 0.011
 ```
 
-With a 10% lift the stop typically arrives in the second half of the month at this traffic
-(the effect is small — expect `None` on some seeds, i.e. more than 30 days needed); with no
-effect it should be `None` — and across many seeds it will be non-`None` at most ~5% of the
-time.
+With `default_rng(3)` neither case stops. Across 500 runs a 10% lift on a 4% base stops
+within 30 days only about 11% of the time (median day 13 among those that do): at 15,000
+users per arm the effect is too small for this test to resolve in a month. A 30% lift stops
+in 96% of runs (median day 11). With no effect it stopped in 1.1% of 1,000 runs — inside the
+5% the guarantee allows, and well under it because the guarantee holds for unlimited looks
+and this run took only 30.
 
-**S2.3** — Sequence: ρ = √(1.121e−5 + 0.001) ≈ 0.03180; margin = 0.03180·√(2·ln 20) ≈ 0.0779;
-width ≈ 0.156. Classical: 1.96·√(1.121e−5)·2 ≈ 0.0131. Ratio ≈ 12 — the sequence is far
-wider at this n because τ² dominates V_n; it tightens toward the classical width only as V_n
-approaches τ² (i.e. at much smaller n) — which is the honest statement that with a τ² of
-0.001 the sequence is designed for effects of a few points, not tenths of a point.
+**S2.3** — Sequence: (−0.0029, 0.0189), width ≈ 0.0218. Classical: 1.96·√(1.121e−5)·2 ≈
+0.0131. Ratio ≈ 1.66. 0 is inside the sequence, consistent with S2.1's `can_stop` False.
+The sequence is wider than the classical interval, but by a factor that shrinks only slowly
+with n rather than one that never closes — the inverted form keeps narrowing as data arrives.
 
-**S2.4** — OBF (t = 0.25, 0.5, 0.75, 1): boundaries ≈ 3.92, 2.77, 2.26, 1.96 — z = 2.5 at
-look 2 does **not** stop (2.5 < 2.77). Pocock: α/4 = 0.0125 per look → z ≈ 2.50 at every
-look — z = 2.5 at look 2 is right at the boundary (stops if ≥). Same data, different
-pre-registered designs, different decisions — which is why the design is chosen before the
-data.
+**S2.4**
+
+```python
+import numpy as np
+from scipy import stats
+K = 4; t = np.arange(1, K + 1) / K; z = stats.norm.ppf(0.975)
+naive_obf = z / np.sqrt(t)                         # [3.92, 2.77, 2.26, 1.96]
+naive_pocock = stats.norm.ppf(1 - 0.05 / K / 2)    # 2.50 at every look
+rng = np.random.default_rng(0); Z = np.cumsum(rng.standard_normal((400_000, K)), axis=1) / np.sqrt(np.arange(1, K + 1))
+np.mean((np.abs(Z) >= naive_obf).any(axis=1)), np.mean((np.abs(Z) >= naive_pocock).any(axis=1))   # ≈ 0.058, ≈ 0.035
+np.mean((np.abs(Z) >= 2.024 / np.sqrt(t)).any(axis=1)), np.mean((np.abs(Z) >= 2.361).any(axis=1))  # ≈ 0.050, ≈ 0.050
+```
+
+Naive OBF: boundaries 3.92, 2.77, 2.26, 1.96 — z = 2.5 at look 2 does **not** stop
+(2.5 < 2.77), but the design's real error rate is about 5.8%. Correct OBF (c = 2.024):
+4.05, 2.86, 2.34, 2.02 — no stop. Naive Pocock (α/4): 2.50 at every look — z = 2.5 is right
+at the boundary and its real error rate is about 3.5%. Correct Pocock: 2.361 — stops. Same
+data, four designs, different decisions — and two of them do not even hold the level they
+claim, which is why the platform removed its table rather than keep it.
 
 **S2.5** — "Sequential testing says the difference is real (we can stop without inflating
 the false-positive rate), but the effect is negligible in size and we've seen only 60% of
