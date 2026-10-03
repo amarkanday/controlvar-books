@@ -11,6 +11,11 @@ CDK, and a statistics engine (frequentist, sequential/mSPRT, CUPED, Bayesian, mu
 bandits). ~66,000 lines of application Python, ~112,000 lines of backend tests (5,800+ test
 functions), ~25,000 lines of dashboard TypeScript, ~38,000 lines of SDK code.
 
+> **Being updated (issue #1).** The books and guides below describe the app as of 2026-09-11 and are being
+> brought up to date one pull request per book, each checked against a pinned app commit (`tools/REF`). Three
+> operator guides are being added: deploying, cutting a release, and running the open-source project. Until a
+> book's update merges, treat its specifics as historical and check them against the app.
+
 ## Guides — read these first
 
 - **[`guides/onboarding.md`](./guides/onboarding.md)** — your first day and first week: accounts,
@@ -79,5 +84,10 @@ product what it is.
 
 Snapshot date for every quoted snippet: **2026-09-11** (`main` at PR #68 plus the P0 open-core
 work: local auth, containers, the Community Edition compose stack).
+
+## Checking the docs
+
+Every claim the books make about the app is held to one pinned commit by six gates: banned terms, paths, quoted
+snippets, links, Try-It numbers and secrets. Run them with `make check`; see [`tools/README.md`](./tools/README.md).
 
 > Private repository. Not for external distribution.

@@ -1,0 +1,27 @@
+# tools/allow.txt -- accepted gate findings. One per line:
+#   GATE | file | reason | key
+# key (last, may contain ' | ') = the offending line's text, stripped (V3: <tagged path>::<identifier>).
+# An entry needs a reason a reviewer can check. Fix the text rather than add an entry
+# wherever you can: an entry here hides that line from the gate for good.
+
+# V2: the path is relative to the app's docs/ directory, not the app root; docs/sdk/<name>.md exists at REF.
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | React | `sdk/react` | 215 (jest) | yes — also runs the ShopLab demo | [react.md](sdk/react.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | JavaScript / TypeScript | `sdk/js` | 105 (jest) | yes | [javascript.md](sdk/javascript.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | OpenFeature (JS) | `sdk/openfeature` | 51 (jest) | yes | [openfeature.md](sdk/openfeature.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Edge (Cloudflare Workers) | `sdk/edge` | 101 (jest) | yes | [edge.md](sdk/edge.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | React Native | `sdk/react-native` | jest | unit tests only (no device runtime) | [react-native.md](sdk/react-native.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Python | `sdk/python` | 97 (pytest) | yes | [python.md](sdk/python.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | OpenFeature (Python) | `sdk/openfeature-python` | 79 (pytest) | yes | [openfeature.md](sdk/openfeature.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Go | `sdk/go` | 51 (`go test -race`) | yes | [go.md](sdk/go.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Java + Spring Boot starter | `sdk/java` | 77 + 30 (JUnit 5) | yes | [java.md](sdk/java.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | iOS (Swift) | `sdk/ios` | 71 (XCTest) | yes | [ios.md](sdk/ios.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Ruby | `sdk/ruby` | 109 (RSpec) | yes | [ruby.md](sdk/ruby.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | PHP | `sdk/php` | PHPUnit | in CI only (no PHP on the dev machine) | [php.md](sdk/php.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | .NET | `sdk/dotnet` | xUnit | in CI only (no .NET on the dev machine) | [dotnet.md](sdk/dotnet.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Android (Kotlin) | `sdk/android` | JUnit 5 | not yet (needs the Android SDK) | [android.md](sdk/android.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Flutter / Dart | `sdk/flutter` | `dart test` | not yet (needs the Dart SDK) | [flutter.md](sdk/flutter.md) |
+V2 | sdk-engineering/part-4-proving-agreement.md | docs-relative link target (docs/sdk/...), exists at REF | | Elixir | `sdk/elixir` | ExUnit | not yet (needs Elixir) | [elixir.md](sdk/elixir.md) |
+V2 | learn-react-nextjs-in-24-hours/part-3-nextjs.md | docs-relative path (docs/sdk/javascript.md), exists at REF | 'sdks/javascript':               'sdk/javascript.md',
+
+# V2: written by the demo seed scripts at run time (seed_shoplab.py), never committed.
+V2 | build-a-platform-in-28-days/week-1-core-loop.md | generated at run time by the demo seed, not a committed file | KEY=$(cat demo/shoplab/.api_key 2>/dev/null || echo "<your key>")
