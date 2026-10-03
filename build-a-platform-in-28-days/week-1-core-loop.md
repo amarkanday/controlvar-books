@@ -976,7 +976,7 @@ have agreed with the server even in principle. The consequence is the one an exp
 platform cannot have: a user counted in variant A by the API and variant B by an SDK, with no
 error anywhere.
 
-The fix (#81, #282) moved assignment onto the contract's function. It was safe to change
+The fix (commit `b46e5259`) moved assignment onto the contract's function. It was safe to change
 because assignment is sticky: only users with no row yet are bucketed by the new function, so
 no existing assignment moved. Today `tests/sdk-contract/golden-vectors.json` pins the function,
 `make test-sdk` checks each SDK's implementation against it, and the module's docstring keeps a
