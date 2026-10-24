@@ -1,21 +1,31 @@
 # Platform Operations
 
-### _The Experimently Edition — Running the Platform, From Laptop to Production, in 12 Hours_
+### _The Controlvar Edition — Running the Platform, From Laptop to Production, in 12 Hours_
 
-> **Preface.** This book explains how to run and maintain Experimently. It covers the local Compose stack,
-> production Compose deployments and the AWS infrastructure defined in CDK. The
-> remaining chapters cover logging, health checks, schedulers, releases and recovery. Read it
-> when setting up an environment, changing infrastructure or preparing to operate the service.
-> Deployment examples describe the configuration at the reference commit below.
+> **Preface.** This is a **specialization** book. The core four books teach you how
+> Controlvar is built; this one teaches you how it _runs_ — on your laptop, in a Docker
+> Compose stack a customer can self-host, and on AWS behind an ALB with blue/green deploys —
+> and how you know it's healthy, what you look at when it isn't, and how a change gets from a
+> pull request to production without anyone holding their breath. Every piece of it is real:
+> the development `docker-compose.yml` with its profiles and seeds, the production compose
+> file that runs the published images, the Dockerfiles with their `core` and `full` targets,
+> the entrypoint that checks its configuration, waits for Postgres and bootstraps the schema
+> (everywhere but AWS, where a one-shot migration task is the only schema writer), nine CDK
+> stacks (twelve with the optional modules), the structured-log and Prometheus wiring, the five
+> background schedulers and their advisory locks, the CI gates, release-please and the signed
+> release images, the one `Deploy` workflow with its canary and its migration task, and the
+> `Rollback` workflow and runbook. Read this if you'll be on call, if you'll deploy, if you'll
+> set up a customer's self-hosted instance, or if you'll touch anything under
+> `infrastructure/`, `deploy/compose/`, `.github/workflows/` or `backend/app/core/health.py`.
 >
-> Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
-> changes, including three breaking ones: #747, #769, #770).
+> Controlvar was called Experimently before 0.35.0; you will still meet the old name in some
+> identifiers (the `EXPERIMENTLY_PROFILE` variable, for one).
 
 ---
 
 ## Who this book is for & prerequisites
 
-- Engineers who will operate, deploy, or self-host Experimently; anyone joining the on-call
+- Engineers who will operate, deploy, or self-host Controlvar; anyone joining the on-call
   rotation.
 - Backend engineers adding a scheduler, a metric, a health check, a config setting, or a
   migration — each has an operational contract described here.
@@ -25,16 +35,22 @@
 
 ## How to use this book
 
-The 12 lessons are grouped into four Parts. Each explains an operational requirement, examines the
-relevant configuration and provides an exercise. Workshops include questions, quizzes and worked
-solutions. Blocks marked `# 📁 path` quote source or configuration; `...` marks omissions. A
-`(condensed)` label identifies a summary whose lines or comments have been edited for explanation.
-Local exercises use Docker. The AWS lessons can be followed by reading stack definitions and
-synthesized templates without deploying an account.
+12 lessons in 4 Parts, the usual rhythm: **What & why → How Controlvar does it (real
+code/config) → Try It Yourself → Key takeaways**, with a Workshop per Part. Configuration
+and infrastructure files are quoted with `# 📁 path` like source code — because they are
+source code. A tagged block is an excerpt of the file at Controlvar v0.36.4: `...` marks lines
+or text left out, and everything else is the file's own. A tag that ends in `(condensed)` marks
+a summary instead: the names are real, but lines have been joined or shortened and the trailing
+comments are the book's. Most Try-It-Yourself sections are things you can do on a laptop with
+Docker; the AWS ones are written so you can follow them with `cdk synth` and reading, without
+an account.
 
-> Each layer exposes a different operational contract: startup establishes configuration and
-> schema readiness, probes guide routing and restarts, scheduler locks coordinate workers, and
-> deployment procedures define recovery. Check the relevant contract when diagnosing a failure.
+> **The one idea to anchor on:** an operations system is a set of **contracts between
+> layers** — the container promises the orchestrator a liveness probe, the entrypoint
+> promises the image a bootstrapped database, the scheduler promises its replicas a lock,
+> the deploy promises the on-call engineer a rollback path, the health endpoint promises the
+> load balancer a truthful 503. Each contract is small; the platform works because none of
+> them lie. Every Hour here names one and shows where it's kept.
 
 ---
 
@@ -43,7 +59,7 @@ synthesized templates without deploying an account.
 ### Part I — The Local and Self-Hosted Stack _(Hours 1–3)_ → [`part-1-local-stack.md`](./part-1-local-stack.md)
 
 - **Hour 1** — Docker Compose: services, profiles, health, and the `.env` contract; the production Compose file
-- **Hour 2** — Multi-stage images and single-origin serving
+- **Hour 2** — The images: multi-stage Dockerfiles (`core` and `full`) and the nginx single-origin trick
 - **Hour 3** — The entrypoint: check, wait, bootstrap, seed, hand over — and the Makefile
 
 ### Part II — AWS _(Hours 4–6)_ → [`part-2-aws.md`](./part-2-aws.md)
@@ -79,9 +95,18 @@ _Turn to [Part I](./part-1-local-stack.md). 🛠️_
 
 ## Related reading — Production Engineering
 
-The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
-book or guide retains its original reference commit. See the book README for scope and verification.
+The Production Engineering specialization is verified against its own app snapshot; this book
+is verified against Controlvar v0.36.4. See each book README for scope and verification.
 
 - [Distributed correctness](../production-engineering/part-2-reliable-systems.md#hour-4--assignments-transactions-and-retries)
 - [Database evolution and performance](../production-engineering/part-2-reliable-systems.md#hour-6--database-evolution-and-performance)
 - [Privacy and data lifecycle](../production-engineering/part-3-security-and-privacy.md#hour-8--data-inventories-identifiers-and-minimization)
+
+## A note on accuracy
+
+Verified against Controlvar v0.36.4 (`79f8ed18`). Every `# 📁` excerpt was re-copied from the
+file at that tag and checked by the repository's gates (`tools/README.md`): each cited path must
+exist at the tag and each identifier in an excerpt must occur in its file. Nothing here was run
+against a real AWS account; the AWS lessons are read from the CDK source, and anything the book
+says about behaviour in a deployed account is intent unless stated otherwise. To re-check, run
+`EXPERIMENTLY_APP=<your clone> REF=v0.36.4 bash tools/check.sh platform-operations`.

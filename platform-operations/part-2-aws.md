@@ -4,13 +4,17 @@
 
 [← Part I](./part-1-local-stack.md) · [Contents](./README.md) · [Part III →](./part-3-observability.md)
 
-Hour 4 introduces the CDK stacks, their dependencies and the environment and profile settings that
-select them. The reviewed checkout has nine core stacks and twelve with modules. Hour 5 traces
-requests through the ALB to the API and dashboard services, then covers deployment and scaling.
-Hour 6 examines the data services, analytics pipeline and backups.
-
-Use synthesized templates to inspect resource settings alongside the stack definitions. Details
-such as secret ARNs, network access and retention periods matter when comparing environments.
+The same images, on AWS. Hour 4 is the map: nine CDK stacks in Python (twelve in a full
+checkout), the environment switch that sizes them, the profile switch that decides whether
+the module stacks exist, and the dependency order that `cdk deploy --all` respects. Hour 5
+is the request path: one internet-facing ALB in front of two ECS Fargate services — the API,
+which CodeDeploy replaces blue/green behind a canary, and the dashboard, which rolls — with
+secrets injected from Secrets Manager by complete ARN and auto-scaling on CPU and memory.
+Hour 6 is everything the API talks to: Aurora PostgreSQL, ElastiCache Redis, DynamoDB, and
+(full profile) the Kinesis → Firehose → S3 event pipeline with Glue and OpenSearch on top,
+plus what is backed up and for how long. Read it with `cdk synth` open; every claim here is a
+line in a stack. Nothing in this Part was run against a real AWS account: it is read from the
+CDK source and its synthesized templates.
 
 ---
 
@@ -19,7 +23,7 @@ such as secret ARNs, network access and retention periods matter when comparing 
 ### What & why
 
 Infrastructure-as-code has the same two virtues as application code: it's reviewable and
-it's reproducible. Experimently's is the AWS CDK in Python — the same language as the
+it's reproducible. Controlvar's is the AWS CDK in Python — the same language as the
 backend, so the same engineers can read it — organised as **one stack per concern** so a
 change to monitoring doesn't touch the database, and CloudFormation can roll back one thing
 at a time. The app file wires them with explicit `add_dependency` calls; CDK then deploys in
@@ -51,7 +55,7 @@ are public. Everything is in **one region, `us-west-2`**: the three workflows pi
 stacks, ECR repositories, secrets and certificate go there too. `dev` and `demo` are for
 `cdk deploy` by hand.
 
-### How Experimently does it
+### How Controlvar does it
 
 The entrypoint — environment validation, task counts per environment, account from
 credentials only:
@@ -355,10 +359,12 @@ The two services are replaced differently, because they fail differently. The **
 serves static files: an ECS rolling deployment with the deployment circuit breaker (rollback
 on) is enough. The **API** is where a bad release hurts, so it gets **blue/green with a
 canary**: the old task set ("blue") keeps serving while a new one ("green") starts; once the
-shift is approved, 10% of the API's traffic goes to green for five minutes, then the rest —
-and blue is kept for an hour so the first rollback is a traffic switch, not a rebuild. At the
-reference commit the canary is `CANARY_10_PERCENT_5_MINUTES`: 10% for 5 minutes; the project
-has decided to lengthen it to 15 minutes before production.
+shift is approved, 10% of the API's traffic goes to green for fifteen minutes, then the rest —
+and blue is kept for an hour so the first rollback is a traffic switch, not a rebuild. The
+canary is `CANARY_10_PERCENT_15_MINUTES`. It was five minutes once; at launch traffic, 10% of a
+few requests a minute often did not reach the alarm's thresholds inside five minutes, so a broken
+release could reach 100% before the alarm could act. Fifteen minutes is a value to revisit once
+production has real traffic.
 
 The API service hands deployment control to CodeDeploy (`deployment_controller=CODE_DEPLOY`),
 and that has consequences you will meet in every later Hour:
@@ -379,7 +385,7 @@ and that has consequences you will meet in every later Hour:
 Secrets reach the container as environment variables that ECS resolves from Secrets Manager
 at task start — the image never contains them and CloudFormation never sees their values.
 
-### How Experimently does it
+### How Controlvar does it
 
 **Secrets, by complete ARN.** The stack imports each secret from the ARN `app.py` validated:
 
@@ -411,7 +417,7 @@ word is exactly six characters long, because that word is then parsed as the suf
 three, `jwt-secret` is the one that fails ("secret" is six characters), and every task needs
 it, so no task would start; `first-superuser-password` and `audit-hmac-key` would resolve.
 (That is also why a check that the complete ARN is right needs a *wrong* suffix as its
-negative control, not a missing one; see the deploying guide.) Nothing can derive the suffix
+negative control, not a missing one; the app's [deployment guide](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/deployment/deployment-guide.md) has the checklist.) Nothing can derive the suffix
 at synth, so the operator supplies it:
 `JWT_SECRET_ARN` and `FIRST_SUPERUSER_PASSWORD_SECRET_ARN` always, `AUDIT_HMAC_KEY_SECRET_ARN`
 for the full profile (it signs the audit log; a core image never reads it, and naming a
@@ -485,7 +491,7 @@ non-secrets, `secrets=` for the rest, a container health check on `/health`:
             ),
             ...
             environment={
-                "APP_ENV": env_name,
+                "APP_ENV": api_app_env(env_name),
                 "PUBLIC_BASE_URL": public_base_url,
                 "LOG_LEVEL": "INFO",
                 "PYTHONUNBUFFERED": "1",
@@ -527,8 +533,11 @@ non-secrets, `secrets=` for the rest, a container health check on `/health`:
         )
 ```
 
-Every environment value is something the application refuses to start without in staging
-or production. `PUBLIC_BASE_URL` (required at synth) is the hostname the API answers on — the
+`APP_ENV` is `prod` in prod and `staging` in every other environment (`api_app_env` in
+`stacks/environments.py`), so a `dev` or `demo` deployment runs the API with staging settings;
+the application reads `prod` as production and `staging` as staging, and both refuse
+placeholder secrets. Every environment value is something the application refuses to start
+without in staging or production. `PUBLIC_BASE_URL` (required at synth) is the hostname the API answers on — the
 `Host` header is attacker-controlled, so the app is told its own name rather than trusting
 the request. `POSTGRES_SERVER` is the Aurora **writer** endpoint; the reader would refuse
 every write. `REDIS_SSL=true` because the replication group refuses plaintext.
@@ -641,7 +650,7 @@ CodeDeploy application `experimentation-platform-<env>` and its deployment group
                 deployment_approval_wait_time=Duration.minutes(30),
                 termination_wait_time=Duration.hours(1),
             ),
-            deployment_config=codedeploy.EcsDeploymentConfig.CANARY_10_PERCENT_5_MINUTES,
+            deployment_config=codedeploy.EcsDeploymentConfig.CANARY_10_PERCENT_15_MINUTES,
             role=codedeploy_role,
             alarms=self.api_5xx_alarms,
             ignore_poll_alarms_failure=False,
@@ -658,8 +667,9 @@ Read it line by line:
 - **`deployment_approval_wait_time`** — CodeDeploy waits up to 30 minutes for the shift to
   be approved. The Deploy workflow approves it itself once every replacement task is healthy
   in green (Part IV); nobody clicks a button in the console.
-- **`CANARY_10_PERCENT_5_MINUTES`** — 10% for 5 minutes, then 100% (to be lengthened to 15
-  minutes before production, as above).
+- **`CANARY_10_PERCENT_15_MINUTES`** — 10% for 15 minutes, then 100% (lengthened from 5, as
+  above). The deploy workflow's shift deadline has to cover it; the synth tests pin the two
+  together.
 - **`termination_wait_time`** — blue stays alive for an hour after the shift.
 - **`alarms`** — `experimentation-api-5xx-blue-<env>` and `experimentation-api-5xx-green-<env>`:
   a breaching minute is at least 5 target 5xx **and** at least 5% of that group's requests;
@@ -726,7 +736,7 @@ runs the five scheduler loops, coordinated by the advisory lock so each tick run
 > does *not* judge: only the 5xx alarms stop it. A release that answers wrongly with a 200,
 > or with fewer errors than the alarm needs, goes to 100% — and because the alarm needs two
 > of three minutes plus metric delay, a bad release is often caught after the shift rather
-> than inside the five minutes.
+> than inside the fifteen minutes.
 
 > **Did You Know?** The stack's `Service.taskDefinition` keeps naming the `bootstrap`
 > revision CloudFormation created, for the life of the service: it can only be changed with
@@ -761,8 +771,8 @@ Then repeat the `MinCapacity` grep with `ENVIRONMENT=staging` (and `/staging/` A
 - One ALB, HTTPS only (80 redirects): `/api/*`, `/health`, `/health/*`, `/metrics` → the
   API's live target group; everything else → the dashboard service. Test listener 8443,
   closed to the internet. You create the DNS alias record.
-- API: Fargate, 1 vCPU / 2 GB, CodeDeploy blue/green — `CANARY_10_PERCENT_5_MINUTES` at the
-  reference commit (to be 15 minutes before production), 30-minute approval wait (approved
+- API: Fargate, 1 vCPU / 2 GB, CodeDeploy blue/green — `CANARY_10_PERCENT_15_MINUTES`,
+  30-minute approval wait (approved
   by the Deploy workflow), blue kept one hour, rolled back automatically by either 5xx alarm.
 - Dashboard: its own ECS service, rolling deploy with circuit breaker, `/healthz`, deployed
   after the API by the same workflow.
@@ -791,7 +801,7 @@ land in a partitioned, gzipped data lake that **Glue** turns into Parquet nightl
 queries; **OpenSearch** indexes events for ad-hoc search. Only Aurora and Redis are on the
 hot path; a failure in the others is an analytics gap, not an outage.
 
-### How Experimently does it
+### How Controlvar does it
 
 **Aurora** — encrypted, in the isolated subnet in prod, sized by environment:
 
@@ -865,10 +875,11 @@ a disposable environment should not leave behind.
 35 days is the most Aurora allows; the value is set explicitly in every environment rather
 than left to CloudFormation's default of 1, and lowering it later discards the older backups.
 *Restoring* from any of these is an incident procedure with its own runbook in the app
-repository (`docs/deployment/disaster-recovery.md`, `docs/deployment/rollback-runbook.md`). Its
-restart step does not work on the CodeDeploy-controlled API service (pending #789), so until
-that is fixed, stop and escalate to whoever owns the environment rather than run it. Part IV
-says when you would reach for it, and this book does not reproduce its commands.
+repository (`docs/deployment/disaster-recovery.md`, `docs/deployment/rollback-runbook.md`).
+The API service is CodeDeploy-controlled, so its restart step is a CodeDeploy deployment that
+names the revision already serving, not an ECS-side forced redeployment; the
+runbook has a section for it. Part IV says when you would reach for the runbook, and this book
+does not reproduce its commands.
 
 **Redis** — a replication group with failover when there's more than one node, encrypted in
 transit and at rest, nightly snapshots:
@@ -1082,7 +1093,7 @@ running `cdk deploy` again.
 target groups?**
 Starts green tasks registered to the (idle) green group; the test listener on 8443 points at
 green; CodeDeploy waits (up to 30 minutes) for the shift to be approved — the Deploy workflow
-approves once green is healthy; 10% of the API's traffic shifts to green for 5 minutes, then
+approves once green is healthy; 10% of the API's traffic shifts to green for 15 minutes, then
 the rest. Throughout, both 5xx alarms are polled; either one in ALARM stops and rolls back.
 Blue stays (idle) for an hour, then is terminated. Next deploy, the roles swap.
 
