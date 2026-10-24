@@ -138,8 +138,8 @@ scheduler were not. Files move; if a path 404s, `git grep` the symbol (e.g.
 `git grep -n "def _hash_user_to_variant"`). The _patterns_ outlast the line numbers.
 
 To re-check a quote yourself, clone [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar)
-at `v0.36.4` and run the repository's `tools/check.sh` gates (see `tools/README.md`) over this
-directory.
+at `v0.36.4`, then point this repository's `tools/check.sh` at it (see `tools/README.md`) to
+re-run the path, snippet and link checks over this book.
 
 _Now turn to [Part I](./part-1-getting-started.md) and start the clock. ⏱️_
 
