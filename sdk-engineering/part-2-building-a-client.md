@@ -4,10 +4,14 @@
 
 [← Part I](./part-1-the-contract.md) · [Contents](./README.md) · [Part III →](./part-3-sixteen-sdks.md)
 
-This Part examines the Python, JavaScript and React implementations of the SDK contract. Hour 4
-covers Python's synchronous transport and thread-safe client. Hour 5 covers JavaScript in Node and
-the browser, including timeouts, concurrent requests and error handling. Hour 6 covers the React
-provider, hooks and server-side rendering entry point, with examples from the two demo applications.
+Part I fixed the semantics. This Part reads three real implementations of them, chosen because
+each one faces a different environment. The Python SDK (Hour 4) is the reference: synchronous,
+dependency-free, thread-safe, with a transport abstraction that makes it testable. The
+JavaScript SDK (Hour 5) has to work in Node and in browsers, where `fetch` has no timeout,
+requests are concurrent by default, and "never reject" needs an escape hatch. The React SDK
+(Hour 6) wraps the same client in a provider and hooks, adds an SSR entry point, and is the
+one two demo apps consume from source — the integration the rest of the platform is judged
+by. Keep `sdk/python/controlvar/`, `sdk/js/src/` and `sdk/react/src/` open as you read.
 
 ---
 
@@ -15,11 +19,14 @@ provider, hooks and server-side rendering entry point, with examples from the tw
 
 ### What & why
 
-The Python SDK separates transport, request handling, caching and result types. The transport
-interface allows HTTP implementations to be replaced in tests or integrations. A shared request
-method handles serialization, response decoding, typed errors and 429 retry. Assignment and flag
-caches use `UserKeyCache`. Frozen dataclasses provide named result fields and value equality without
-allowing callers to mutate the returned records.
+The Python SDK's server mode is a 593-line client plus four small modules — and the four
+modules are the design. **Transport** isolates HTTP so the client can be tested without a network and
+users can swap `urllib` for `requests` or `httpx`. **Request** is one private method that
+turns a `(method, path, body, query)` into decoded JSON or a typed error, with the 429 retry
+in exactly one place. **Cache** is the `UserKeyCache` from Hour 3, twice. **Types** are
+frozen dataclasses so callers get attribute access, equality (the contract smoke compares two
+assignments with `==`) and nothing mutable. (The package on PyPI and on disk is `controlvar`;
+the class is still called `ExperimentationClient`, as it is in every SDK.)
 
 The constraint that shaped it: **no runtime dependencies**. A server-side SDK gets installed
 into applications with their own pinned `requests`/`urllib3`/`httpx` versions; a dependency
@@ -32,13 +39,13 @@ lines: the refresh thread, backoff, `ready()`/`status()`, and the counts it send
 `md5-mod100-v1` bucket). Nothing in this Hour depends on them: a client created without
 `evaluation="local"` never fetches a ruleset.
 
-### How Experimently does it
+### How Controlvar does it
 
 The transport protocol and its default — note the rule that HTTP errors are _responses_,
 not exceptions:
 
 ```python
-# 📁 sdk/python/experimentation/transport.py
+# 📁 sdk/python/controlvar/transport.py
 class Transport(Protocol):
     """Anything with ``send(method, url, headers, body, timeout) -> Response``.
 
@@ -51,7 +58,14 @@ class Transport(Protocol):
 class UrllibTransport:
     """Default transport built on :func:`urllib.request.urlopen` (no third-party deps)."""
 
-    def send(self, method, url, headers, body, timeout) -> Response:
+    def send(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        body: Optional[bytes],
+        timeout: float,
+    ) -> Response:
         request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as raw:  # noqa: S310 - caller-provided URL
@@ -78,8 +92,15 @@ wrong layer.
 The single request method — URL building, JSON, the retry, the error:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
-    def _request(self, method: str, path: str, *, body=None, query=None) -> Any:
+# 📁 sdk/python/controlvar/client.py
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[Mapping[str, Any]] = None,
+        query: Optional[Mapping[str, str]] = None,
+    ) -> Any:
         """Perform one API call and return the decoded JSON body (``None`` if empty).
 
         Retries exactly once on 429, sleeping for ``Retry-After`` (capped at
@@ -109,7 +130,11 @@ The single request method — URL building, JSON, the retry, the error:
         try:
             return response.json()
         except ValueError as exc:
-            raise ExperimentationError(f"{method} {path} returned a non-JSON body", status=response.status, body=response.text()) from exc
+            raise ExperimentationError(
+                f"{method} {path} returned a non-JSON body",
+                status=response.status,
+                body=response.text(),
+            ) from exc
 ```
 
 Two details worth a second look. `urlencode(query, quote_via=quote)` — the default
@@ -121,8 +146,13 @@ attribute — tests replace it with a recorder so a 429 test runs in microsecond
 write:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
-    def get_assignment(self, experiment_key: str, user_id: str, user_attributes=None) -> Assignment:
+# 📁 sdk/python/controlvar/client.py
+    def get_assignment(
+        self,
+        experiment_key: str,
+        user_id: str,
+        user_attributes: Optional[Mapping[str, Any]] = None,
+    ) -> Assignment:
         cached = self._assignments.get(user_id, experiment_key)
         if cached is not None:
             return cached
@@ -165,10 +195,18 @@ read: only a real boolean is taken, so a server that predates the field yields `
 The types:
 
 ```python
-# 📁 sdk/python/experimentation/types.py
+# 📁 sdk/python/controlvar/types.py
 @dataclass(frozen=True)
 class Assignment:
-    """A user's (sticky) variant assignment, from ``POST /api/v1/tracking/assign``."""
+    """A user's (sticky) variant assignment, from ``POST /api/v1/tracking/assign``.
+
+    ``assigned`` is ``True`` when the server enrolled the user and ``False`` when
+    it did not (global holdout, mutual exclusion group or targeting rules) and
+    returned the control variant instead, with no exposure recorded. ``reason``
+    says why: ``"assigned"``, ``"holdout"``, ``"mutual_exclusion"`` or
+    ``"targeting"``. Both are ``None`` when the server predates the fields; such
+    a server cannot tell you, so do not read ``None`` as either answer.
+    """
 
     experiment_key: str
     user_id: str
@@ -202,11 +240,12 @@ And the batch path, with the index arithmetic that keeps error positions meaning
 chunks:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
+# 📁 sdk/python/controlvar/client.py
     def track_batch(self, events: Iterable[Mapping[str, Any]]) -> BatchResult:
         """Send raw track bodies via ``POST /api/v1/tracking/batch`` in chunks of 100. Never raises.
         ...
-        A chunk that fails outright counts every one of its events as a failure; error
+        ``event_type`` defaults to ``event_name`` when missing. A chunk that
+        fails outright counts every one of its events as a failure; error
         ``index`` values are absolute positions in ``events``.
         """
         result = BatchResult()
@@ -218,7 +257,14 @@ chunks:
             except Exception as exc:  # noqa: BLE001 - never raise
                 logger.warning("track_batch chunk starting at %d failed: %s", start, exc)
                 result.failure_count += len(chunk)
-                result.errors.append({"index": start, "count": len(chunk), "status": getattr(exc, "status", None), "error": str(exc)})
+                result.errors.append(
+                    {
+                        "index": start,
+                        "count": len(chunk),
+                        "status": getattr(exc, "status", None),
+                        "error": str(exc),
+                    }
+                )
                 continue
             if isinstance(data, dict):
                 result.success_count += int(data.get("success_count") or 0)
@@ -247,7 +293,7 @@ chunks:
 
 ```python
 >>> import logging; logging.basicConfig(level=logging.DEBUG)
->>> from experimentation import ExperimentationClient
+>>> from controlvar import ExperimentationClient
 >>> c = ExperimentationClient("http://localhost:8000", open("tests/sdk-contract/live/.api_key").read().strip())
 >>> a = c.get_assignment("sdk_contract_ab", "u-hour4", {"country": "US"}); a
 Assignment(experiment_key='sdk_contract_ab', user_id='u-hour4', variant_id='…', variant_name='treatment', is_control=False, configuration=None, assigned=True, reason='assigned')
@@ -259,7 +305,7 @@ FlagEvaluation(key='sdk_contract_flag', enabled=True, config=None, reason='rollo
 True
 >>> c.get_feature_flag("nope", "u-hour4")
 Traceback (most recent call last): ...
-experimentation.types.ExperimentationError: GET /api/v1/feature-flags/evaluate/nope failed with HTTP 404
+controlvar.types.ExperimentationError: GET /api/v1/feature-flags/evaluate/nope failed with HTTP 404
 >>> try: c.get_feature_flag("nope", "u-hour4")
 ... except Exception as e: print(e.status, e.body)
 404 {"detail":"Feature flag with key 'nope' not found"}
@@ -283,25 +329,26 @@ send(self, *a): print(a[0], a[1]); return super().send(*a)`) and watch the cache
 
 ### What & why
 
-The JavaScript SDK supports browsers and Node, which impose different transport constraints.
-Browser `fetch` needs explicit timeout handling through `AbortController`, and initial page renders
-can issue concurrent requests for the same user. Browser cryptography does not provide MD5 through
-`crypto.subtle`; injected `fetch` functions also need the correct binding. Node supplies global
-`fetch` from version 18, while integrations may inject another implementation. An `onError` hook
-makes failures observable for operations such as `track` that do not reject.
+The JS SDK implements the same contract for two hostile-in-different-ways environments.
+**Browsers**: `fetch` has no timeout (you need `AbortController`), a page fires many
+concurrent calls for the same user on first render, `crypto.subtle` has no MD5 and is
+async anyway, and "call `fetch` bound to an object" throws `Illegal invocation`. **Node**: the
+global `fetch` exists from 18 onward but integrators on older runtimes or with `undici`
+wrappers need to inject their own. And in both, `track` "never rejects" means an unhandled
+failure is invisible — so there's an `onError` hook.
 
 The additions over Python, then: an abort-based timeout, **in-flight deduplication** (ten
 components asking for the same flag share one request), a custom `fetch` slot, `onError`,
 and a `Retry-After` parser that also accepts HTTP-dates.
 
-### How Experimently does it
+### How Controlvar does it
 
 The class contract:
 
 ```ts
 // 📁 sdk/js/src/client.ts
 /**
- * Client for the Experimently public API.
+ * Client for the Controlvar public API.
  *
  * - By default (`evaluation: 'server'`) flag evaluation and experiment assignment
  *   are decided by the server. With `evaluation: 'local'` (server-side code only)
@@ -410,21 +457,34 @@ The request — abort timeout, unbound fetch, typed error codes, one retry:
       // Call fetch unbound: binding it to the client breaks browsers ("Illegal invocation").
       const fetchImpl = this.customFetch ?? globalThis.fetch;
       if (typeof fetchImpl !== 'function') {
-        throw new ExperimentationError('No fetch implementation available; pass config.fetch', { code: 'NETWORK_ERROR' });
+        throw new ExperimentationError('No fetch implementation available; pass config.fetch', {
+          code: 'NETWORK_ERROR',
+        });
       }
       response = await fetchImpl(`${this.apiUrl}${path}`, {
         method,
-        headers: { 'X-API-Key': this.apiKey, 'Content-Type': 'application/json', Accept: 'application/json' },
+        headers: {
+          ...(init.headers ?? {}),
+          'X-API-Key': this.apiKey,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
         body: init.body === undefined ? undefined : JSON.stringify(init.body),
         signal: controller.signal,
       });
     } catch (err) {
       if (err instanceof ExperimentationError) throw err;
       if (controller.signal.aborted) {
-        throw new ExperimentationError(`Request timed out after ${this.timeoutMs} ms (${method} ${path})`, { code: 'TIMEOUT', cause: err });
+        throw new ExperimentationError(
+          `Request timed out after ${this.timeoutMs} ms (${method} ${path})`,
+          { code: 'TIMEOUT', cause: err }
+        );
       }
       const message = err instanceof Error ? err.message : String(err);
-      throw new ExperimentationError(`Network error (${method} ${path}): ${message}`, { code: 'NETWORK_ERROR', cause: err });
+      throw new ExperimentationError(`Network error (${method} ${path}): ${message}`, {
+        code: 'NETWORK_ERROR',
+        cause: err,
+      });
     } finally {
       clearTimeout(timer);
     }
@@ -512,7 +572,11 @@ one keyed body or the list:
 // 📁 sdk/js/src/client.ts
   /** Build the wire bodies for one event: a single keyed body, or the fan-out list. */
   private expand(event: TrackEvent): TrackBody[] {
-    const base: TrackBody = { event_type: event.eventType ?? event.eventName, event_name: event.eventName, user_id: event.userId };
+    const base: TrackBody = {
+      event_type: event.eventType ?? event.eventName,
+      event_name: event.eventName,
+      user_id: event.userId,
+    };
     if (event.value !== undefined) base.value = event.value;
     if (event.properties !== undefined) base.metadata = event.properties;
     if (event.timestamp !== undefined) base.timestamp = toIso(event.timestamp);
@@ -580,10 +644,11 @@ for `NETWORK_ERROR`.
 
 ### What & why
 
-A React integration must represent loading, success and failure as state, then update components
-when the result arrives. It also needs a way to share the current user across components. Server-side
-rendering introduces a separate lifetime: `getServerSideProps` has no DOM or component hooks and
-must not share a user's cached state with unrelated requests.
+React changes the shape of the problem. A component can't `await` in render; it needs a
+value _now_ (loading), then a value _later_ (the answer), and it re-renders when either
+changes. The user is app-wide state, not a parameter. And the same code may run on the
+server (Next.js `getServerSideProps`) where there is no DOM, no hooks and no place to keep
+a per-session cache.
 
 The React SDK's answers: a **provider** holds one client and one user; **hooks** wrap each
 contract call in `useState` + `useEffect` with loading/error states and _safe defaults while
@@ -592,7 +657,7 @@ promises for SSR; and the client itself is a browser-flavoured port of the JS cl
 abort + dedupe + per-user cache). ShopLab and StreamPulse consume it from source through a
 path alias, which is how the SDK gets exercised by real UI on every demo run.
 
-### How Experimently does it
+### How Controlvar does it
 
 The provider — one client per config, one context value per user _content_:
 
@@ -616,7 +681,11 @@ export function ExperimentationProvider({ config, user, children }: ProviderProp
     [client, user.userId, attributesKey]
   );
 
-  return <ExperimentationContext.Provider value={value}>{children}</ExperimentationContext.Provider>;
+  return (
+    <ExperimentationContext.Provider value={value}>
+      {children}
+    </ExperimentationContext.Provider>
+  );
 }
 ```
 
@@ -643,7 +712,9 @@ one:
  */
 export function useExperiment(experimentKey: string): ExperimentAssignment {
   const { client, user } = useExperimentation();
-  const [state, setState] = useState<ExperimentAssignment>(() => defaultAssignment(experimentKey, { loading: true }));
+  const [state, setState] = useState<ExperimentAssignment>(() =>
+    defaultAssignment(experimentKey, { loading: true })
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -677,7 +748,10 @@ after success:
 
 ```ts
 // 📁 sdk/react/src/client/ExperimentationClient.ts
-export function defaultAssignment(experimentKey: string, overrides: Partial<Pick<ExperimentAssignment, 'loading' | 'error'>> = {}): ExperimentAssignment {
+export function defaultAssignment(
+  experimentKey: string,
+  overrides: Partial<Pick<ExperimentAssignment, 'loading' | 'error'>> = {}
+): ExperimentAssignment {
   return {
     experimentKey,
     variantKey: 'control',
@@ -714,13 +788,13 @@ The SSR entry point — same calls, never throws, no hooks:
 ```ts
 // 📁 sdk/react/src/ssr/index.ts
 /**
- * SSR utilities for the Experimently React SDK.
+ * SSR utilities for the Controlvar React SDK.
  *
  * Use these utilities in server-side rendering contexts (Next.js getServerSideProps,
  * Remix loaders, etc.) where browser APIs are not available. ServerClient never throws.
  *
  * @example
- * import { ServerClient } from '@getexperimently/react-sdk/ssr';
+ * import { ServerClient } from '@controlvar/react-sdk/ssr';
  *
  * export async function getServerSideProps({ req }) {
  *   const client = new ServerClient({ apiKey: process.env.API_KEY, baseUrl: process.env.API_URL });
@@ -773,7 +847,7 @@ export default function ShopLabApp({ Component, pageProps }: AppProps) {
             <Layout>
               <Component {...pageProps} />
             </Layout>
-            <ExperimentlyPanel />
+            <ControlvarPanel />
           </EventLogProvider>
         </ExperimentationProvider>
       ) : (
@@ -789,7 +863,7 @@ the storefront on the next reload:
 
 ```json
 // 📁 demo/shoplab/tsconfig.json
-      "@getexperimently/react-sdk": [
+      "@controlvar/react-sdk": [
         "../../sdk/react/src/index.ts"
       ]
 ```
@@ -797,7 +871,7 @@ the storefront on the next reload:
 ```js
 // 📁 demo/shoplab/next.config.js
 const ALIAS_TARGETS = {
-  '@getexperimently/react-sdk': SDK_ENTRY,
+  '@controlvar/react-sdk': SDK_ENTRY,
   // Force a single React copy. ...
   react: path.resolve(__dirname, 'node_modules/react'),
   'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
@@ -824,9 +898,9 @@ And the demo's own tests mock the SDK at the package name, with setters for the 
 needs and a `trackEventMock` to assert on — the pattern for any app that consumes the SDK:
 
 ```tsx
-// 📁 demo/shoplab/src/__mocks__/experimently-sdk.tsx
+// 📁 demo/shoplab/src/__mocks__/controlvar-sdk.tsx
 /**
- * Manual mock of `@getexperimently/react-sdk` for jest.
+ * Manual mock of `@controlvar/react-sdk` for jest.
  *
  * jest.config.js maps the package name here, so pages/components under test get these
  * hooks instead of the real provider. Tests configure return values with `__setExperiment`,
@@ -852,7 +926,7 @@ cd sdk/react && npm test -- --silent > /tmp/react-sdk-tests.txt 2>&1; tail -5 /t
 cd ../../demo/shoplab && npm run dev                          # http://localhost:3200
 ```
 
-Open the storefront, open the **Experimently panel** (it uses `useExperiment` ×4 and
+Open the storefront, open the **Controlvar panel** (it uses `useExperiment` ×4 and
 `useFeatureFlag` ×2), and in DevTools' Network tab watch: four `/assign` and two `/evaluate`
 calls on first load, none on navigation (cached), and one `/batch` with six entries when you
 complete a checkout. Then change the visitor's attributes in localStorage and reload — the
@@ -941,7 +1015,7 @@ provider also mounts.
 
 ```python
 import requests
-from experimentation.transport import Response, TransportError
+from controlvar.transport import Response, TransportError
 
 class RequestsTransport:
     def __init__(self): self._s = requests.Session()

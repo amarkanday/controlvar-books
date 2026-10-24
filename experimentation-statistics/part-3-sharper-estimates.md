@@ -4,13 +4,14 @@
 
 [← Part II](./part-2-sequential.md) · [Contents](./README.md) · [Part IV →](./part-4-many-comparisons.md)
 
-CUPED, Bayesian analysis and multi-armed bandits address different requirements. CUPED uses
-pre-experiment observations to reduce variance. Bayesian analysis estimates probabilities and
-expected loss under a specified model. A bandit changes traffic allocation as outcomes arrive.
-Hours 7–9 describe each method, its implementation and the assumptions needed to interpret it.
-
-The final section covers warehouse analysis from per-variant summary statistics, without moving
-raw observations out of the warehouse.
+Part I asked "is there a difference?"; Part II asked "when may I look?". This Part asks
+three sharper questions. Can pre-experiment data make the same users tell you more — CUPED
+(Hour 7)? Can we answer the question the product manager actually asked, "what's the
+probability B is better, and what do I lose if I'm wrong?" — the Bayesian analysis (Hour 8)?
+And can the experiment _optimise while it runs_, sending more users to the better arm —
+bandits, and what that costs in inference (Hour 9)? The Part ends with the warehouse
+analysis, which computes the same results from per-variant sums without the raw rows ever
+leaving the warehouse.
 
 ---
 
@@ -18,10 +19,11 @@ raw observations out of the warehouse.
 
 ### What & why
 
-Metric variance affects both confidence-interval width and sample-size requirements. Users differ
-in spending, activity and conversion propensity for reasons unrelated to treatment. Pre-experiment
-observations can explain some of this variation. CUPED uses that information to adjust the outcome
-and compare residual variation between arms.
+The width of every interval and the size of every sample-size requirement is driven by one
+thing: the **variance** of the metric. Users differ enormously in how much they spend, how
+often they visit, how likely they are to convert — and most of that variation has nothing
+to do with the treatment. If you knew, for each user, what they were _going to do anyway_,
+you could subtract it and compare only the residual.
 
 **CUPED** (Controlled-experiment Using Pre-Experiment Data; Deng, Xu, Kohavi & Walker, 2013)
 does exactly that with a covariate X measured _before_ the experiment — last month's spend,
@@ -43,9 +45,17 @@ percentile so a single $10,000 order doesn't dominate the variance. It changes t
 slightly (you're now measuring "revenue capped at the 99th percentile") in exchange for a
 usable interval.
 
-### How Experimently does it
+### How Controlvar does it
 
-The primitives — θ from the control group, applied to both:
+There are two layers, and it pays to keep them apart. The first is a small teaching library,
+`CupedService`, which does CUPED on raw per-user arrays. The second is the estimator behind the
+`GET /results/{id}/cuped` route, which works from per-arm sums. The route does not call the
+library; the library is still worth reading because it is the method in its plainest form, and
+the Try It runs it.
+
+#### The library primitives
+
+θ from the control group, applied to both:
 
 ```python
 # 📁 backend/app/services/cuped_service.py
@@ -81,12 +91,12 @@ The primitives — θ from the control group, applied to both:
         return Y - theta * (X - E_X)
 ```
 
-Estimating θ on **control only** is a deliberate conservative choice: the treatment might
-change the Y–X relationship, and a θ fit on pooled data could then leak a little treatment
-effect into the adjustment. Control-only θ can't. `E[X]` is taken from the pooled data,
+Estimating θ on **control only** is a deliberate conservative choice in the library: the
+treatment might change the Y–X relationship, and a θ fit on pooled data could then leak a little
+treatment effect into the adjustment. Control-only θ can't. `E[X]` is taken from the pooled data,
 which is correct because X is pre-treatment and its mean is the same in both arms.
 
-The full pipeline, with the variance-reduction number the API reports:
+The full pipeline, with the variance-reduction number it reports:
 
 ```python
 # 📁 backend/app/services/cuped_service.py
@@ -118,16 +128,6 @@ The full pipeline, with the variance-reduction number the API reports:
         adj_control_mean = float(control_Y_adj.mean())
         adj_treatment_mean = float(treatment_Y_adj.mean())
         adjusted_effect = adj_treatment_mean - adj_control_mean
-
-        # Step 5: Pooled SE (Welch-style — different group sizes / variances)
-        var_c = float(np.var(control_Y_adj, ddof=1)) if n_c > 1 else 0.0
-        var_t = float(np.var(treatment_Y_adj, ddof=1)) if n_t > 1 else 0.0
-        se = math.sqrt(var_c / n_c + var_t / n_t) if (n_c > 0 and n_t > 0) else 0.0
-        se = max(se, 1e-12)  # guard against division-by-zero below
-
-        # Step 6: Two-tailed z-test
-        z_stat = adjusted_effect / se
-        p_value = float(2.0 * (1.0 - stats.norm.cdf(abs(z_stat))))
         ...
         # Step 7: Variance reduction percentage (control group)
         var_original = float(np.var(control_Y, ddof=1)) if n_c > 1 else 0.0
@@ -154,32 +154,77 @@ Winsorization:
         return np.clip(values, a_min=None, a_max=upper)
 ```
 
-#### What the platform's CUPED route does today (beta)
+#### What the platform's CUPED route does
 
-The primitives above are correct, and the Try It exercises them on real covariates. The
-route that applies them to an experiment, `GET /results/{id}/cuped`, is **beta** — its
-response carries `analysis_status: "beta"` and an `analysis_notice`, and the route is marked
-`x-stability: beta` — because it does not have a pre-experiment covariate to feed them yet
-(issue #217):
+The route, `GET /results/{id}/cuped`, answers the question for an experiment with real data. Its
+numbers are labelled `ga` in the analysis-status table (Part IV Hour 12); the route itself stays
+`x-stability: beta` while its response shape is still being settled, so read the contract before
+you build on it. Older copies of this book described a placeholder covariate (each user's
+position in assignment order) that reduced almost no variance. That is gone: the covariate is now
+each user's own history.
 
-- **Y** is each assigned user's conversion (1 if they are a converting user, else 0),
-  matched like every other analysis path.
-- **X is each user's position in assignment order** (`np.arange(n)`), a placeholder, not a
-  pre-experiment metric. It is unrelated to the outcome, so θ is noise and
-  `variance_reduction_pct` is close to 0: the adjusted estimate is close to the unadjusted
-  one, as the notice says.
-- Only the control and the **first** treatment variant are analysed, and the interval is
-  always 95% (the route passes no α).
-- The experiment's `variance_reduction_config` has `method` (`none`, `cuped`, `cuped_plus`,
-  `winsorization`), `covariate_metric_id`, `covariate_lookback_days` and
-  `winsorization_percentile`. The covariate fields are stored but not read. `none` means
-  θ is exactly 0 and the reduction exactly 0; `winsorization` clips Y and then runs the same
-  proxy adjustment; `cuped_plus` runs the same proxy CUPED as `cuped`.
-- `CupedService.apply_cuped_ratio` returns `mean(Y_num) / mean(Y_den)` and ignores X
-  entirely; the route never calls it. There is no working ratio-metric CUPED (CUPED++) yet.
+- **Y** is whether the user is a converting user, matched like every other analysis path
+  (`converting_user_ids`, Part I Hour 2). The route analyses **proportion (conversion) metrics**;
+  any other metric type is listed with `unavailable_reason: "not_a_proportion_metric"`.
+- **X** is a 0/1 covariate: whether the user sent the covariate event in the
+  `covariate_lookback_days` before their assignment. The event is the metric's own `event_name`,
+  or that of the metric named by `covariate_metric_id`. The read is guarded twice, in
+  `covariate_user_ids`:
 
-So: learn the method from this Hour, use the primitives on your own data, and do not read
-a variance reduction off the platform's CUPED route until #217 lands.
+  ```python
+  # 📁 backend/app/services/event_matching.py
+              if assigned - lookback <= happened < assigned and received_at < assigned:
+                  found.add(user_id)
+  ```
+
+  The event must have _happened_ in `[assigned_at − lookback, assigned_at)` (an event at the
+  moment of assignment is not history), **and** the server must have _received_ it before the
+  assignment (`events.updated_at`). History sent after the user was assigned is not read for that
+  user, so a client that back-fills "old" events cannot leak the treatment into the covariate.
+- **The estimator is a regression, from sums.** `cuped_metric_result`, in
+  `sufficient_stats_analysis.py`, fits `y ~ C(arm) + x` by ordinary least squares using five sums
+  per arm (`n`, Σy, Σx, Σy², Σx², Σxy). So a caller with the same sums from somewhere else — a
+  warehouse — gets the same numbers. The key lines:
+
+  ```python
+  # 📁 backend/app/services/sufficient_stats_analysis.py
+      pooled_sxx = sum(a.sxx for a in parsed)
+      pooled_sxy = sum(a.sxy for a in parsed)
+      scale = max(1.0, sum(abs(a.sum_x) for a in parsed))
+      theta = pooled_sxy / pooled_sxx if adjust and pooled_sxx > 1e-12 * scale else 0.0
+  ```
+
+  and, per arm, `adjusted_mean = y_mean - theta * (x_mean - x_grand)`. Note what differs from the
+  library: θ is the **pooled within-arm slope over every arm**, not the control's alone. That
+  is the regression's own coefficient on `x`, and it makes the adjusted means comparable. The
+  price is the one the library avoided: an arm whose own Y–X relationship differs can come out
+  _noisier_ after adjustment, so `variance_reduction_pct` **can be negative**, and adding an arm
+  changes the other arms' adjusted effects.
+- **Judging.** The effect is the treatment's adjusted mean minus the control's, with a
+  two-sided z-test and an interval at the experiment's stored `confidence_level`;
+  `corrected_p_value` applies its stored `correction_method` across the metric's treatments
+  (Part IV Hour 10). `variance_reduction_pct` is
+  `100 · (1 − Var(adjusted effect) / Var(unadjusted effect))`.
+- **Reasons, not guesses.** A comparison that cannot be computed is listed with
+  `unavailable_reason` and null numbers: `fewer_than_2_units`, `no_variation` (neither arm's
+  outcome varies), `no_residual_variation` (the covariate explains everything, so the standard
+  error would be 0 and a p-value would claim certainty the data cannot give),
+  `no_control_variant`, `no_treatment_variant`, `covariate_metric_not_found`,
+  `metric_has_no_event_name`, `result_invalid`. When nobody has covariate events, or everybody
+  does, X does not vary within any arm and θ is exactly 0: the adjusted numbers equal the
+  unadjusted ones. `covariate_coverage_pct` tells you how many of the comparison's users had
+  any covariate event; a low figure is your warning that CUPED has little to work with.
+- **The config** is the experiment's `variance_reduction_config`: `method` (`none`, `cuped`,
+  `cuped_plus`, `winsorization`), `covariate_metric_id`, `covariate_lookback_days` (1–90,
+  default 7) and `winsorization_percentile` (50–100, default 99). `none` means θ is exactly 0.
+  `cuped_plus` is computed as `cuped` and each row's `method` says `cuped`. `winsorization`
+  clips outcomes, which only makes sense for mean metrics, and the route analyses proportions
+  only: it lists each proportion metric as `winsorization_needs_mean_metric` rather than clipping
+  a 0/1 outcome to zero.
+- Only the **API** carries it. The dashboard shows no CUPED figure.
+
+`CupedService.apply_cuped_ratio` (a ratio-metric variant that ignores X) and the other library
+helpers are not called by any route; there is no working ratio-metric CUPED (CUPED++) yet.
 
 **Post-stratification** (`post_stratification_service.py`) is the sibling technique:
 instead of a continuous covariate, stratify users by a categorical one (platform, country)
@@ -190,18 +235,21 @@ its per-user rows from an experiment's assignments and events yet, so
 existing experiment (404 for an unknown one, 422 for a malformed body). It used to answer
 with numbers generated at random (issue #443); the 501 replaced them.
 
-> **Watch Out!** Measure X before assignment. A value observed during the experiment, such as
-> sessions that week, may itself be affected by treatment. Adjusting for it can introduce bias.
-> A covariate with no variance or no outcome correlation provides no useful variance reduction.
-> At this book's reference commit, the beta route's placeholder covariate has that limitation.
+> **Watch Out!** X must be measured **before** assignment. A "covariate" observed during the
+> experiment (sessions this week) can be affected by the treatment, and adjusting on it
+> _introduces_ bias — the classic post-treatment-adjustment mistake. A zero-variance or
+> uncorrelated X gives θ ≈ 0 and no reduction, which is the honest outcome. The route's
+> `received_at < assigned` guard exists for exactly this reason.
 
 > **Did You Know?** New users have no pre-period data. The usual treatment is to give them
 > the covariate mean, so their adjustment is zero — they still count, they just don't
-> benefit. A product with mostly new users gets little from CUPED; a product with returning
-> users gets a lot. (The platform's route reads no pre-period data, so this is method, not
-> platform behaviour; the dashboard shows no CUPED or variance-reduction figure.)
+> benefit. The route's 0/1 covariate does this naturally: a user with no history has X = 0. A
+> product with mostly new users gets little from CUPED (look at `covariate_coverage_pct`); a
+> product with returning users gets a lot.
 
 ### Try It Yourself
+
+The library, on continuous data:
 
 ```python
 >>> import numpy as np
@@ -225,20 +273,50 @@ with numbers generated at random (issue #443); the 501 replaced them.
 A 56% variance reduction shrinks the standard error from 0.451 to 0.300 — the same as
 running with about 2.3 times the users. Then replace X with something unrelated
 (`X2 = rng.normal(size=2*n)`, continuing the same generator): θ is noise (0.29 here, tiny on
-a Y whose standard deviation is about 27) and the reduction is 0.02% — what the beta route's
-assignment-order covariate gives you.
+a Y whose standard deviation is about 23) and the reduction is 0.02% — what a covariate with
+no relationship to the outcome gives you.
+
+Now the estimator the route uses, on a 0/1 covariate ("bought in the 7 days before assignment")
+and a 0/1 outcome ("bought during the test"), from sums:
+
+```python
+>>> import numpy as np
+>>> from backend.app.services.sufficient_stats_analysis import cuped_metric_result, BinomialVariant
+>>> class M: id = "m"; name = "purchase"; is_primary = True
+>>> C, T = BinomialVariant("c", "control", True), BinomialVariant("t", "treatment", False)
+>>> rng = np.random.default_rng(21)
+>>> def arm(n, lift):
+...     x = rng.random(n) < 0.30                                  # past buyers
+...     y = rng.random(n) < np.where(x, 0.30, 0.04) + lift       # past buyers convert far more often
+...     x, y = x.astype(float), y.astype(float)
+...     return n, y.sum(), x.sum(), (y * y).sum(), (x * x).sum(), (x * y).sum()
+>>> nC, *sc = arm(20000, 0.0); nT, *st = arm(20000, 0.01)
+>>> for adjust in (False, True):
+...     r = cuped_metric_result([(C, nC, *sc), (T, nT, *st)], 0.95, "none", metric=M, adjust=adjust)[0]
+...     print(adjust, round(r["adjusted_effect"], 4), round(r["adjusted_se"], 5), r["theta"], round(r["variance_reduction_pct"], 1))
+False 0.0116 0.00325 0.0 0.0
+True 0.0101 0.00302 0.26... 13.4
+```
+
+Two things to notice. The standard error falls from 0.00325 to 0.00302 (13.4% less variance): a
+binary covariate that only half-explains a rare outcome buys a modest reduction. And the
+_estimate_ moved, from 0.0116 to 0.0101, because the two arms drew slightly different shares of
+past buyers by chance; CUPED corrects for that imbalance as well as for noise, which is a second
+reason it is worth having. The `adjust=False` row, with `theta == 0.0` and the unadjusted numbers, is what
+`method: "none"` produces.
 
 ### Key takeaways
 
-- CUPED: `Y − θ(X − E[X])`, θ = Cov/Var on control, X strictly pre-experiment; same mean,
-  variance × (1 − ρ²).
-- The pipeline reports the adjusted effect, SE, p, CI and the variance-reduction
-  percentage.
-- The platform's `/cuped` route is beta: its covariate is a placeholder (assignment order),
-  so it reduces almost no variance; ratio CUPED is not implemented; the dashboard shows no
-  CUPED figure.
-- Winsorize heavy tails (changes the estimand slightly); post-stratification for
-  categorical covariates — whose route answers 501 until it has real per-user rows.
+- CUPED: `Y − θ(X − E[X])`, X strictly pre-experiment; same mean, variance × (1 − ρ²).
+- The library (`CupedService`) fits θ on the control only and works on arrays; the route fits
+  the regression `y ~ C(arm) + x` from per-arm sums, with θ pooled within arms, so
+  `variance_reduction_pct` can be negative.
+- On the platform X is a 0/1 flag: did the user send the covariate event in the
+  `covariate_lookback_days` before assignment, and did the server receive it before the user was
+  assigned. Only proportion metrics are analysed; the numbers are `ga`, the route is
+  `x-stability: beta`, and the dashboard shows no CUPED figure.
+- Winsorize heavy tails (changes the estimand slightly); post-stratification for categorical
+  covariates — whose route answers 501 until it has real per-user rows.
 - Adjusting on a post-treatment variable introduces bias — X must be pre-experiment.
 
 ---
@@ -247,10 +325,12 @@ assignment-order covariate gives you.
 
 ### What & why
 
-Bayesian analysis estimates the uncertainty in each arm's conversion rate θ as a probability
-distribution and updates it with observed data. Under the chosen model and prior, this supports
-quantities such as the probability that treatment is better than control and the expected loss
-from choosing an arm. These quantities answer different questions from a frequentist p-value.
+A frequentist p-value answers a question nobody asked ("how surprising is this data if
+nothing's going on?"). A product manager asks: **what's the probability B is better than A,
+and how much do I stand to lose if I pick wrong?** Bayesian analysis answers those directly by
+treating each arm's conversion rate θ as uncertain, expressing that uncertainty as a
+distribution, and updating it with data. The answers are only as good as the model and the
+prior behind them, which is why this Hour spends time on both.
 
 For conversion rates the maths is a gift: the **Beta** distribution is _conjugate_ to the
 binomial, so if the prior on θ is Beta(α, β) and you observe c conversions in n trials, the
@@ -264,14 +344,16 @@ From the posteriors, three quantities (the first two by Monte Carlo — the resu
 - **Probability to be best (PtBB)** — the fraction of draws in which arm i has the highest θ.
 - **Expected loss** — E[max_j θ_j − θ_i]: how much conversion rate you expect to give up by
   choosing arm i. A tiny expected loss means "even if i isn't best, it's nearly best."
-- **Credible interval** — the central 95% of the posterior: an interval that _is_ "95%
-  probability the true rate is in here," which a confidence interval is not.
+- **Credible interval** — the central 95% of the posterior (the 2.5th to 97.5th percentile; it
+  is _equal-tailed_, not the highest-density interval, and the two differ on a skewed
+  posterior): an interval that _is_ "95% probability the true rate is in here," which a
+  confidence interval is not.
 
 Plus a **stopping rule** built on probability to be best, expected loss and a ROPE (region
 of practical equivalence), and — as a library function the API does not call — a **Bayes
 factor** (Savage–Dickey) summarising evidence for a point null.
 
-### How Experimently does it
+### How Controlvar does it
 
 The conjugate update and the credible interval:
 
@@ -483,11 +565,13 @@ the recommendation and ends the experiment.
 `bayesian_enabled: true` on create or update, with an optional `bayesian_config` (omitted,
 the default `BayesianConfig` is stored). A cloned experiment keeps its analysis settings.
 
-> **Watch Out!** Prior assumptions have more influence with small samples. Beta(1, 1) is uniform
-> over conversion rates, even when historical rates suggest a much narrower range. A prior such
-> as Beta(4, 96) represents a mean near 4%, but its use should be justified by relevant prior data.
-> The `alpha` and `beta` configuration fields allow this choice. Document the prior and consider
-> how sensitive an early probability-to-be-best estimate is to it.
+> **Watch Out!** The prior matters at small n. Beta(1, 1) is "uninformative" but it's still
+> a claim that a 90% conversion rate is as plausible as 4%; with 20 users it pulls the
+> posterior toward 50%. For a mature product, an informative prior (Beta(4, 96) for a ~4%
+> baseline, say) can be more honest and makes early PtBB numbers less excitable — provided you
+> can justify it from real prior data, and write it down. The `alpha`/`beta` config fields exist
+> for this; the default is a placeholder, so check how sensitive an early probability-to-be-best
+> is to the choice.
 
 > **Did You Know?** Bayesian methods don't have a "peeking problem" in the frequentist
 > sense — the posterior is what it is at every look. But a _stopping rule_ on the posterior
@@ -496,8 +580,9 @@ the default `BayesianConfig` is stored). A cloned experiment keeps its analysis 
 > `backend/tests/unit/stats_validation/test_bayesian_stop_winner.py` holds it there across
 > base rates of 1%, 10% and 50%. Look every day and act on the first `STOP_WINNER`, and the
 > rate inflates exactly as Part II Hour 4 describes. If you will peek, the mSPRT is the
-> peeking-safe verdict. (The Bayesian results are API-only; the dashboard shows neither them
-> nor the decision.)
+> peeking-safe verdict. (The dashboard shows the Bayesian block, with its decision, at the end of
+> the Overview tab for the primary metric, and adds an SRM qualifier when the sample-ratio check
+> has failed; the numbers are the ones `GET /results/{id}/bayesian` returns.)
 
 ### Try It Yourself
 
@@ -549,8 +634,9 @@ And the A/A calibration in miniature — two identical arms at 1%, 5,000 users e
 - Stopping: `STOP_WINNER` when the leader's P(best) ≥ 0.975 (fixed) **and** its expected
   loss < `loss_threshold`; `STOP_EQUIVALENT` when every arm is within the ROPE with > 95%
   probability; otherwise `CONTINUE`. 100,000 draws per variant in the API.
-- The decision is a recommendation recorded on the experiment; nothing acts on it, and the
-  dashboard does not show it. The Bayes factor is a library function the API does not fill.
+- The decision is a recommendation recorded on the experiment; nothing acts on it. The
+  dashboard shows it on the Overview tab. The Bayes factor is a library function the API does
+  not fill.
 - The prior matters at small n; enable the analysis with `bayesian_enabled` and
   `bayesian_config`.
 
@@ -560,11 +646,12 @@ And the A/A calibration in miniature — two identical arms at 1%, 5,000 users e
 
 ### What & why
 
-A fixed-allocation A/B test keeps its planned traffic split while estimating treatment effects.
-A multi-armed bandit updates allocation as outcomes arrive, directing more traffic toward arms
-with promising results. Adaptive allocation can improve outcomes during the run, but it also changes
-the sampling process. Ordinary fixed-allocation comparisons need additional care, and allocation
-imbalance is expected rather than necessarily indicating a routing defect.
+An A/B test spends the whole run showing half the users the worse variant, so that at the
+end you _know_ which is better. A **multi-armed bandit** spends the run learning _and_
+exploiting: it shifts traffic toward arms that look better as evidence accumulates, so fewer
+users see the loser. The price is inference: the arms are no longer exchangeable (later
+users are routed by earlier outcomes), so the clean causal estimate an A/B test gives is
+gone, and a skewed traffic split is expected rather than alarming.
 
 Three algorithms, one interface (`compute_weights(variant_stats) → {variant_id: weight}`):
 
@@ -577,7 +664,7 @@ Three algorithms, one interface (`compute_weights(variant_stats) → {variant_id
 - **ε-greedy** — the simplest: the empirically best arm gets `1 − ε + ε/n`, every other arm
   `ε/n`. Deterministic; explores a fixed fraction forever.
 
-### How Experimently does it
+### How Controlvar does it
 
 Thompson Sampling — the posterior per arm, then the Monte Carlo from Hour 8 used as a
 policy:
@@ -739,26 +826,43 @@ And `/tracking/assign` routes _new_ users by those weights — deterministically
 sticky rows still winning (Build book Day 4):
 
 ```python
-# 📁 backend/app/api/v1/endpoints/tracking.py
-def _select_bandit_variant(experiment: Experiment, bandit_state: Optional[BanditState], user_id: str) -> Optional[uuid.UUID]:
-    """Pick a variant for a *new* user according to the bandit weights.
+# 📁 backend/app/services/bandit_routing.py
+def pick_variant(weighted: WeightedVariants, experiment_id: str, user_id: str) -> Optional[uuid.UUID]:
+    """Deterministic pick from *weighted* for ``(user_id, experiment_id)``.
 
-    Deterministic per ``(user_id, experiment.id)``: the user is hashed into a
-    bucket in ``[0, 1)`` and the bucket is looked up in the cumulative
-    distribution of the normalised weights, so repeated calls for the same
-    user return the same variant before the sticky assignment row exists.
+    The user is hashed into a bucket in ``[0, 1)`` and the bucket is looked up
+    in the cumulative distribution of the normalised weights, so repeated calls
+    for the same user return the same variant before the sticky assignment row
+    exists.
     """
+    total = sum(w for _, w in weighted)
+    ...
+    bucket = int(digest, 16) % 10_000 / 10_000
+
+    cumulative = 0.0
+    for variant_id, weight in weighted:
+        cumulative += weight / total
+        if bucket < cumulative:
+            return variant_id
 ```
+
+`/tracking/assign` (and its batch form) build a `bandit_chooser` once per request, which reads
+`BanditState` once and returns a function of the user id over plain values; a batch of N users
+reads the weights once. A fixed-allocation experiment, or one with no state or only zero
+weights, answers `None` and falls back to the ordinary traffic-allocation hashing. A variant
+whose weight is zero or missing receives no traffic.
 
 #### What a bandit costs you
 
-Adaptive allocation affects how per-arm conversion rates should be interpreted. Later allocation
-depends on earlier outcomes, and time-varying user populations can reach arms in different
-proportions. Thompson Sampling provides exploration but does not remove every inference concern.
-Bandits are useful when improving outcomes during the run matters more than obtaining a
-fixed-allocation effect estimate, such as a short promotion or an ongoing optimization. When the
-goal is a causal effect estimate for a later decision, use an appropriate experimental design and
-analysis rather than interpreting the raw bandit rates as an ordinary A/B result.
+Say it plainly, because the results page can't: **a bandit's per-arm conversion rates are
+biased estimates.** Users routed later are routed _because_ of earlier outcomes; if an arm
+had a lucky start it gets more traffic and its later (regression-to-the-mean) users pull its
+rate down — or a temporal effect (weekend vs weekday) lands unevenly across arms. Thompson
+Sampling's exploration mitigates this but doesn't eliminate it (E3.5 measures it). The honest
+uses of a bandit: (1) a short-lived decision where optimising during the run matters more than
+knowing the effect size afterwards (a promotion banner this week); (2) many arms where an A/B
+test's equal split would waste most users on bad options; (3) an always-on optimisation that
+never needs a report. For a decision you'll cite in a quarterly review, run an A/B test.
 
 > **Watch Out!** Because a bandit is _supposed_ to drift from the configured split, the SRM
 > check is skipped for `optimization_type != "fixed"`. That also means the one exchangeability
@@ -831,7 +935,7 @@ floating point. The fix is to **centre** first: pick k (the grand mean), and hav
 warehouse return Σ(y − k) and Σ(y − k)². Comparisons use the centred means, in which k
 cancels; k is added back only for the reported mean and interval.
 
-### How Experimently does it
+### How Controlvar does it
 
 This is the **full profile** (`modules/`), and the warehouse routes
 (`/api/v1/warehouse/analysis/...`) are `x-stability: beta` — the request and response shapes
@@ -853,7 +957,8 @@ may still change. The numbers themselves come from the core estimators in
   a p-value. A run also refuses on `no_units`, `join_key_mismatch`,
   `too_many_variant_values` and `timezone_not_utc`, and a failed run never reports numbers.
 - **SRM** is computed with the same `compute_srm` as Part I Hour 1 (skipped for adaptive
-  allocation), and the warehouse run results view is the one dashboard screen that shows it.
+  allocation), and the warehouse run results view shows it, as the core results page does for
+  `/results`.
 
 ```python
 >>> import numpy as np
@@ -885,10 +990,13 @@ holds the function to an exact reference.
 
 ## Part III Workshop
 
-**Q1. Why is θ estimated on the control group only?**
+**Q1. Why does the `CupedService` library estimate θ on the control group only, and what does
+the route do differently?**
 The treatment might change the Y–X relationship; a pooled θ could then absorb part of the
 treatment effect into the adjustment. Control-only θ can't bias the effect, only reduce
-noise.
+noise. The route instead fits the regression `y ~ C(arm) + x` and uses the pooled within-arm
+slope over every arm, which keeps the adjusted means comparable at the cost that
+`variance_reduction_pct` can come out negative.
 
 **Q2. A covariate measured during the experiment has ρ = 0.8 with the outcome. Should you
 CUPED on it?**
@@ -919,11 +1027,13 @@ B's probability to be best is 0.90, below the fixed 0.975 floor; both conditions
 And no: the decision is a recommendation recorded on the experiment. Nothing stops an
 experiment on it — a person does.
 
-**Q8. Your `/cuped` response shows `variance_reduction_pct: 0.3`. Is CUPED useless for your
-product?**
-You can't tell from that. The route is beta: its covariate is each user's assignment order,
-not a pre-experiment metric, so ~0 is what it always reports (`analysis_notice` says so). Run
-`compute_cuped_effect` on a real pre-period covariate to find out.
+**Q8. Your `/cuped` response shows `variance_reduction_pct: 0.3` and `covariate_coverage_pct:
+2`. Is CUPED useless for your product?**
+Not necessarily. Only 2% of the comparison's users had any covariate event in the lookback
+window, so there is almost nothing to adjust on: the product may have mostly new users, or the
+covariate event may be the wrong one (try a different `covariate_metric_id`, or a longer
+`covariate_lookback_days`). A reduction near 0 with high coverage would be the sign of a covariate
+that simply does not predict the outcome.
 
 **Quiz.** Thompson weight for an arm with Beta(1, 1) among arms with Beta(41, 961) and
 Beta(53, 949)?
@@ -1029,9 +1139,9 @@ for day in range(20):
 ```
 
 With `default_rng(9)`: a 3.82% on 9,562 users, b 3.94% on 30,422, final weights 0.31 / 0.69
-— a 76/24 traffic split between two identical arms. Repeat over 200 seeds and the pattern is
-systematic: the arm that ends with more traffic averages 4.05% and 72% of the users, the
-starved arm 3.81%. The mechanism is in the starved arm: an arm that has an unlucky start
+— a 76/24 traffic split between two identical arms. Repeat over 200 runs (`default_rng(1000 +
+seed)` for each, the same loop) and the pattern is systematic: the arm that ends with more
+traffic averages 4.04% on 71.5% of the users, the starved arm 3.80%. The mechanism is in the starved arm: an arm that has an unlucky start
 loses traffic, so its low estimate is corrected slowly, while an arm that has a lucky start
 keeps getting users who pull its rate back toward the truth. Both reported rates are
 biased, in opposite directions — which is why bandit rates are unfit for reporting an

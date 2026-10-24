@@ -4,13 +4,13 @@
 
 [← Back to Contents](./README.md)
 
-A conversion-rate comparison depends on three things: a valid allocation of users, a suitable
-statistical test, and enough observations to detect an effect worth acting on. This Part covers
-those requirements in order. Hour 1 explains randomisation and the sample-ratio mismatch check.
-Hour 2 covers tests and confidence intervals for conversion rates. Hour 3 introduces power and
-sample-size planning, including the platform's minimum-sample-size check.
-
-The examples use SciPy. Run them in a Python shell as you work through the calculations.
+Three hours on the bedrock. A conversion-rate comparison stands on three things: users who were
+really allocated at random, a test that suits the data, and enough observations to see an effect
+worth acting on. Why randomisation is the whole point and how the platform checks that it actually
+happened (Hour 1); the tests and intervals behind a conversion-rate comparison and the labels the
+dashboard puts on them (Hour 2); and power — the number that tells you how many users a decision
+needs and the gate that stops a lucky early result from shipping (Hour 3). Keep a Python shell
+with `scipy` open; every formula here is one line away from a number.
 
 ---
 
@@ -18,32 +18,47 @@ The examples use SciPy. Run them in a Python shell as you work through the calcu
 
 ### What & why
 
-An A/B test assigns units, usually users, to variants through a randomisation procedure. With
-valid assignment and no other systematic differences introduced by the experiment, the groups are
-comparable in expectation before treatment. This property supports interpreting an outcome
-difference as a treatment effect. The implementation uses a deterministic hash of the user's ID
-to produce stable allocations.
+Picture a checkout test whose dashboard says "+8%, p = 0.01", and a week later the lift is gone.
+Nobody lied; the allocation had quietly gone wrong — say a redirect only the treatment page
+triggered, so users who bounced before it loaded were never counted in that arm — and the p-value
+was computed, correctly, on two groups that were no longer comparable. Controlvar's answer is a
+check that sits above every tab of the results page and, since a failed check overrides the
+recommendation, can stop the page telling you to ship. This hour is about that check and the idea
+behind it.
 
-The statistical comparison depends on that design. A routing defect that sends a particular user
-population to one arm, uneven collection loss or an adaptive allocation policy can change the
-sampling process. Calculating a p-value does not detect or correct every such problem. Check the
-assignment and collection path before interpreting the test.
+An A/B test is a **randomised controlled experiment**: users are assigned to variants by a
+process that has nothing to do with them — a deterministic hash of their id, which also keeps
+each user's variant stable — so the groups are, in expectation, identical in every way except the
+treatment. That property is **exchangeability**, and it is what turns a difference in conversion
+rates into evidence about the treatment rather than about who happened to land in which group.
 
-A sample-ratio mismatch (SRM) check compares observed allocation counts with the configured split.
-For example, a 50/50 experiment with counts of 6,043 and 5,712 has assigned 51.4% of 11,755 users
-to one arm. A chi-square goodness-of-fit test measures the evidence against the expected ratio.
-A result below the platform's 0.001 threshold warrants investigation. Passing this check does not
-prove exchangeability; it addresses allocation balance, which is only one requirement.
+Everything downstream assumes it. The z-test assumes the two samples are draws from the same
+population under the null. The confidence interval assumes the only systematic difference is the
+variant. If exchangeability fails — because a routing bug sends iOS users to control, because a
+bot hammers one URL, because collection loses events for one arm, because a bandit deliberately
+routes more users to the better arm — the p-value is still computed, still small or large, and
+means nothing.
+
+You can't observe exchangeability directly. You can observe its most common _symptom_: a
+**sample-ratio mismatch (SRM)**. The experiment was configured 50/50; the assignment counts are
+6,043 vs 5,712, which is 51.4% of 11,755 users in one arm. A chi-square goodness-of-fit test says
+how surprising that is under a working randomiser. If it is very surprising (p < 0.001), the
+randomiser is not doing what you think, and nothing else on the page can be trusted until you
+know why. Be precise about what the check proves, though: passing it does **not** prove
+exchangeability. It addresses allocation balance, which is only one requirement; a perfectly
+balanced split can still hide a biased one.
 
 #### Why p < 0.001, not 0.05
 
-The platform uses a stricter threshold for SRM warnings than the 0.05 level often used for outcome
-tests. This reduces warnings caused by ordinary allocation variation. Repeated dashboard refreshes
-are correlated observations, so the threshold should not be interpreted as a guarantee about a
-fixed number of false alarms per refresh. Investigate a warning in the context of the allocation
-and collection process.
+Because the dashboard is read constantly, and an SRM warning that cried wolf would be ignored.
+The platform uses a far stricter threshold than the 0.05 you use for outcome tests, so that a
+warning is rare and always worth a human's time. (You will sometimes read that a 0.05 threshold
+"fires on one refresh in twenty". That is not right: refreshes of the same experiment re-read
+mostly the same data, so they are correlated, and the false-alarm rate is not a fixed number per
+refresh. The honest reason for 0.001 is the cost of a false alarm and the convention in the
+experimentation literature, not a per-refresh calculation.)
 
-### How Experimently does it
+### How Controlvar does it
 
 The test is a pure function of counts and allocations:
 
@@ -94,8 +109,8 @@ allocation are excluded — no assignments are _expected_ for them, and dividing
 expected count of zero is undefined.
 
 Two design decisions in the wrapper matter. The check **never fails a results request** —
-it's best-effort, returning `None` on any error — because an SRM check that broke the page
-would be worse than no check. And it **only runs for fixed-allocation experiments**:
+`sample_ratio_check` logs and returns `None` on any error, because an SRM check that broke the
+page would be worse than no check. And it **only runs for fixed-allocation experiments**:
 
 ```python
 # 📁 backend/app/services/srm_service.py
@@ -108,21 +123,41 @@ def _is_fixed_allocation(optimization_type: Any) -> bool:
 ```
 
 A bandit _intends_ to drift from the configured split (Hour 9), so an SRM warning on a
-bandit would be noise; the results endpoint skips it. (That also means bandit results are
-_never_ exchangeability-guaranteed — which is exactly the trade Hour 9 explains.)
+bandit would be noise; `compute_srm_for_experiment` returns `None` for it. (That also means
+bandit results are _never_ exchangeability-guaranteed — which is exactly the trade Hour 9
+explains.) One limitation is written into the module docstring and worth repeating: if someone
+edits a running experiment's `traffic_allocation`, the counts mix the old and the new split and
+the check tests them against the current one, because nothing records when an allocation changed.
 
-The result rides on the `/results` response as `srm`:
+The check is run by `AnalysisService.get_experiment_results`, not by the route, so `/results`,
+the data export and the report all give the same answer. The route only serialises the block:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
         # --- P0 statistical credibility: sample-ratio mismatch ---
-        srm_response = _compute_srm(experiment_id, db)
+        srm_response = _srm_block(experiment_id, result.get("srm"))
 ```
 
-The core dashboard does **not** render it: no results component reads `srm`, so today an SRM
-is visible only to someone reading the API response (or, in the full profile, the warehouse
-run results view, which shows the SRM of a warehouse run). Until the results page shows it,
-make "check `srm.warning`" part of reading any result you intend to act on.
+and it rides on the `/results` response as `srm`. A failed check does more than add a block. When
+`warning` is set, `recommendation_under_srm` replaces the summary's recommendation:
+
+```python
+# 📁 backend/app/services/srm_service.py
+SRM_RECOMMENDATION: str = "INCONCLUSIVE"
+```
+
+The reason string reads "Sample-ratio mismatch: the observed assignment split does not match the
+configured traffic allocation (p = ...), so these results cannot be trusted until the cause is
+found." Not even `CONTINUE_TESTING` survives, because more data does not repair a broken
+randomiser. `has_winner` and `winning_variant_id` are left alone, because they describe
+significance, not trust. Like the check, the rule fails open: if it
+raises, the engine's own recommendation stands.
+
+The core dashboard renders the check, above the tabs because a mismatch qualifies every one of
+them (`SrmNotice.tsx`). A pass is one quiet line ("Sample ratio check passed"); a warning is a
+region with the observed and expected count per variant, the chi-square and the p-value. The
+"Leading" chip and the Bayesian panel carry a qualifier under a warning. A `null` `srm` — a
+bandit, no assignments yet, a check that failed — shows nothing, and absence is not a pass.
 
 What an SRM tells you to _do_: nothing statistical. Go find the leak. The usual suspects, in
 order: a targeting rule or SDK version that fails to assign on one platform (users drop out of
@@ -140,8 +175,10 @@ variant. The chi-square tells you the split is wrong; the fix is always in the p
 > changed split**. Move a 50/50 test to 70/30 mid-run and new users follow the new split
 > while old users keep their variant; the assignment counts no longer match either
 > configuration, the SRM fires, and it's right to — the two arms now have different
-> _tenure_ distributions. The platform's advice: create a new experiment rather than
-> re-split a running one.
+> _tenure_ distributions. The SRM module's own docstring lists an edit of a running
+> experiment's `traffic_allocation` as a known limitation, for this reason: nothing records when an
+> allocation changed, so the counts are tested against the current split. The safe move is a new
+> experiment rather than a re-split.
 
 ### Try It Yourself
 
@@ -164,9 +201,10 @@ Then simulate the false-alarm rate: draw 10,000 fair 50/50 splits of 10,000 user
 - Randomisation → exchangeability → every statistic's licence to speak. Break it and the
   numbers are arithmetic on a lie.
 - SRM = Pearson chi-square of observed assignment counts vs `traffic_allocation`, k − 1 dof,
-  warning at p < 0.001 (strict because polled).
-- Best-effort, never fails the request, skipped for bandits, excludes 0% arms.
-- It is on the `/results` response (`srm`), not on the core dashboard — read it yourself.
+  warning at p < 0.001 (deliberately strict, so a warning is rare and means something).
+- Best-effort (fails open), never fails the request, skipped for bandits, excludes 0% arms.
+- It is on the `/results` response (`srm`) and in a notice above the dashboard's tabs; a warning
+  also turns the recommendation into `INCONCLUSIVE`.
 - An SRM warning is a plumbing bug to find, not a statistic to adjust.
 
 ---
@@ -175,13 +213,14 @@ Then simulate the false-alarm rate: draw 10,000 fair 50/50 splits of 10,000 user
 
 ### What & why
 
-For a binary conversion metric, each variant's rate is `converting users / assigned users`.
-Several statistical tools can compare these proportions. The platform uses them as follows:
+A conversion metric is a **proportion**: `converting users / assigned users` per variant.
+Comparing two proportions is the oldest question in statistics, and there are several
+standard tools. This is what the platform uses each one for:
 
 | Question                            | `/results` (every metric)                    | `?breakdown=` segments              |
 | ----------------------------------- | -------------------------------------------- | ----------------------------------- |
 | Do the rates differ? (p-value)      | **Fisher's exact test**, at every n          | pooled **two-proportion z-test**    |
-| How precise is each rate? (CI)      | normal approximation at the requested level  | **Wilson** interval, at the corrected α |
+| How precise is each rate? (CI)      | normal approximation at the analysis level   | **Wilson** interval, at the corrected α |
 | How big is the difference? (effect) | **Cohen's h**, labelled                      | —                                   |
 
 **Fisher's exact test** computes the exact probability of the observed 2×2 table (and all
@@ -201,7 +240,7 @@ small/medium/large regardless of the base rate. A significant-but-negligible res
 most common outcome of a well-powered test, and the label is what lets the results page say
 so.
 
-### How Experimently does it
+### How Controlvar does it
 
 #### One counts-based engine
 
@@ -253,11 +292,14 @@ Three things to read off it:
   `"fisher_exact"` on every treatment `/results` returns, whatever the metric's
   `metric_type`. A "revenue" metric on `/results` is analysed as "did the user produce a
   matching event" — a proportion.
-- **The interval and the significance decision use the same level.** `confidence_level` on
-  the request (default 0.95) sets both `z` (via `two_sided_z`) and `alpha = 1 − level`. Ask
-  for 0.90 and the interval narrows to ±1.645·se and significance is p < 0.10. (Before
-  issue #454 was fixed the interval was hard-coded to 1.96 whatever you asked for; that fix
-  is part of engine version 1.2.0.)
+- **The interval and the significance decision use the same level.** The level sets both `z`
+  (via `two_sided_z`) and `alpha = 1 − level`. Where the level comes from changed: each
+  experiment now stores a `confidence_level` (0.80 to 0.99, default 0.95) and a
+  `correction_method` (default `benjamini_hochberg`), locked once the experiment leaves
+  draft, and `/results` uses them unless the request names its own `?confidence_level=` or
+  `?correction_method=`. Choose 0.90 and the interval narrows to ±1.645·se and significance is
+  p < 0.10. (Before the fix for the hard-coded-1.96 bug the interval ignored whatever level
+  you asked for; that fix shipped in engine version 1.2.0, and the engine is now at 1.4.0.)
 - **The clamp.** `max(0, …)` and `min(100, …)` are the tell that the normal interval can
   leave [0, 1] near the edges.
 
@@ -381,8 +423,8 @@ mean metrics** (`mean_metric_result`, full profile; Part III). `/results` never 
 > _not_ "the probability the treatment is better." It's the probability of data at least
 > this extreme _if_ the null were true. The number a product manager actually wants —
 > P(treatment > control) — is the Bayesian probability-to-be-best (Part III Hour 8). The
-> API returns it (`bayesian_results` on `/results`, and `GET /results/{id}/bayesian`); the
-> dashboard does not show it.
+> API returns it (`bayesian_results` on `/results`, and `GET /results/{id}/bayesian`), and the
+> Overview tab shows it as "Chance to be best".
 
 ### Try It Yourself
 
@@ -442,11 +484,12 @@ its `sample_size` and `conversions` to `binomial_metric_result` with
 
 ### What & why
 
-A Type I error is a false positive: rejecting the null hypothesis when it is true. The
-significance level α controls this error rate under the test's assumptions. A Type II error is
-failing to detect a specified real difference. Power, 1 − β, is the probability of detecting that
-effect. Sample-size planning uses the baseline rate p₁, minimum detectable effect (MDE), α and
-target power to estimate the observations needed per arm.
+A test has two ways to be wrong. A **Type I error** (false positive) is declaring a
+difference that isn't there; the significance level α caps it at 5% per test when α = 0.05 and
+the test's assumptions hold. A **Type II error** (false negative) is missing a difference that
+is real; **power** = 1 − β is the probability of detecting a real effect of a given size. Power
+is what you _buy_ with sample size: for a baseline rate p₁, a minimum detectable effect (MDE),
+α and desired power, the required users per arm is a closed-form number.
 
 The reason it matters operationally: **a significant result from an underpowered test is
 more likely to be wrong, and more likely to overstate the effect.** With 100 users an arm, a
@@ -467,7 +510,7 @@ where p₂ = p₁·(1 + MDE) (relative) or p₁ + MDE (absolute), p̄ is their m
 `z_power` are normal quantiles (1.96 and 0.84 for α = 0.05, power = 0.80). Read the
 denominator: halve the detectable effect and you need _four times_ the users.
 
-### How Experimently does it
+### How Controlvar does it
 
 One function does the planning everywhere the platform plans: `sample_size_two_proportions`
 in `power_calculator_service.py`. The results page's Sample Size tab, the guided setup's
@@ -518,20 +561,24 @@ schema, and the recommendation logic that honours it:
         ...
 ```
 
-and `_summarise_decision`, which — since the ShopLab fix — only recommends `SHIP_VARIANT`
-when the primary metric is significant _and_ every variant has reached the minimum.
+and `_summarise_decision`, which only recommends `SHIP_VARIANT` when the primary metric is
+significant _and_ every variant has reached the minimum; short of the minimum a significant
+winner is reported (`has_winner`) but the recommendation stays `CONTINUE_TESTING`. (A failed SRM
+check, Hour 1, can still override either with `INCONCLUSIVE`.)
 
 `GET /results/{id}/sample-size` is the planner behind the dashboard's Sample Size tab:
 
 - **Baseline**: the `baseline_conversion_rate` query parameter if sent, otherwise the
   **control variant's observed rate** on the primary metric (converting users / assigned).
-- **`mde`** is **relative** (0.05 means 12% → 12.6%), default **0.05**. The metric's
-  `expected_effect` is not read.
-- **`confidence_level`** (0.80–0.99, default 0.95) and **`power_target`** (0.50–0.99,
-  default 0.80).
-- **`correction_method`** (`none` by default): `bonferroni` or `benjamini_hochberg` plan
-  each comparison at α / (variants − 1); the response reports the `alpha` and `comparisons`
-  it planned with.
+- **`mde`** is **relative** (0.05 means 12% → 12.6%). Omit it and the planner uses the primary
+  metric's saved `expected_effect` when that is above 0 and below 1, otherwise 0.05;
+  `mde_source` (`request`, `experiment` or `default`) says which it used.
+- **`confidence_level`** (0.80–0.99; omitted, it is the experiment's stored level, 0.95 unless
+  its creator chose otherwise) and **`power_target`** (0.50–0.99, default 0.80).
+- **`correction_method`** (omitted, the experiment's stored method, `benjamini_hochberg`
+  unless chosen otherwise, as the results use): `bonferroni` and `benjamini_hochberg` plan
+  each comparison at α / (variants − 1); `none` plans at α. The response reports the `alpha`
+  and `comparisons` it planned with.
 - `current_sample_size_per_variant` is the **smallest** variant's assignment count.
   `days_to_significance` and `projected_completion_date` are always `null`.
 - When it cannot plan, `required_sample_size_per_variant` is `null` and
@@ -543,10 +590,11 @@ when the primary metric is significant _and_ every variant has reached the minim
 
 The dashboard's meter shows `current / required` and turns red below 80%.
 
-> **Watch Out!** `minimum_sample_size` defaults to 100. That is enough for small demos but is
-> usually too small for a planned conversion-rate test. For example, the planner requires 39,475
-> users per arm for a 4% baseline, a 10% relative MDE and 80% power. Set the experiment's threshold
-> from its planning assumptions; the default does not establish adequate power.
+> **Watch Out!** `minimum_sample_size` defaults to **100**, which is far below what most
+> conversion tests need (a 4% baseline with a 10% relative MDE at 80% power wants 39,475
+> per arm). The default keeps demos and small internal tests from being permanently
+> "inconclusive"; a real experiment should set it from the planner. The gate only protects
+> you if the number in it is honest, and the default does not establish adequate power.
 
 > **Did You Know?** Power calculations assume you'll look **once**, at the planned n. If
 > you'll look every day — and everyone does — use the sequential analysis (Part II), whose
@@ -572,11 +620,27 @@ The dashboard's meter shows `current / required` and turns red below 80%.
 (39475, 47805)
 ```
 
-Then feel underpowering: with `default_rng(1)`, simulate 2,000 experiments of 100 users
-per arm with **no true effect** (both rates 4%), run the z-test on each, and count how many
-have p < 0.05 (0.0385 — at this size the z-test is a little conservative). Now simulate
-2,000 with a _true_ 10% lift at n = 100 and count how many detect it — 0.047, no better
-than chance. Repeat at the n the formula gave you (39,475): 0.80.
+Then feel underpowering. Simulate 2,000 experiments per row below, each analysed with a pooled
+two-proportion z-test. Run the three calls in this order on one generator, because the numbers
+depend on the draw order:
+
+```python
+>>> import numpy as np
+>>> from scipy import stats
+>>> rng = np.random.default_rng(1)
+>>> def reject_rate(n, p_c, p_t, runs=2000):
+...     a, b = rng.binomial(n, p_c, runs), rng.binomial(n, p_t, runs)
+...     pooled = (a + b) / (2 * n)
+...     se = np.sqrt(pooled * (1 - pooled) * 2 / n)
+...     z = (b / n - a / n) / np.where(se == 0, 1, se)
+...     return (2 * stats.norm.sf(abs(z)) < 0.05).mean()
+>>> reject_rate(100, 0.04, 0.04), reject_rate(100, 0.04, 0.044), reject_rate(39475, 0.04, 0.044)
+(0.0465, 0.042, 0.8005)
+```
+
+With **no true effect** the z-test rejects in 0.0465 of runs at n = 100 (a little under 5%: at
+this size it is slightly conservative). With a _true_ 10% lift it detects it in 0.042 — no better
+than chance, which is the point. At the n the formula gave you (39,475) it detects it in 0.80.
 
 ### Key takeaways
 
@@ -596,8 +660,9 @@ than chance. Repeat at the n the formula gave you (39,475): 0.80.
 ## Part I Workshop
 
 **Q1. Why is the SRM threshold 0.001 rather than 0.05?**
-The dashboard is polled many times; at 0.05 a healthy experiment would false-alarm on one
-in twenty refreshes. 0.001 keeps the warning rare and meaningful.
+A warning has to be rare and meaningful, or people learn to ignore it. 0.001 is the
+conventional, deliberately strict threshold. (The tempting answer, "at 0.05 a healthy
+experiment false-alarms on one refresh in twenty", is wrong: refreshes are correlated.)
 
 **Q2. An SRM warning appears. What's the first thing to check, and what's the wrong
 response?**

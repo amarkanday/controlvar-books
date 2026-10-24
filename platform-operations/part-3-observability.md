@@ -4,10 +4,14 @@
 
 [← Part II](./part-2-aws.md) · [Contents](./README.md) · [Part IV →](./part-4-release-engineering.md)
 
-Operating the service requires several kinds of evidence. Hour 7 covers structured logs and request
-IDs. Hour 8 examines health probes and Prometheus metrics, including access controls and timeouts.
-Hour 9 covers scheduler locks, run history, health reporting, alarms and notifications. The examples
-show which failures each signal can detect and which require another check.
+You can't operate what you can't see. This Part is the three ways the platform makes itself
+visible: **logs** that are one JSON object per line with a request ID that survives from
+nginx to the database (Hour 7); **health probes** that tell the truth to the right audience
+and **metrics** that Prometheus can scrape without leaking them to the world (Hour 8); and
+the **schedulers** — the platform's only long-running background work — with their lock,
+their run history, their health endpoint, and the alarms and Slack/email notifications built
+on all of it (Hour 9). Have the development stack running (Part I); the Try It Yourself
+sections curl it.
 
 ---
 
@@ -28,7 +32,7 @@ proxy call (Hour 2), the API adopts an incoming one or generates a UUID4, and ec
 the response header. A user reporting "it failed at 14:02" can give you the header value
 from their browser's network tab; you can go straight to the lines.
 
-### How Experimently does it
+### How Controlvar does it
 
 The middleware — adopt or mint, bind, echo:
 
@@ -119,17 +123,16 @@ staging and production and console everywhere else. A production line looks like
 {"event": "Assigned user u-123 to variant 7c1… in experiment 3f2a…", "service": "experimentation-platform", "logger": "backend.app.services.assignment_service", "level": "info", "timestamp": "2026-09-11T14:02:07.312Z", "request_id": "5e0b4c2a-…", "path": "/api/v1/tracking/assign", "method": "POST"}
 ```
 
-and the CloudWatch Logs Insights queries in `docs/monitoring/log-insights-queries.md` are
-written against exactly those fields:
+and CloudWatch Logs Insights discovers the fields of JSON log lines on its own, so a query can
+use them by name. This one is illustrative (it is not a file in the repository): the ten noisiest
+paths among error-level lines.
 
 ```text
-# 📁 docs/monitoring/log-insights-queries.md
-fields @timestamp, @message
-| parse message "\"url\":\"*\"" as url
-| parse message "\"error_type\":\"*\"" as error_type
-| stats count(*) as error_count by url, error_type
+fields @timestamp, request_id, path, event
+| filter level = "error"
+| stats count(*) as error_count by path
 | sort error_count desc
-| limit 20
+| limit 10
 ```
 
 The rest of the chain: nginx sets the header from its own `$request_id`, the ALB in
@@ -193,7 +196,7 @@ scheduler ticks. The scrape endpoint is unauthenticated by nature — so it's gu
 token outside development, and labels are normalised so a UUID in a path doesn't create a
 metric series per experiment.
 
-### How Experimently does it
+### How Controlvar does it
 
 The contract, from the module's docstring:
 
@@ -207,7 +210,9 @@ Routes (all unauthenticated, none in the OpenAPI schema):
 ``GET /health/live``
     Liveness: the process is up and the event loop answers. Never touches the
     database or Redis, so a dependency outage does not make orchestrators
-    restart healthy processes. Used by the container ``HEALTHCHECK``.
+    restart healthy processes. Used by the container ``HEALTHCHECK``. The only
+    probe declared ``async def``: it runs on the event loop because that is
+    what it reports on.
 
 ``GET /health/ready``
     Readiness: PostgreSQL must answer ``SELECT 1``. Redis is checked and
@@ -217,6 +222,10 @@ Routes (all unauthenticated, none in the OpenAPI schema):
     The profile the process runs (``core`` or ``full``) is reported as
     ``profile`` and in ``checks.modules``, and never gates readiness. Returns
     200 when ready, 503 otherwise.
+
+    A plain ``def`` route, so FastAPI runs it in the thread pool: the checks
+    are blocking calls, and a slow database or Redis holds one worker thread
+    instead of the event loop every other request is answered on (#810).
 
 ``GET /health``
     Alias of ``/health/ready`` kept for the existing ALB/ECS/CDK wiring.
@@ -280,18 +289,34 @@ The database check uses a session from the _application pool_ — so it fails wh
 is exhausted, which is a real "can't serve" condition, not just when Postgres is down. The
 Redis check builds its client with the same factory the rest of the application uses, so it
 honours `REDIS_SSL` (on AWS the ElastiCache group requires TLS) exactly as the real
-connections do, and it uses one-second timeouts so a hung Redis can't make readiness itself
-hang past the ALB's timeout:
+connections do, and it uses one-second timeouts and **no client retries** so a hung Redis can't
+make readiness itself hang past the ALB's timeout. The retries matter: redis-py retries ten times
+with backoff by default, which made one failed ping take seconds with Redis refusing connections
+and longer than the 5-second probe timeouts with Redis unreachable:
 
 ```python
 # 📁 backend/app/core/health.py
 def check_redis() -> Dict[str, Any]:
-    """``PING`` Redis using the connection settings."""
+    """``PING`` Redis using the connection settings.
+
+    One connect attempt, with 1 s connect and socket timeouts. redis-py
+    retries ten times with backoff by default, which made one failed ping
+    take seconds with Redis refused and longer than the 5 s probe timeouts
+    with Redis unreachable (#810).
+    """
     try:
+        from redis.backoff import NoBackoff
+        from redis.retry import Retry
+
         from backend.app.core.redis_client import create_redis_client
 
         t0 = time.perf_counter()
-        client = create_redis_client(socket_connect_timeout=1, socket_timeout=1)
+        client = create_redis_client(
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            # No client retries: see the docstring.
+            retry=Retry(NoBackoff(), 0),
+        )
         try:
             client.ping()
         finally:
@@ -447,10 +472,11 @@ Then hit `/api/v1/experiments/<uuid>` a few times and confirm the metric label i
 
 ### What & why
 
-Each API process starts five background loops: experiment scheduling, rollout advancement,
-metrics aggregation and analysis-history cleanup, safety monitoring, and bandit weight updates.
-A loop can stop making progress without producing request errors, so monitor successful tick
-history and elapsed time as well as exceptions.
+Five background loops run inside every API process — experiment (start/end by schedule),
+rollout (advance stages), metrics (aggregate; also purges analysis history), safety (error
+rates → rollback), bandit (recompute weights). They are the only work that happens without a
+request, which makes them both the most important thing to monitor and the easiest to lose
+track of: a stuck scheduler produces no errors, just an absence.
 
 Three guarantees, from one shared runner. **Single runner per tick**: with several API
 tasks (two in staging, three in production, Hour 5), each tick must run once, not once per
@@ -460,7 +486,7 @@ by the scheduler's name decides who. **Run history**: every executed tick is per
 the three scheduler metrics from Hour 8. On top of those sit the health endpoint, the
 CloudWatch alarms, and the notifications the schedulers themselves send.
 
-### How Experimently does it
+### How Controlvar does it
 
 The runner's contract:
 
@@ -519,10 +545,10 @@ def try_acquire(conn: Connection, name: str) -> bool:
     return bool(row)
 ```
 
-The lock connection uses AUTOCOMMIT to avoid leaving a transaction idle for the duration of a
-tick. Aurora can terminate an idle-in-transaction session, releasing its advisory lock while the
-worker is still running. Another replica could then acquire the lock. A dedicated autocommit
-connection avoids that particular failure mode.
+The AUTOCOMMIT note is the one that was learned the hard way: Aurora kills idle-in-transaction
+sessions, and a killed session releases its advisory lock — so two replicas could end up
+running the same tick, one of them half-way through. A dedicated autocommit connection has
+no open transaction to be idle in.
 
 The tick itself — skip → record → classify → re-raise:
 
@@ -668,13 +694,16 @@ API_5XX_EXPRESSION = "IF(FILL(e,0) >= 5, FILL(e,0)/r, 0)"
 API_5XX_RATE_THRESHOLD = 0.05
 ```
 
-The 5xx alarms count target responses through `HTTPCode_Target_5XX_Count`. Load-balancer-generated
-502/503/504 responses have no target-group dimension, so a separate no-healthy-task composite is
-needed to detect an ALB serving 503s without a healthy target. Missing data from an idle target group
-is not treated as breaching. Both blue and green groups have alarms because CodeDeploy switches
-traffic between them. Thresholds are initial values to assess against real traffic. The design's
-behavior immediately after a traffic shift, or with an alarm already firing before approval, had
-not been observed in a real account at the reviewed revision.
+Three details make these honest. The 5xx alarms count **target** 5xx only
+(`HTTPCode_Target_5XX_Count`): the load balancer's own 502/503/504 have no target-group
+dimension, which is exactly why the no-healthy-task composite exists — with no task behind
+it, the ALB answers 503 itself and the 5xx alarms see nothing. An idle target group's
+missing data is not breaching, so it never pages. And one alarm per colour, because
+CodeDeploy swaps blue and green on every deployment: an alarm on one group would watch the
+wrong one half the time. The thresholds are starting values, to be measured against real
+traffic; and how the alarms behave during the hour after a traffic shift, or when one is
+already in ALARM before a shift is approved, is the intended design but has not yet been
+observed in a real account.
 
 Mapped to the rollback runbook's decision tree (Hour 12): the 5xx-rate box is the 5xx
 alarms, "crash loops" is the no-healthy-task composite. What is still **not** alarmed:

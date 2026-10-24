@@ -4,15 +4,20 @@
 
 [← Part III](./part-3-observability.md) · [Contents](./README.md)
 
-Hour 10 describes the pull-request and release checks. Hour 11 follows a release tag through signed
-image creation and deployment, including the migration task and CodeDeploy canary. Hour 12 covers
-rollback, secret configuration and backups.
+How a change becomes a release, how a release becomes what an environment serves, and how
+an environment goes back to the previous release when it has to. Hour 10 is CI: what runs
+on every pull request, what branch protection requires, and why there are two gates rather
+than one. Hour 11 is the release and the deploy: release-please cuts a tag and builds signed
+images, and the one `Deploy` workflow takes that tag to staging or prod through a snapshot, a
+one-shot migration task and a CodeDeploy canary. Hour 12 is the other direction: the
+rollback decision tree, what CodeDeploy rolls back by itself, the `Rollback` workflow, the
+database rollback order, the secrets a deployment needs, and the backups behind all of it.
+Application rollback and database recovery have different requirements, so pay particular
+attention to the order of operations when a release changes the schema.
 
-Application rollback and database recovery have different requirements. Pay particular attention
-to the order of operations when a release changes the schema.
-
-> Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
-> changes, including three breaking ones: #747, #769, #770).
+> Verified against Controlvar v0.36.4 (`79f8ed18`). The workflows are read from `.github/workflows/`
+> at that tag; nothing in this Part was run against a real AWS account, and where the app's own
+> runbooks say a path has not been observed in one, so does this book.
 
 ---
 
@@ -20,10 +25,13 @@ to the order of operations when a release changes the schema.
 
 ### What & why
 
-The pull-request workflows include required and advisory checks. Branch protection blocks a
-merge while a required check is missing or unsuccessful; advisory checks report results without
-blocking. At the reviewed revision, `main` requires 20 checks. Additional integration, performance,
-Cognito and nightly suites provide coverage outside that required set.
+Continuous integration is where "it works on my machine" is replaced with a list of things
+that must be true before a change can merge. The platform runs several workflows on a pull
+request, and the important distinction is between **required** checks — branch protection
+blocks the merge until they report success — and **advisory** ones, which run and report but
+don't block. The repository declares **20** required checks (listed below); integration,
+performance and Cognito suites and the nightly run add slower coverage where a slow or flaky
+job costs nobody a merge.
 
 Two gates exist because they answer different questions. The **PR QA Gate** asks "does the
 code work?" — tests in both profiles, contracts, containers, a real browser. The **Release
@@ -33,7 +41,7 @@ produces the one check-run name (`Release Gate Summary`) that the `Deploy` workf
 before it will deploy a tag (Hour 11). It runs on pull requests **and on every push to
 `main`**, so the commit a release tag points at always carries a summary.
 
-### How Experimently does it
+### How Controlvar does it
 
 The PR gate's shape — a classifier first, then one job per reason to exist:
 
@@ -57,7 +65,8 @@ jobs:
   smoke-tests:             # backend/tests/smoke: the wiring checks (routes exist, deps resolve)
   frontend-tests:          # jest; next build
   sdk-contracts:           # golden vectors, offline
-  profile-build:           # matrix: reports as core-build and full-build
+  core-build:              # the core profile stands alone: copy the tree, delete modules/, rebuild, test
+  full-build:              # the same sequence on the full tree, modules included
   sdk-live-contract:       # Postgres + Redis + backend + seed; the SDKs' contract smoke (SDK book)
   browser-e2e:             # five fail-hard browser journeys against the static export
   docker-smoke:            # build the images; boot compose; walk the golden path through them
@@ -71,9 +80,12 @@ The `changes` job is what lets a typo fix skip forty minutes of tests. Its subtl
 branch protection requires checks to *report*: a workflow that simply did not run on a
 docs-only change would leave every required check missing and the pull request blocked. So
 the heavy jobs are **skipped** (a skipped plain job still reports under its name), and the
-two whose required names only exist once they run — `core-build`/`full-build` from a matrix,
-and `SDK Live Contract / sdk-live-contract (core)` from a reusable workflow — always run and
-condition their steps instead.
+three whose required names would not survive a skip — `core-build` and `full-build`, which were
+one matrix until a skipped matrix reported its unexpanded name, and `SDK Live Contract /
+sdk-live-contract (core)` from a reusable workflow — always run and condition their steps
+instead. A classifier that itself fails makes everything run: a skipped check is accepted by
+protection, so "skip unless docs-only" would turn a crashed classifier into a green gate with
+nothing run.
 
 The unit job runs the Lambda suites too, with a comment that explains a past gap:
 
@@ -84,11 +96,13 @@ The unit job runs the Lambda suites too, with a comment that explains a past gap
           APP_ENV: test
           TESTING: 'true'
           ...
-        run: python -m pytest backend/tests/unit/ -p no:cov -q --tb=short -x --junitxml=unit-junit.xml
+        run: python -m pytest backend/tests/unit/ backend/tests/realistic/ -p no:cov -q --tb=short -x --junitxml=unit-junit.xml
 
+      ...
       # The Lambda functions (event processor, flag evaluation) and their
       # shared package carry tests of their own (240 collected) that ran
-      # nowhere in CI.
+      # nowhere in CI. Each function's tests/ dir
+      # must run in its own pytest invocation (they all define `tests.conftest`).
       - name: Run Lambda tests
         run: |
           for d in backend/lambda/event_processor backend/lambda/feature_flag_evaluation backend/lambda/shared; do
@@ -96,10 +110,14 @@ The unit job runs the Lambda suites too, with a comment that explains a past gap
           done
 ```
 
-The PR gate uses `-x` to stop after the first failure and return feedback sooner. Nightly runs
-continue through the suite. `-p no:cov` disables the coverage plugin because coverage is measured
-in a separate run. Tests also cover the handlers under `backend/lambda/`, although no stack deploys
-those handlers (Part II, Hour 4).
+`-x` (stop at first failure) in the PR gate is a speed choice: a red PR gate needs one
+failure to act on, not the full list; the nightly runs without it. `-p no:cov` disables the
+coverage plugin — coverage is a separate, explicit run. (No stack deploys a handler from
+`backend/lambda/`; these suites keep the code that is there honest. Part II, Hour 4.) Between
+the two steps sits one that is easy to miss: `scripts/check_junit_skips.py` fails the job if a
+test that must run was *skipped* — in the workflow-reading tests, the statistical gates, the
+seeded realistic scenarios and the docs tests — because a skipped gate looks exactly like a
+passing one.
 
 The Docker smoke is the job that most resembles a customer — it builds the images and walks
 the same path a self-hoster would:
@@ -262,9 +280,11 @@ And the **nightly** suite (`02:00 UTC`) runs what's too slow or too environment-
 a pull request: integration tests, benchmarks, the smoke tests, the SDK contracts again and
 the browser E2E suite, filing an issue when it fails.
 
-**What branch protection requires.** Exactly these 20 check names, read with
-`gh api repos/getexperimently/experimently/branches/main/protection/required_status_checks`
-on 2026-10-03 (`strict` is off):
+**What branch protection requires.** Exactly these 20 check names, as `REQUIRED_CHECKS` in
+`scripts/configure-repo.sh` declares them. That script is what applies branch protection, and it
+says live protection may differ from its list; what the live repository enforces is a setting only
+a maintainer can read, with `gh api repos/Controlvar/controlvar/branches/main/protection/required_status_checks`
+(the script's payload sets `strict`, which makes a branch merge only when it is up to date with `main`):
 
 | Workflow | Required checks it reports |
 |---|---|
@@ -300,10 +320,10 @@ advisory too.
 
 ```bash
 gh pr checks <number>                                   # the check list with required/advisory status
-gh api repos/getexperimently/experimently/branches/main/protection/required_status_checks --jq '.contexts'
+gh api repos/Controlvar/controlvar/branches/main/protection/required_status_checks --jq '.contexts'   # needs a token that can read the setting
 EP_TEST_PROFILE=compose ./scripts/run-backend-tests.sh release    # exactly what the release gate runs
 gh run list --workflow "Release Gate" --branch main --limit 3
-gh api "repos/getexperimently/experimently/commits/$(git rev-parse origin/main)/check-runs?check_name=Release%20Gate%20Summary" --jq '.check_runs[].conclusion'
+gh api "repos/Controlvar/controlvar/commits/$(git rev-parse origin/main)/check-runs?check_name=Release%20Gate%20Summary" --jq '.check_runs[].conclusion'
 ```
 
 The last command is the question the deploy asks (`scripts/verify_release_gate.sh` asks it
@@ -327,16 +347,16 @@ check runs and an unfiltered read can miss the gate).
 
 ### What & why
 
-Release creation and environment deployment are separate workflows. Follow their responsibilities
-individually when tracing a change from `main` to a running environment.
+Two separate machines take a change from `main` to an environment, and it pays to keep them
+apart in your head.
 
 **The release** happens on its own. Every merge to `main` is squash-merged with the pull
 request title as its subject, and release-please reads those subjects as conventional commits
 (`feat`, `fix`, `perf`, … with `!` for a breaking change). It keeps a release pull request
 open — `chore(main): release X.Y.Z` — that bumps the version in every place it lives. Merging
 that pull request creates the tag `vX.Y.Z` and a GitHub release, and release-please then
-**calls** `release.yml`, which builds the four images, scans them, pushes them to GHCR, signs
-them and attaches the Helm chart. Nobody runs the release workflow by hand on a normal day.
+**calls** `release.yml`, which builds the four images, scans them, pushes them to GHCR and signs
+them. Nobody runs the release workflow by hand on a normal day.
 
 **The deploy** happens when a person asks for it. `Deploy` (`.github/workflows/deploy.yml`)
 is dispatched with an environment (`staging` or `prod`), a release tag and a profile. One
@@ -360,7 +380,7 @@ Three design decisions are worth understanding before the YAML.
   release has to keep working against the migrated schema, because that is what a rollback
   runs (Hour 12).
 
-### How Experimently does it
+### How Controlvar does it
 
 **The release.** release-please's own workflow ends by calling the release:
 
@@ -387,22 +407,20 @@ change (`!`) bumps the **minor** version (`bump-minor-pre-major`).
 
 What a release publishes, for version `X.Y.Z`:
 
-- images `ghcr.io/getexperimently/experimently:{core,full}-X.Y.Z` and
-  `ghcr.io/getexperimently/experimently-web:{core,full}-X.Y.Z`, `linux/amd64` only, public
+- images `ghcr.io/controlvar/controlvar:{core,full}-X.Y.Z` and
+  `ghcr.io/controlvar/controlvar-web:{core,full}-X.Y.Z`, `linux/amd64` only, public
   (anonymous pull works); a final release also moves the floating `:core` and `:full` tags;
 - each image scanned for stored credentials with trivy (two passes) before it is pushed,
   then signed with cosign keyless and given an SPDX SBOM attestation;
-- the Helm chart as `experimently-X.Y.Z.tgz` on the GitHub release. Today the chart is a `.tgz`
-  release asset only; the project has decided it will ALSO be an OCI package at
-  `oci://ghcr.io/getexperimently/charts/experimently`; the first push and making it public
-  are founder-only and not done;
 - the version written in one source (`VERSION`) and checked everywhere else it appears by
   `scripts/check_version_sources.py`.
 
 The documentation site is not part of that call. It is built from the tag by dispatching
 `gh workflow run docs.yml --ref vX.Y.Z`, and it deploys only for a final `v*` tag (an rc tag
-builds but does not deploy). The step-by-step procedure is the releasing guide in this
-repository's `guides/` (`guides/releasing.md`).
+builds but does not deploy). The app's [CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/v0.36.4/CONTRIBUTING.md)
+describes how a release is cut and re-run, and
+[Releases, images and verification](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/self-hosting/releases.md)
+says what a release publishes and how to check it.
 
 **The deploy's inputs.** The profile is a decision, not a default:
 
@@ -500,9 +518,10 @@ account by hand), their labels checked against the requested profile and commit,
 could move.
 
 > **Watch Out!** What an AWS environment runs is built by `Deploy` from the tag, not the
-> signed image the release published to GHCR. Same source, same Dockerfile, different build.
-> Deploying the released digest itself is an open item (#455); until it lands, "the image I
-> verified with cosign" and "the image prod runs" are two images.
+> signed image the release published to GHCR. Same source, same Dockerfile, different build —
+> and a tag that already exists in the account's ECR repository (`:<tag>-<profile>`) is reused
+> rather than rebuilt, with its labels checked against the requested commit and profile. So
+> "the image I verified with cosign" and "the image prod runs" are two images.
 
 **Snapshot, then migrate.** Always, before the migration:
 
@@ -610,9 +629,10 @@ The application is `experimentation-platform-<env>` and the deployment group
 `experimentation-<env>` (Part II, Hour 5). CodeDeploy starts the green task set and then
 **waits up to 30 minutes for approval** before shifting traffic. The workflow gives it:
 `scripts/shift_traffic.py` checks every target in the replacement target group is healthy,
-sends `continue-deployment` once, and polls to a 1,800-second deadline. The canary is 10% of
-traffic for 5 minutes at the reference commit (the project has decided to lengthen it to 15
-minutes before production), then 100%. Success means the PRIMARY task set is this revision
+sends `continue-deployment` once, and polls to a 2,400-second deadline
+(`CODEDEPLOY_DEADLINE_SECONDS`): the replacement tasks starting, the approval, the canary and the
+final shift. The canary is 10% of traffic for 15 minutes (`CANARY_10_PERCENT_15_MINUTES`, Part II),
+then 100%; a synth test pins the deadline to stay 1,500 seconds longer than the canary. Success means the PRIMARY task set is this revision
 **and** the `/api/*` listener rule forwards to its target group. While the deployment is
 active — the canary and the hour after the shift, while the old task set is kept — the
 group's two 5xx alarms watch it, and CodeDeploy rolls the API back by itself if either fires
@@ -650,7 +670,8 @@ dashboard_task_definition_arn=experimentation-dashboard-<env>:<m>` — the revis
 serving **before** this deploy.
 
 **Before the first deploy of an environment** (each environment is its own AWS account, in
-`us-west-2`; the deploying guide in this repository's `guides/` has the full checklist):
+`us-west-2`; the app's [deployment guide](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/deployment/deployment-guide.md)
+has the full checklist):
 
 - a GitHub environment named `staging` or `prod` with a required reviewer, the **secrets**
   `AWS_ACCOUNT_ID` (a secret, not a variable, so it is masked in public logs) and
@@ -687,15 +708,17 @@ gh run list --workflow Deploy --limit 5
 git ls-remote --tags origin 'v*' | tail -n 3
 ```
 
-Verify a published image — the GHCR packages are public, so no login is needed:
+Verify a published image — the GHCR packages are public, so no login is needed. The identity is
+the repository that built the image and it is case-sensitive: releases before 0.35.0 were signed
+under the former repository's name, and `controlvar/controlvar` in lower case matches no signature:
 
 ```bash
-IMAGE=ghcr.io/getexperimently/experimently:core-0.17.0
+IMAGE=ghcr.io/controlvar/controlvar:core-0.36.4
 cosign verify "$IMAGE" \
-  --certificate-identity-regexp '^https://github.com/getexperimently/experimently/' \
+  --certificate-identity-regexp '^https://github\.com/Controlvar/controlvar/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 cosign verify-attestation --type spdxjson "$IMAGE" \
-  --certificate-identity-regexp '^https://github.com/getexperimently/experimently/' \
+  --certificate-identity-regexp '^https://github\.com/Controlvar/controlvar/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 docker inspect --format '{{index .Config.Labels "io.experimently.profile"}}' "$IMAGE"
 ```
@@ -703,8 +726,7 @@ docker inspect --format '{{index .Config.Labels "io.experimently.profile"}}' "$I
 ### Key takeaways
 
 - Release: conventional PR titles → release-please PR (zero checks, admin merge) → tag →
-  `release.yml` called by release-please → signed, SBOM-attested amd64 images on GHCR and the
-  chart as a release asset. Dispatch `release.yml` only to recover a failed called run, and
+  `release.yml` called by release-please → signed, SBOM-attested amd64 images on GHCR. Dispatch `release.yml` only to recover a failed called run, and
   `docs.yml --ref vX.Y.Z` by hand.
 - Deploy: one `Deploy` workflow for staging and prod; inputs environment, release tag,
   profile; preflight with no AWS credential; one approval; refusals before any change.
@@ -718,10 +740,12 @@ docker inspect --format '{{index .Config.Labels "io.experimently.profile"}}' "$I
 
 ### What & why
 
-The app's rollback runbook (`docs/deployment/rollback-runbook.md`) starts with a decision tree and
-a two-minute assessment budget. It favors rollback when the cause is uncertain and reserves hotfixes
-for small, well-understood changes. First check whether CodeDeploy has already completed or started
-an automatic rollback; the manual response depends on that state.
+A deploy that can't be undone in minutes is a deploy you'll be afraid to do. The rollback
+runbook (`docs/deployment/rollback-runbook.md` in the app) opens with a **decision tree** and
+a two-minute budget, and its first rule is "when in doubt, roll back" — hotfixes are for
+one-line changes only. The tree starts with two questions an older design never asked,
+because CodeDeploy may already have acted: *did an alarm already roll the API back?* and *is
+CodeDeploy rolling back right now?*
 
 There are three ways the API goes back to a previous revision:
 
@@ -739,13 +763,13 @@ The rest of the Hour is what a recovery stands on: the secrets a deployment need
 backups.
 
 > **The first rollback in an environment.** `Rollback` is the intended path and the one the
-> runbook describes, but at the reference commit it has not yet completed end to end against
-> real AWS (#783 is open). Forward `Deploy`, the alarm rollback and the break-glass override
-> have run on staging. Rehearse a rollback in staging — two deploys of two tags, then roll
-> back to the first — before production ever relies on it, and treat the first one in each
+> runbook describes, and the runbook's first instruction is to rehearse it: two gated deploys
+> of two tags in staging, then roll back to the first, before production ever relies on it. The
+> runbook is also candid that parts of the alarm path (an alarm already in ALARM before a
+> deploy is approved, for one) have not been rehearsed on AWS. Treat the first rollback in each
 > environment as the test it is.
 
-### How Experimently does it
+### How Controlvar does it
 
 The decision tree, with the thresholds that need no deliberation:
 
@@ -784,7 +808,7 @@ Is any of the following true?
 ```
 
 "Is there a workaround (feature flag at 0%)?" — on the branch the excerpt elides — is the
-platform eating its own cooking: a behaviour behind an Experimently flag can be turned off in
+platform eating its own cooking: a behaviour behind a Controlvar feature flag can be turned off in
 seconds without a deploy, and the safety monitor may already have done it.
 
 **What CodeDeploy rolls back by itself.** The deployment group carries two alarms,
@@ -941,9 +965,11 @@ a different thing: they are rotated in the dashboard and hashed at rest (SDK boo
 **Rotation, restore and restart are not in this book.** The app's secrets-management,
 rollback and disaster-recovery documents keep the rotation schedule and the procedures for
 rotating a secret, restoring the database to a point in time, and restarting the API
-service. Their restart steps do not work on the CodeDeploy-controlled API service (pending
-#789). Until that is fixed, do not run them: stop and escalate to whoever owns the
-environment. This book quotes none of their commands.
+service. The API is CodeDeploy-controlled, so a restart is a CodeDeploy deployment that names
+the revision already serving, not an ECS-side forced redeployment, and
+CodeDeploy refuses a deployment for about an hour after any deploy; the runbooks say how to
+check that first. A rotation reaches the API only after such a restart, because ECS reads a
+secret into a task when the task starts. This book quotes none of their commands.
 
 **Backups.** What protects the data (`docs/deployment/disaster-recovery.md`):
 
@@ -956,12 +982,13 @@ environment. This book quotes none of their commands.
 - **The API and dashboard** hold no data: their images and task-definition revisions are the
   backup.
 
-The disaster-recovery plan states its targets as targets, not measurements: an **RTO of
-1 hour** and an **RPO of 5 minutes** (Aurora's restorable time is typically within five
-minutes of the present, within the retention period). It walks through task crashes, an
-Aurora writer failure, a full cluster loss, Redis loss, a region failure (the CDK creates no
-second region), a security breach and complete data loss, and it schedules a monthly restore
-test.
+The disaster-recovery plan states an **RPO of 5 minutes** as a target (Aurora's restorable
+time is typically within five minutes of the present, and only within the retention period), and
+it is careful to give its recovery time as a measurement rather than a promise: in a staging
+rehearsal on a database holding little data, the restore took about twelve minutes and the cutover
+took the API down for about thirteen; a larger database restores more slowly. It walks through
+task crashes, a total ECS outage, an Aurora writer failure, a full cluster loss, Redis loss, a
+region failure (the CDK creates no second region), a security breach and complete data loss.
 
 > **Watch Out!** A cluster deployed from an earlier version of the CDK app, which set no
 > retention, keeps CloudFormation's default of one day until its database stack is
@@ -1007,7 +1034,7 @@ Then time yourself against the runbook's "< 5 minutes from decision to rollback 
 - Secrets: three made by hand plus Aurora's generated one, imported by complete ARN; no
   Redis secret. Rotation, restore and restart procedures live in the app's runbooks.
 - Backups: Aurora 35 days in prod and staging, a snapshot before every deploy's migration;
-  RTO 1 h / RPO 5 min are targets.
+  RPO 5 min is a target, and the recovery time is a measurement, not a promise.
 
 ---
 
@@ -1064,7 +1091,8 @@ it. `conventional-title` reported the problem but is not a required check.
 ## Exercises
 
 **E4.1 — Required checks audit.** Using
-`gh api repos/getexperimently/experimently/branches/main/protection/required_status_checks`,
+`REQUIRED_CHECKS` in `scripts/configure-repo.sh` (and, if you can read the setting,
+`gh api repos/Controlvar/controlvar/branches/main/protection/required_status_checks`),
 list the required contexts and match each to the workflow and job that reports it. Name the
 jobs that run on a pull request but are not required, and argue for or against requiring
 each.
@@ -1092,12 +1120,13 @@ renamed the dashboard service in the CDK but not in `rollback.yml`?
 ## Solutions
 
 **S4.1** — the 20 contexts map as in Hour 10's table: eleven from the PR QA Gate
-(`core-build`/`full-build` from its matrix, `SDK Live Contract / sdk-live-contract (core)`
-from its reusable workflow), one each from Release Gate, Security Scan, Integration Tests,
+(`core-build` and `full-build`, plain jobs that always run, and `SDK Live Contract /
+sdk-live-contract (core)` from its reusable workflow), one each from Release Gate, Security Scan, Integration Tests,
 SDK Unit Tests, Infrastructure Tests, Lint, Regression Guard, DCO and Leak Guard. Running but
 not required: `conventional-title` (the strongest case for requiring it — a prose title
 silently drops a change out of the release), `Dependency Review`, CodeQL and Doc Examples.
-The list lives in settings, not in the repository, which is why the audit is a command.
+What the live repository enforces is a setting, not a file, which is why the audit has a command
+as well as a script.
 
 **S4.2** — the migration task meets every state including an **empty** database (an
 environment's first deploy), and the historical migration chain cannot be replayed from
@@ -1154,5 +1183,6 @@ mismatch never reaches an incident.
 
 _You've finished Platform Operations. The other two specializations are
 [Experimentation Statistics](../experimentation-statistics/README.md) and
-[SDK Engineering](../sdk-engineering/README.md); the guides — onboarding, troubleshooting,
-usage — are in [`guides/`](../guides/); the core path is in the [root README](../README.md)._ 🛠️
+[SDK Engineering](../sdk-engineering/README.md); the core path is in the [root README](../README.md);
+to contribute to Controlvar itself, start with its
+[CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/v0.36.4/CONTRIBUTING.md)._ 🛠️

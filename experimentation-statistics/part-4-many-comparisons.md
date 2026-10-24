@@ -4,13 +4,15 @@
 
 [← Part III](./part-3-sharper-estimates.md) · [Contents](./README.md)
 
-An experiment may compare several treatments, measure several outcomes and report results for
-multiple segments. These additional comparisons affect how significance should be interpreted.
-Hour 10 covers multiple-testing correction. Hour 11 examines segment breakdowns and the platform's
-heterogeneity, novelty and interaction checks, including their implementation limits.
-
-Hour 12 covers reproducibility: random seeds, engine versions, snapshots, caching and the
-`ga`/`beta` analysis labels. Together, these records explain how a reported result was produced.
+Everything so far assumed one comparison: one metric, one treatment against one control,
+one look (or a correctly-priced sequence of looks). Real experiments have five metrics, three
+treatments and a "let's break it down by platform" request from the PM — and every extra
+comparison is another lottery ticket for a false positive. Hour 10 is the correction
+machinery; Hour 11 is the honest way to slice results (and the drift-and-contamination
+checks that ride alongside — one now computed by the platform, two not); Hour 12 is the
+engineering discipline that makes any number the platform ever showed recomputable: seeds,
+engine versions, fingerprint tests, snapshots, the cache, and the table that says which
+analyses are `ga` and which are `beta`.
 
 ---
 
@@ -18,10 +20,12 @@ Hour 12 covers reproducibility: random seeds, engine versions, snapshots, cachin
 
 ### What & why
 
-For m independent tests whose null hypotheses are all true, testing each at α = 0.05 gives a
-probability of at least one false positive of `1 − 0.95^m`. That is about 14% for three tests,
-40% for ten and 64% for twenty. A results page with several treatments and metrics therefore needs
-a declared multiple-testing policy; choosing whichever uncorrected comparison is significant does
+Run one test at α = 0.05 and, if nothing is going on, you'll be fooled 5% of the time. Run
+_m_ independent tests and the chance that _at least one_ fools you is `1 − 0.95^m`: 14% for
+three metrics, 40% for ten, 64% for twenty. An experiment with three treatments and five
+metrics has fifteen p-values on its results page; a "winner somewhere" is close to a coin
+flip under the null. A results page with several treatments and metrics needs a declared
+multiple-testing policy; picking whichever uncorrected comparison happens to be significant does
 not preserve a 5% error rate for the collection.
 
 Two philosophies of correction:
@@ -42,7 +46,7 @@ answer should be robust to the correction — a treatment that's only significan
 `correction=none` isn't a winner. For **guardrail** metrics, uncorrected is often
 _preferable_: you'd rather over-detect a harm than miss it.
 
-### How Experimently does it
+### How Controlvar does it
 
 The results endpoint takes a `correction_method` and applies it **across the treatment
 variants of each metric** — the "which of my three variants beat control?" family:
@@ -52,7 +56,15 @@ variants of each metric** — the "which of my three variants beat control?" fam
 def adjusted_p_values(
     p_values: List[Optional[float]], method: str
 ) -> List[Optional[float]]:
-    """Multiple-comparison correction across the treatment variants of one metric."""
+    """Multiple-comparison correction across the treatment variants of one metric.
+
+    Raises:
+        UnknownCorrectionMethodError: ``method`` is not one of
+            ``CORRECTION_METHODS``, whatever the p-values are. An unknown
+            spelling used to mean "no correction", silently.
+    """
+    if method not in CORRECTION_METHODS:
+        raise UnknownCorrectionMethodError(method)
     valid = [(i, p) for i, p in enumerate(p_values) if p is not None]
     adjusted: List[Optional[float]] = [None] * len(p_values)
     if not valid or method == "none":
@@ -70,7 +82,7 @@ def adjusted_p_values(
             running = min(running, p * k / rank)
             adjusted[i] = min(1.0, running)
         return adjusted
-    return adjusted
+    raise AssertionError(f"unreachable: {method!r}")  # pragma: no cover
 ```
 
 It lives beside `binomial_metric_result` (Part I Hour 2), which calls it;
@@ -79,7 +91,13 @@ below still works.
 
 Read the BH branch carefully: it walks from the _largest_ rank down, keeping a running
 minimum, so the adjusted p-values are non-decreasing in rank — the step-up procedure. A
-`None` p-value (a variant with no data) is skipped and doesn't count toward k.
+`None` p-value (a variant with no data) is skipped and doesn't count toward k. And note the
+first line: a method that is not one of `none`, `bonferroni` or `benjamini_hochberg` is
+refused, even when there are no p-values to correct. An unknown spelling used to mean "no
+correction" without a word. `UnknownCorrectionMethodError` is deliberately not a `ValueError`:
+the results route answers a `ValueError` with 404 and the export reads one as "no results",
+and either would have hidden a misspelt method. Raised, it reaches the route's
+`unexpected_failure` (a 500), where somebody sees it.
 
 The adjusted value is the one that decides significance and the one the recommendation
 quotes:
@@ -109,19 +127,39 @@ quotes:
                 f"{pct:.1f}% improvement on {primary['metric_name']} (p={p:.4f})."
 ```
 
-The endpoint validates the method with a regex and includes it in the cache key, so
-`?correction_method=bonferroni` and `?correction_method=none` never serve each other's
-cached body:
+**Where the method comes from** changed since the first edition of this book. The route's
+parameters are optional, and omitted means "the experiment's own":
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
-    correction_method: str = Query(
-        default="none",
+    correction_method: Optional[str] = Query(
+        default=None,
         pattern="^(none|bonferroni|benjamini_hochberg)$",
+        description=(
+            "Multiple-comparison correction for this request. Omit it to use "
+            "the experiment's stored correction_method (benjamini_hochberg "
+            "unless set otherwise). 'none' shows the uncorrected numbers."
+        ),
     ),
-    ...
+```
 
-def _results_cache_key(experiment_id, confidence_level, correction_method, breakdown) -> str:
+`resolve_analysis_settings` (`backend/app/services/analysis_settings.py`) does the choosing:
+the request's value where it names one, otherwise the experiment's stored
+`correction_method` and `confidence_level`. A new experiment stores **`benjamini_hochberg` at
+0.95** unless its creator chose otherwise, and both are locked once the experiment leaves
+draft, so a running experiment cannot have its correction changed to find a winner. The
+resolved values go into the cache key, so `?correction_method=bonferroni` and
+`?correction_method=none` never serve each other's cached body, and the response echoes the
+`correction_method` and `confidence_level` the numbers were computed under:
+
+```python
+# 📁 backend/app/api/v1/endpoints/results.py
+def _results_cache_key(
+    experiment_id: UUID,
+    confidence_level: float,
+    correction_method: str,
+    breakdown: Optional[str],
+) -> str:
     return (
         f"results:{experiment_id}:{ENGINE_VERSION}:"
         f"{confidence_level}:{correction_method}:{breakdown or ''}"
@@ -151,24 +189,24 @@ corrected over before you quote it.
         # All hypotheses with rank ≤ cutoff_rank are rejected
 ```
 
-> **Watch Out!** The default is `correction_method=none`, and the dashboard always uses the
-> default: it requests `/results` with no `correction_method` and no `confidence_level`, so
-> what it shows is uncorrected at 0.95. It says so — the p-value column is labelled
-> **"unadjusted"**; a response that does carry a correction is labelled "adjusted
-> (Bonferroni)" or "adjusted (BH)" with the raw p beside it, and the badge, row colour and
-> recommendation all follow the one `is_significant` decision. A correction is chosen only
-> through the API (and in the Sample Size tab's planner). So a reader of the default page, or
-> a naïve API consumer reading `is_significant` from the default response, is reading
-> _uncorrected_ significance for a multi-variant experiment. Read the `correction_method`
-> field in the response, not just the verdict.
+> **Watch Out!** Read the `correction_method` field of the response, not just the verdict.
+> The dashboard asks for the experiment's stored settings and shows what comes back: with a
+> correction in force the p-value column carries the adjusted value with the raw p beside it
+> ("unadjusted 0.0300"), and a footnote says how many variants were compared; with `none` the
+> column is labelled **"unadjusted"**. The badge, the row colour and the recommendation all
+> follow the one `is_significant` decision. But an API consumer who passes
+> `?correction_method=none` (or whose experiment was stored with `none`) is reading
+> _uncorrected_ significance for a multi-variant experiment, and the verdict looks the same
+> either way. The first edition of this book warned that the default was `none`; it is no
+> longer, which is exactly why the field is worth checking rather than assuming.
 
 > **By the Way** — Bonferroni also belongs in the **power calculation**. If you'll test three
 > treatments at α/3, the sample size per variant has to be computed at α/3, not α:
 > `calculate_required_sample_size(baseline, mde, alpha=0.05/3)` returns a noticeably larger n
 > (the `z_alpha` term grows from 1.96 to 2.39). `GET /results/{id}/sample-size` does this for
-> you: pass `correction_method=bonferroni` (or `benjamini_hochberg`) and it plans each
-> comparison at α / (variants − 1), reporting the `alpha` and `comparisons` it used. The
-> dashboard's Sample Size tab exposes the same choice.
+> you: under `bonferroni` or `benjamini_hochberg` (the experiment's stored method unless you
+> pass another) it plans each comparison at α / (variants − 1), reporting the `alpha` and
+> `comparisons` it used. The dashboard's Sample Size tab exposes the same choice.
 
 ### Try It Yourself
 
@@ -208,8 +246,10 @@ how often any raw p < 0.05, then how often any Bonferroni-adjusted p < 0.05.
   `is_significant` and the recommendation; `BenjaminiHochbergService` (behind
   `POST /fdr-correction`) corrects a p-value map you supply. The method is validated, echoed,
   and part of the cache key.
-- Default is `none`, and the dashboard always shows the default, labelled "unadjusted";
-  `/sample-size` plans multi-arm experiments at the corrected α when asked.
+- The method and level default to the experiment's stored ones (`benjamini_hochberg` at 0.95,
+  locked after draft); a request may override them for that request. The dashboard shows the
+  response's method and labels the raw p "unadjusted"; `/sample-size` plans multi-arm
+  experiments at the corrected α.
 
 ---
 
@@ -217,15 +257,17 @@ how often any raw p < 0.05, then how often any Bonferroni-adjusted p < 0.05.
 
 ### What & why
 
-Segment breakdowns can help investigate whether treatment effects differ across populations.
-They also add comparisons, reduce the sample in each comparison and may be selected after examining
-the data. The platform labels these results exploratory, applies Bonferroni correction by the
-number of segments and reports a heterogeneous-treatment-effect (HTE) indicator. Treat an apparent
-segment difference as a reason for further investigation or a planned follow-up experiment.
+"Does it work on iOS?" is a reasonable question and a statistical trap. Break a result into
+_s_ segments and you've run _s_ more tests (Hour 10), on smaller samples (Hour 3), chosen
+after seeing the data (the garden of forking paths). The platform's answer is to allow the
+breakdown but label it **exploratory**, Bonferroni-correct it by the number of segments,
+and flag **heterogeneous treatment effects (HTE)** — the situation where the effect genuinely
+differs by segment, which is the one case where the breakdown deserves a follow-up
+experiment rather than a decision.
 
 Three related checks belong alongside because they all attack exchangeability from the
-outside. The platform has helper functions for all three, but its interactions and novelty
-routes do not feed them outcome data yet — see "What the routes compute today" below:
+outside. The platform computes one of them (interactions, and only on the beta pair route) and
+describes the other two for you to do by hand — see the end of the Interactions discussion below:
 
 - **Novelty** — the effect is real on day 1 and gone by day 14, because users tried the new
   thing once. A declining daily effect is the signature.
@@ -235,11 +277,12 @@ routes do not feed them outcome data yet — see "What the routes compute today"
   treatment. Social features, marketplaces and anything with contagion violate it; so does
   contamination (control users who saw the treatment).
 
-### How Experimently does it
+### How Controlvar does it
 
 **Breakdowns.** `GET /results/{id}?breakdown=platform` groups users by an event metadata key,
 computes per-segment results with the corrected α, and marks every segment exploratory. The
-base α is `1 − confidence_level` of the request. A segment's denominator is the distinct
+base α is `1 − confidence_level` of the analysis (the experiment's stored level unless the
+request names one). A segment's denominator is the distinct
 assigned users with an event carrying that segment value; its numerator is converting users
 (Part I Hour 2). Every variant appears in every segment, and the control is the variant
 flagged `is_control` — never guessed from ids or order:
@@ -341,120 +384,106 @@ segments, with two heuristics as backstop:
         return False
 ```
 
-The chi-square calculation tests whether conversions are distributed differently across segments
-in treatment and control. It is a proxy for treatment-effect heterogeneity and is sensitive to
-segment-size imbalance. Additional heuristics examine variation in lifts and lifts with opposing
-signs. An HTE value of `True` renders a red `role="alert"` indicator; investigate the breakdown before
-relying on the aggregate result.
+Be honest about what this is: the chi-square tests whether the _distribution of conversions
+across segments_ differs between treatment and control, which is a proxy for "the effect
+differs by segment" and is sensitive to segment-size imbalance; the heuristics (coefficient
+of variation of lifts > 0.5; lifts of opposing sign) catch the cases that matter most to a
+reader. HTE = `True` renders a red `role="alert"` and means "don't average this — investigate."
 
-**Novelty** — regress the daily effect on day index; a slope below −0.05 is flagged:
+**Interactions** — two experiments that run at once share users, and a user can be in an arm of
+each. There are two routes, and it matters which one you are reading:
 
-```python
-# 📁 backend/app/services/interaction_detection_service.py
-    NOVELTY_SLOPE_THRESHOLD = -0.05  # Negative slope threshold to flag novelty
-    ...
-    @staticmethod
-    def detect_novelty_effect(daily_effects: List[float]) -> NoveltyResult:
-        """Detect novelty effects by fitting a linear regression to daily effect sizes.
+- `GET /interactions/scan` (stable) reports the **overlap** of every pair of active experiments
+  and nothing else: the Jaccard similarity of their assigned users, with `interaction_result`,
+  `novelty_result` and `sutva_result` always `null` (not computed), and a risk level from the
+  overlap alone.
+- `GET /interactions/{a}/{b}` (**beta**) reports the real overlap of two experiments, in any
+  status, and **tests** whether each treatment's effect depends on the other experiment's arm.
 
-        A significantly negative slope indicates that the treatment effect is
-        declining over time, which is the signature of a novelty effect.
-        """
-        ...
-        x = np.arange(len(daily_effects), dtype=float)
-        y = np.array(daily_effects, dtype=float)
-
-        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-
-        # A clearly negative slope signals novelty
-        has_novelty = bool(slope < InteractionDetectionService.NOVELTY_SLOPE_THRESHOLD)
-```
-
-(The threshold is on the slope, not on its p-value — a pragmatic choice that fires on a
-visibly declining effect and stays quiet on noise around a flat line. The recommendation it
-attaches is "extend the minimum runtime," which is the only real cure: let the novelty
-dissipate and measure the steady state.)
-
-**Interactions** — overlap by Jaccard, then a 2×2 chi-square without Yates' correction:
+The overlap is a Jaccard coefficient, and the risk bands come from two constants:
 
 ```python
 # 📁 backend/app/services/interaction_detection_service.py
     OVERLAP_THRESHOLD = 0.30  # Flag pairs with > 30 % shared users
-
-    @staticmethod
-    def compute_user_overlap(users_a: Set[str], users_b: Set[str]) -> float:
-        """Compute Jaccard similarity: |A ∩ B| / |A ∪ B|.
-
-        Returns 0.0 when either set is empty.
-        """
+    HIGH_OVERLAP_THRESHOLD = 0.60  # Above this the overlap alone is high risk
     ...
-    @staticmethod
-    def detect_interaction(control_only: int, treatment_a_only: int, treatment_b_only: int, both_treatments: int) -> InteractionResult:
-        """Chi-squared test for interaction between experiments A and B.
-
-        Constructs a 2×2 contingency table and tests for independence:
-
-            +----------------+----------+-----------+
-            |                | Exp-B ON | Exp-B OFF |
-            +----------------+----------+-----------+
-            | Exp-A ON       | both     | a_only    |
-            | Exp-A OFF      | b_only   | control   |
-            +----------------+----------+-----------+
-        """
-        table = np.array(
-            [[both_treatments, treatment_a_only], [treatment_b_only, control_only]],
-            dtype=float,
-        )
-        ...
-        chi2, p_value, dof, expected = stats.chi2_contingency(table, correction=False)
-
-        # Effect size: simple excess above additivity for the "both" cell
-        ...
-        interaction_effect_size = (
-            (both_treatments - expected_both) / total if total > 0 else 0.0
-        )
-
-        has_interaction = bool(p_value < 0.05)
+    @classmethod
+    def risk_from_overlap(cls, overlap: float) -> str:
+        if overlap > cls.HIGH_OVERLAP_THRESHOLD:
+            return "high"
+        if overlap > cls.OVERLAP_THRESHOLD:
+            return "medium"
+        return "low"
 ```
 
-The structural fix for interactions is upstream of statistics: put the two experiments in a
-**mutual exclusion group** (Build book Day 4) so no user is in both.
+`low` at or below 0.30, `medium` above 0.30 up to 0.60, `high` above 0.60. The scan leaves
+pairs at or under 0.30 out of its results.
 
-**SUTVA** — declared, not detected:
+The pair route's test is the interesting part. Take experiment E and one of its treatments, and
+the arms of the other experiment O that share users with it. For the shared users the counts form
+a 2 × J table: row 0 is E's control, row 1 is E's treatment, one column per arm of O, each cell
+holding users and converters on E's primary conversion metric. The question is whether the
+treatment's lift **in percentage points** is the same in every column. Under that hypothesis —
+the _additive model_ — the rates are `p0j = bⱼ` and `p1j = bⱼ + d`: one baseline per arm of O and
+one common difference `d`. The module fits that model by binomial maximum likelihood (by
+bisection, with no start value to choose) and takes Pearson's X² of the counts against the
+fitted rates, on J − 1 degrees of freedom:
 
 ```python
-# 📁 backend/app/services/interaction_detection_service.py
-    @staticmethod
-    def check_sutva(treatment_size: int, control_size: int, network_feature: bool = False, contamination_rate: float = 0.0) -> SUTVAResult:
-        """Check for SUTVA (Stable Unit Treatment Value Assumption) violations.
+# 📁 backend/app/services/interaction_analysis.py
+def interaction_test(n: Sequence, x: Sequence) -> InteractionTest:
+    """Pearson's X^2 test of the additive model on one 2 x J table.
 
-        Network features inherently violate SUTVA because a user's outcome
-        depends on the treatment status of other users.
-        """
-        has_violation = network_feature or contamination_rate > 0.05
+    Call it only on a table ``floor_reason`` accepts.
+    """
+    n_arr, x_arr = _as_tables(n, x)
+    fitted = fit_additive_batch(n_arr[None], x_arr[None])
+    statistic = float(pearson_statistic_batch(n_arr[None], x_arr[None], fitted)[0])
+    ...
+    df = n_arr.shape[1] - 1
+    return InteractionTest(
+        statistic=statistic,
+        degrees_of_freedom=df,
+        p_value=float(stats.chi2.sf(statistic, df)),
+    )
 ```
 
-A network feature is flagged on the experimenter's say-so (`network_feature=True`), because
-no statistic on the outcome data can tell you the units interfere; a contamination rate
-(control users who were exposed) above 5% is flagged when the caller supplies one.
+A table is tested only when it clears a floor, because the chi-squared approximation is not
+calibrated on thin or skewed cells: every cell needs at least `MIN_USERS_PER_CELL = 100` users,
+and at least `MIN_EXPECTED_PER_CELL = 25` expected converters _and_ non-converters at the table's
+pooled rate (`floor_reason`). Below the floor a row is listed with an `unavailable_reason`
+(`too_few_shared_users`, `too_few_conversions`) instead of a p-value; so are experiments in the
+same mutual exclusion group (`mutual_exclusion_group`), pairs with `no_shared_users`, an
+experiment with `no_metric`, a primary metric that is not a conversion metric
+(`not_a_proportion_metric`) and one with `no_control_variant`. The p-values of an experiment's
+treatments are then corrected with the experiment's own stored `correction_method`, and
+`is_significant` is judged at its `confidence_level`. The beta notice states the limits plainly:
+`p_value` is uncorrected, pairs are tested one at a time with no correction across pairs, and
+secondary and non-conversion metrics are not tested.
 
-#### What the routes compute today (beta)
+The structural fix for interactions is upstream of statistics: put the two experiments in a
+**mutual exclusion group** (Build book Day 4) so no user is in both. The route knows this — it
+refuses to test a pair that shares a group.
 
-The functions above are correct as functions — the Try It exercises them. The routes that
-apply them to real experiments are **beta** (issue #219), and each response says so in
-`analysis_status` and `analysis_notice`:
+**Novelty and SUTVA** — described, not computed. The platform has no routine at v0.36.4 that
+tests for a novelty effect or a SUTVA violation: the `novelty_result` and `sutva_result` fields
+are kept in the scan's response shape and are `null`, and a `null` means "not computed", never
+"no novelty". Treat them as checks to do by hand:
 
-- **Interactions** (`GET /interactions/{a}/{b}` and the active-experiment scan,
-  `scan_active_experiments`) measure **user overlap only** (Jaccard). `interaction_result`,
-  `novelty_result` and `sutva_result` are `null` — not computed — and `overall_risk` comes
-  from the overlap alone: `low` at ≤ 0.30, `medium` above 0.30 up to 0.60, `high` above
-  0.60. Pairs at or under 0.30 are left out of the scan.
-- **Novelty** (`.../novelty`) is not computed: `has_novelty` and `decline_rate` are `null`,
-  and a null `has_novelty` means "not computed", never "no novelty".
+- **Novelty.** Compute the daily treatment effect, regress it on the day index, and look at the
+  slope. A clearly negative slope is the signature; the only cure is time — extend the minimum
+  runtime and measure the steady state. The Try It does this with `scipy.stats.linregress`.
+  Mind the units: a cut-off on the slope means something only for effects expressed in one
+  consistent unit, so pick the unit before you pick the threshold.
+- **SUTVA.** There is no statistic on outcome data that can tell you units interfere. A network
+  feature (social, marketplace, anything with contagion) violates it by construction, and
+  contamination (control users who saw the treatment) violates it in practice; both are
+  design questions. The remedy is a different randomisation unit — a cluster, a market, a time
+  slice — not a different p-value.
 
-So an interaction "risk" from the platform today means "these experiments share a lot of
-users", which is the input to the mutual-exclusion decision — not a test of whether they
-interact.
+So an interaction "risk" from `/scan` means "these experiments share a lot of users", which is
+the input to the mutual-exclusion decision — not a test of whether they interact. If you want
+the test, call the pair route.
 
 **Post-stratification** is the constructive sibling of the breakdown: instead of reporting
 per-segment results, reweight each stratum's control and treatment means to the _pooled_
@@ -510,15 +539,24 @@ class PostStratificationService:
 [('ios', 0.025, [('c', None, False), ('t', 0.0, True)]), ('android', 0.025, [('c', None, False), ('t', 0.5624, False)])]
 >>> svc.detect_hte(res)          # +2pp on iOS, −0.25pp on Android → True (opposing signs, and the chi-square)
 True
+>>> import numpy as np
+>>> from scipy import stats
+>>> stats.linregress(np.arange(6), [0.30, 0.22, 0.15, 0.08, 0.02, 0.0]).slope   # novelty by hand: a falling daily effect
+-0.062
 >>> from backend.app.services.interaction_detection_service import InteractionDetectionService as I
->>> I.detect_novelty_effect([0.05, 0.04, 0.03, 0.02, 0.01, 0.0]).has_novelty      # slope −0.01 → False (threshold is −0.05)
->>> I.detect_novelty_effect([0.30, 0.22, 0.15, 0.08, 0.02, 0.0]).has_novelty      # slope ≈ −0.06 → True
->>> I.compute_user_overlap({"u1", "u2", "u3"}, {"u3", "u4"}), I.has_significant_overlap({"u1","u2","u3"}, {"u3","u4"})
+>>> I.compute_user_overlap({"u1", "u2", "u3"}, {"u3", "u4"}), I.has_significant_overlap({"u1", "u2", "u3"}, {"u3", "u4"})
 (0.25, False)
->>> r = I.detect_interaction(control_only=1000, treatment_a_only=1100, treatment_b_only=1050, both_treatments=1400)
->>> r.has_interaction, round(r.p_value, 4), round(r.interaction_effect_size, 4)
-(True, 0.0013, 0.0118)
->>> I.check_sutva(5000, 5000, network_feature=True).warning_message
+>>> [I.risk_from_overlap(o) for o in (0.30, 0.31, 0.60, 0.61)]
+['low', 'medium', 'medium', 'high']
+>>> from backend.app.services import interaction_analysis as ia
+>>> n = [[2000, 2000], [2000, 2000]]        # rows: E's control, E's treatment; columns: the other experiment's two arms
+>>> ia.interaction_test(n, [[80, 80], [120, 120]]).p_value > 0.99             # +2pp in both columns: no interaction
+True
+>>> r = ia.interaction_test(n, [[80, 80], [120, 200]])                         # +2pp in one column, +6pp in the other
+>>> round(r.statistic, 2), r.degrees_of_freedom, round(r.p_value, 5)
+(14.28, 1, 0.00016)
+>>> ia.floor_reason([[2000, 50], [2000, 50]], [[80, 2], [120, 3]]), ia.floor_reason(n, [[2, 2], [3, 3]])
+('too_few_shared_users', 'too_few_conversions')
 ```
 
 ### Key takeaways
@@ -527,10 +565,14 @@ True
   rendered as an amber warning; a segment result is a hypothesis, not a decision.
 - HTE: chi-square on the 2×N conversion table plus CV-of-lift > 0.5 and opposing-sign
   heuristics → red alert.
-- Novelty: `linregress` slope on daily effects < −0.05 → "extend the runtime."
-  Interactions: Jaccard > 0.30 then 2×2 chi-square (p < 0.05); prevent with a MEG. SUTVA:
-  declared for network features, flagged for supplied contamination > 5%. These are
-  functions; the beta routes compute **overlap only** and return the rest as `null`.
+- Interactions: `/scan` (stable) reports overlap only (Jaccard; low ≤ 0.30 < medium ≤ 0.60 <
+  high). The beta pair route tests whether each treatment's lift differs across the other
+  experiment's arms — an additive-model Pearson X² on a 2 × J table, with a floor of 100 users
+  and 25 expected converters/non-converters per cell, corrected by the experiment's stored
+  method. Prevent interactions with a mutual exclusion group.
+- Novelty and SUTVA are not computed by the platform (`novelty_result`, `sutva_result` are
+  `null`, which means "not computed"); check novelty by regressing daily effects on the day
+  index, and treat SUTVA as a design question.
 - Post-stratification gives one reweighted estimate instead of many small ones — in theory;
   the route answers 501.
 
@@ -540,9 +582,9 @@ True
 
 ### What & why
 
-A reported result may need to be reviewed months after the experiment. Reproducing it requires
-more than the displayed value: the data, calculation version and random sampling inputs must be
-known. Three sources of change complicate that work:
+A results page is evidence in a decision that someone will be asked to justify later — in a
+retro, a quarterly review, an audit. "The dashboard said 0.94 in March" is only evidence if
+you can _recompute_ 0.94 in September. Three things get in the way:
 
 1. **Randomness** — Monte Carlo statistics (PtBB, expected loss, Thompson weights) differ
    run to run unless seeded, and a dashboard that polls would show a number that flickers.
@@ -561,7 +603,7 @@ full payload. Add the results **cache** (which makes "the number the user saw" a
 five minutes) and the response **contract** (which makes the shape stable across clients),
 and a number becomes an artefact rather than a moment.
 
-### How Experimently does it
+### How Controlvar does it
 
 The seed, from `core` so schemas can import it without cycles:
 
@@ -569,7 +611,7 @@ The seed, from `core` so schemas can import it without cycles:
 # 📁 backend/app/core/stats_engine.py
 #: Bumped whenever a change alters numbers a client could have persisted
 #: (sampling strategy, estimator, default priors, thresholds).
-ENGINE_VERSION: str = "1.2.0"
+ENGINE_VERSION: str = "1.4.0"
 
 #: Mask that keeps the derived seed inside the signed 64-bit range.
 _SEED_MASK = (1 << 63) - 1
@@ -656,6 +698,8 @@ for Thompson weights and stamps `BanditState.engine_version` (Part III Hour 9).
 | 1.0.0   | The first stamped version (never fingerprinted).                                               |
 | 1.1.0   | Breakdowns: every variant in every segment, and the flagged control rather than a guessed one.  |
 | 1.2.0   | `/results` intervals and significance at the requested confidence level (#454); the sequential confidence sequence became the inverted mSPRT (#231); a Bayesian `STOP_WINNER` needs P(best) ≥ 0.975 (#242). |
+| 1.3.0   | CUPED adjusts for each user's own pre-assignment events (`cuped_metric_result`) instead of a placeholder covariate (#217). |
+| 1.4.0   | The mSPRT and the confidence sequence use the Agresti–Caffo variance, and Λ is computed in log space and capped (#854). |
 
 **The fingerprint test and the bump rule.** A version string only means something if it
 moves whenever the numbers do, and nobody remembers to bump it by hand. So
@@ -776,8 +820,10 @@ platform's "one scheduler does the housekeeping" pattern (Build book Day 17):
 
 **The cache and the contract.** The results endpoint caches the serialised
 `ExperimentResultsResponse` in Redis under a key that includes every parameter that changes
-the numbers — and only writes the snapshot on a _fresh_ computation, so cached reads don't
-churn the audit row:
+the numbers — and only writes the snapshot on a _fresh_ computation under the experiment's
+**stored** settings, so cached reads don't churn the audit row and a request that asks for
+other settings (`?correction_method=none`, say) cannot leave a row that reads as the
+experiment's own results:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
@@ -785,11 +831,20 @@ churn the audit row:
     24 h for completed/paused ones).  Pass ``use_cache=false`` to force
     a fresh computation.
     ...
-    cache_key = _results_cache_key(experiment_id, confidence_level, correction_method, breakdown)
+    cache_key = _results_cache_key(
+        experiment_id,
+        settings.confidence_level,
+        settings.correction_method,
+        breakdown,
+    )
     # = f"results:{experiment_id}:{ENGINE_VERSION}:{confidence_level}:{correction_method}:{breakdown or ''}"
     ...
     # --- Persist audit snapshots (best-effort; never fails the response) ---
-    _record_results_snapshots(db, response)
+    # Only a computation under the experiment's stored settings is recorded:
+    # a request asking for other settings must not leave an audit row that
+    # reads as the experiment's own results.
+    if settings == stored:
+        _record_results_snapshots(db, response)
 
     # --- Cache write ---
     try:
@@ -803,9 +858,8 @@ churn the audit row:
 
 Because `ENGINE_VERSION` is in the key, an upgraded engine misses every entry the old one
 wrote instead of serving its numbers for up to a day. `POST /results/{id}/invalidate-cache`
-(superuser) clears `results:{id}:*` — the thing to reach for after a data backfill. The five-minute TTL is also why "I tracked an event and the
-dashboard didn't change" is in the troubleshooting guide: the number is _stable_ for five
-minutes by design.
+(superuser) clears `results:{id}:*` — the thing to reach for after a data backfill. The five-minute TTL is also the first thing to rule out when "I tracked an event and the
+dashboard didn't change": the number is _stable_ for five minutes by design.
 
 The **contract** is the Pydantic response model (`schemas/results.py`) that every consumer —
 the dashboard's `results.ts` service, the CSV export, the MCP server, the demos — reads. Its
@@ -819,18 +873,19 @@ when responses are constructed:
 
 | Analysis (route)                                  | Status | Why, in its `analysis_notice`                                                    |
 | ------------------------------------------------- | ------ | -------------------------------------------------------------------------------- |
-| `cuped` (`GET /results/{id}/cuped`)               | beta   | the covariate is not a pre-experiment metric yet, so the reduction is ~0 (#217)   |
-| `interactions` (`GET /interactions/{a}/{b}`)      | beta   | only user overlap is measured; interaction, novelty, SUTVA are null (#219)        |
-| `novelty` (`.../novelty`)                         | beta   | novelty is not computed; `has_novelty` null means not computed (#219)             |
+| `cuped` (`GET /results/{id}/cuped`)               | ga     | — (the covariate is each user's own pre-assignment events, #217)                  |
+| `interactions` (`GET /interactions/{a}/{b}`)      | beta   | tests each treatment's lift across the other experiment's arms; uncorrected across pairs, conversion metrics only (#219) |
 | `sequential` (`GET /results/{id}/sequential`)     | beta   | the decision is mSPRT alone; `alpha_spending` is always empty (#232)              |
+| `holdout` (`GET /holdout/{id}/results`)           | beta   | the combined effect of running experiments on users first seen while the holdout was active; shipped flags are not part of it (#445) |
 | `warehouse_proportion`, `warehouse_mean`          | ga     | — (computed from sufficient statistics by the core estimators)                    |
 
 A notice is present **exactly** when the status is `beta` — the table refuses any other
 combination at import. This is separate from a route's `x-stability` (`stable`/`beta`), which
 is about the request and response _shape_: the warehouse routes are `x-stability: beta` while
-their numbers are `ga`. `/results` itself, `/bayesian` and `/sample-size` carry no
-`analysis_status`; they compute what their fields say. Post-stratification has no entry
-because it computes nothing — it answers 501.
+their numbers are `ga`, and the CUPED route is `x-stability: beta` while its numbers are `ga`.
+`/results` itself, `/bayesian` and `/sample-size` carry no `analysis_status`; they compute what
+their fields say. Post-stratification has no entry because it computes nothing — it answers
+501, and `/interactions/scan` reports overlap only and says so rather than carrying a label.
 
 > **Watch Out!** "Seeded" means reproducible **given the same inputs**. If late events arrive
 > tonight, tomorrow's recomputation for _today's_ bucket will differ — the seed is the same,
@@ -851,7 +906,7 @@ because it computes nothing — it answers 501.
 >>> from backend.app.core.stats_engine import derive_seed, as_of_bucket, make_rng, ENGINE_VERSION
 >>> from datetime import datetime, timezone, timedelta
 >>> ENGINE_VERSION
-'1.2.0'
+'1.4.0'
 >>> as_of_bucket(datetime(2026, 9, 11, 23, 59, tzinfo=timezone.utc)), as_of_bucket(datetime(2026, 9, 12, 0, 1, tzinfo=timezone.utc))
 ('2026-09-11', '2026-09-12')
 >>> as_of_bucket(datetime(2026, 9, 11, 20, 0, tzinfo=timezone(timedelta(hours=-5))))   # 20:00 EST = 01:00 UTC next day
@@ -865,7 +920,7 @@ True
 
 Then, against a running stack with a Bayesian-enabled experiment: call
 `GET /api/v1/results/{id}/bayesian` twice and diff the bodies (identical, including `seed`
-and `engine_version: "1.2.0"`; the route is not cached, and each call records the decision on
+and `engine_version: "1.4.0"`; the route is not cached, and each call records the decision on
 the experiment);
 query `SELECT kind, engine_version, seed, n_samples, as_of FROM experimentation.analysis_snapshots
 WHERE experiment_id = '…' ORDER BY created_at DESC LIMIT 5;` and confirm one `bayesian` row for
@@ -880,7 +935,7 @@ naming the hash it got. That failure is the reminder to bump the version.
 
 - Seed = `blake2b("{experiment_id}|{UTC day}|{n_samples}")` masked to 63 bits; `default_rng`
   only; stable across processes, machines and the dashboard/scheduler boundary.
-- `ENGINE_VERSION` (1.2.0) is bumped when numbers a client could have persisted would change;
+- `ENGINE_VERSION` (1.4.0) is bumped when numbers a client could have persisted would change;
   `test_engine_fingerprint.py` forces it (update the unreleased hash, or bump a released
   version; never edit a released hash). It's on the Bayesian, CUPED and bandit responses,
   every snapshot, and the `/results` cache key.
@@ -920,9 +975,10 @@ coarser ones would freeze a daily-updated posterior.
 
 **Q6. You bump a default prior from Beta(1,1) to Beta(2,2). What else must change?**
 `test_engine_fingerprint.py` will fail, and that decides it. If the current `ENGINE_VERSION`
-(1.2.0) has shipped — it has — bump it, update `test_stats_determinism.py` and both OpenAPI
+has shipped in a release, bump it, update `test_stats_determinism.py` and both OpenAPI
 snapshots (their `engine_version` defaults follow it), and add the new version's hash beside
-the old ones; never edit 1.2.0's hash. A client could have persisted numbers computed under
+the old ones; never edit a released version's hash. (If it has not shipped, replace its own
+hash: the change is part of that version.) A client could have persisted numbers computed under
 the old prior, and the snapshot's `engine_version` is how a reader tells the two apart. The
 `/results` cache key changes with it, so no old answer is served after the upgrade.
 
@@ -930,8 +986,8 @@ the old prior, and the snapshot's `engine_version` is how a reader tells the two
 `p_value: 0.03, is_significant: true`. Should the PM ship?
 → Not on that alone: uncorrected across three arms, the family-wise rate at 0.05 is ~14%.
 Re-request with `bonferroni` (0.09 → not significant) or `benjamini_hochberg`; check
-`sample_size_adequate`, the response's `srm` (the dashboard doesn't show it) and the primary
-metric's minimum sample size.
+`sample_size_adequate`, the response's `srm` (and that the recommendation is not `INCONCLUSIVE`
+because of it) and the primary metric's minimum sample size.
 
 ---
 
@@ -948,9 +1004,10 @@ variant at α = 0.05, 0.05/2, 0.05/3, 0.05/5. Plot n against the number of treat
 1,000 users per arm; compute per-segment p-values; repeat 1,000 times and report how often at
 least one segment is "significant" at α = 0.05 vs at α/10.
 
-**E4.4 — Novelty.** Generate 21 daily effects that decay from +0.15 to 0 exponentially, plus
-noise σ = 0.02; report the fitted slope and whether `detect_novelty_effect` flags it; then
-find the decay rate at which it stops flagging.
+**E4.4 — Novelty by hand.** Generate 21 daily effects that decay from +0.15 to 0 exponentially,
+plus noise σ = 0.02; fit `scipy.stats.linregress` of the effect on the day index and report the
+slope and its p-value; then find the decay rate at which a −0.05/day cut-off stops flagging, and
+say what that implies about the units the effect is expressed in.
 
 **E4.5 — Reproducibility audit.** Write a function that, given an `analysis_snapshots` row of
 kind `bayesian`, recomputes PtBB from the payload's posteriors using the row's `seed` and
@@ -1009,18 +1066,21 @@ predicts) — the number the amber warning exists to prevent from being screensh
 **S4.4**
 
 ```python
-from backend.app.services.interaction_detection_service import InteractionDetectionService as I
+import numpy as np
+from scipy import stats
 rng = np.random.default_rng(4); days = np.arange(21)
 for rate in (0.30, 0.20, 0.10, 0.05):
     y = 0.15 * np.exp(-rate * days) + rng.normal(0, 0.02, 21)
-    r = I.detect_novelty_effect(y.tolist()); print(rate, round(r.decline_rate, 4), r.has_novelty)
+    r = stats.linregress(days, y); print(rate, round(r.slope, 4), r.pvalue)
 ```
 
-A 0.15 effect decaying over 21 days has an average slope of at most −0.007/day — well above
-the −0.05 threshold — so none of these flag. The threshold is calibrated for effects
-expressed in the units the service receives (relative lifts in the results pipeline, where a
-30% → 0% decline over a week is −0.05/day); feed it absolute conversion-rate differences and
-it will never fire. Know your units before trusting a "no novelty" verdict.
+Slopes of −0.0056, −0.0056, −0.0050 and −0.0046 per day, every one with p < 0.001: the decline
+is unmistakable statistically, and a −0.05/day cut-off flags **none** of them. A 0.15 effect
+decaying over 21 days has an average slope of at most −0.007/day, an order of magnitude inside
+the cut-off. That is the lesson about units: a fixed threshold on a slope means something only
+for effects expressed in the unit it was chosen for (a relative lift, where a 30% → 0% decline
+over a week is −0.05/day). Fed absolute conversion-rate differences, the same cut-off never
+fires. Choose the unit first, and prefer the slope's p-value and a plot to a magic number.
 
 **S4.5**
 

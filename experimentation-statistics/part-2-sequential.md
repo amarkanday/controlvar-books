@@ -4,13 +4,14 @@
 
 [← Part I](./part-1-foundations.md) · [Contents](./README.md) · [Part III →](./part-3-sharper-estimates.md)
 
-Checking an ordinary fixed-horizon test repeatedly and stopping when it becomes significant can
-increase the false-positive rate. Hour 4 demonstrates the problem. Hours 5 and 6 explain the
-platform's mixture sequential probability ratio test (mSPRT) and its confidence sequence.
-
-The discussion connects the calculations to the response fields: `can_stop`,
-`always_valid_p_value`, `evidence_strength`, `recommended_action` and `at_risk`. It also explains
-why the sequential response carries a `beta` notice and no longer reports alpha-spending boundaries.
+Everyone looks at results before the planned end. This Part is about why that quietly
+destroys the guarantees of Part I (Hour 4), the one method the platform uses to make looking
+safe — the mixture sequential probability ratio test (mSPRT), an evidence ratio you may inspect
+at any moment (Hour 5) — and its companion, a confidence sequence that is the same test turned
+inside out, so the interval and the stop decision can never disagree (Hour 6). Hour 6 also
+covers the alpha-spending boundaries the platform used to report and no longer does, and
+why. By the end you'll know what `can_stop`, `always_valid_p_value`, `evidence_strength`,
+`recommended_action`, `at_risk` and the `beta` notice on the Sequential tab actually promise.
 
 > **Status.** The sequential analysis is **beta**: `GET /results/{id}/sequential` answers
 > `analysis_status: "beta"` and an `analysis_notice` saying that the stop/continue decision
@@ -24,14 +25,17 @@ why the sequential response carries a `beta` notice and no longer reports alpha-
 
 ### What & why
 
-For a valid fixed-horizon test at α = 0.05, the false-positive rate is controlled at 5% when its
-assumptions and planned analysis rule hold. Repeatedly checking the ordinary p-value and stopping
-at the first result below 0.05 changes that rule. In the example below, 20 daily looks produce a
-false-positive frequency of about 25% (the measured value is 0.247). A sequential method is needed
-if the stopping decision will depend on these interim results.
+A fixed-horizon test promises: _if there's no effect, a p-value below 0.05 happens 5% of the
+time_. The promise holds for **one** look at the pre-planned sample size. Look every day
+and stop the first time p dips below 0.05, and the promise breaks: under the null, the
+running p-value wanders, and over 20 daily looks the chance that it dips below 0.05 _at
+least once_ is not 5% but about 25% (the Try It below measures 0.247). With unlimited looks
+it is certain — a random walk crosses any fixed line eventually.
 
-Repeated testing can produce apparent improvements that fail to reproduce. The problem arises
-from the stopping rule, even when each individual p-value is calculated correctly.
+This isn't a subtle effect. It's the single most common way an experimentation program
+"finds" wins that don't replicate, and it happens without anyone doing anything that feels
+wrong: they just checked the dashboard. Note where the fault lies: each individual p-value is
+calculated correctly; it is the _stopping rule_ that changed the question.
 
 Three ways out:
 
@@ -53,7 +57,7 @@ schedule you like — is at most α. That's a strictly stronger guarantee than t
 one, and it's achieved by making the p-value _more conservative_ (larger) than the classical
 one at any single look. You pay a bit of power at a fixed n for the freedom to look whenever.
 
-### How Experimently does it
+### How Controlvar does it
 
 The experiment opts in with `sequential_testing_enabled: true` and a configuration,
 validated on the schema:
@@ -171,8 +175,8 @@ effect size, and you don't know it. The **mixture** SPRT (mSPRT) fixes that by a
 likelihood ratio over a prior distribution of effect sizes — a Gaussian centred at zero with
 variance τ² — so no single alternative has to be chosen.
 
-For a difference in proportions δ̂ = p_t − p_c with variance V_n, the mixture likelihood ratio
-has a closed form:
+For a difference in proportions δ̂ = p_t − p_c with variance V_n (below, the Agresti–Caffo
+variance), the mixture likelihood ratio has a closed form:
 
 ```
 Λ_n = √( V_n / (V_n + τ²) ) · exp( τ² · Z_n² / (2 · (V_n + τ²)) ),   Z_n = δ̂ / √V_n
@@ -191,7 +195,7 @@ the mixture near zero — more power for small effects, slower to declare large 
 the reverse. `0.001` (a standard deviation of ~3 percentage points on a difference of
 proportions) is the default for conversion metrics.
 
-### How Experimently does it
+### How Controlvar does it
 
 The core computation — quoted in full because the formula in the comment _is_ the method:
 
@@ -214,20 +218,19 @@ The core computation — quoted in full because the formula in the comment _is_ 
         p_t = treatment_successes / treatment_total
         delta = p_t - p_c
 
-        # Pooled variance of the difference in proportions
-        V_n = p_c * (1 - p_c) / control_total + p_t * (1 - p_t) / treatment_total
-
-        if V_n <= 0:
-            # Degenerate case (all 0s or all 1s in both groups)
-            return MSPRTResult(lambda_ratio=1.0, always_valid_p_value=1.0, can_stop=False,
-                               evidence_strength=EvidenceStrength.INCONCLUSIVE, boundary=boundary)
+        # Agresti-Caffo variance of the difference (#854): positive for any
+        # counts with n > 0, and the same V the confidence sequence uses.
+        V_n = self.difference_variance(
+            control_successes, control_total, treatment_successes, treatment_total
+        )
 
         Z_n = delta / math.sqrt(V_n)
 
         # mSPRT lambda: mixture likelihood ratio with Gaussian(0, tau^2) prior
         # Lambda_n = sqrt(V_n / (V_n + tau^2)) * exp(tau^2 * Z_n^2 / (2*(V_n + tau^2)))
         ratio = V_n / (V_n + tau_squared)
-        lambda_ratio = math.sqrt(ratio) * math.exp(tau_squared * Z_n**2 / (2.0 * (V_n + tau_squared)))
+        log_lambda = 0.5 * math.log(ratio) + tau_squared * Z_n**2 / (2.0 * (V_n + tau_squared))
+        lambda_ratio = math.exp(min(log_lambda, _LOG_FLOAT_MAX))
 
         can_stop = lambda_ratio >= boundary
         always_valid_p = min(1.0, 1.0 / lambda_ratio)
@@ -237,6 +240,25 @@ The core computation — quoted in full because the formula in the comment _is_ 
         return MSPRTResult(lambda_ratio=lambda_ratio, always_valid_p_value=always_valid_p, can_stop=can_stop,
                            evidence_strength=evidence_strength, boundary=boundary)
 ```
+
+Two details in that code deserve a pause, because both exist to stop the method misbehaving.
+
+**The variance is Agresti–Caffo, not the plug-in.** The obvious V is `p_c(1−p_c)/n_c + p_t(1−p_t)/n_t`.
+It is wrong exactly where experiments are fragile: with a small, low-rate arm it is too small, and
+with zero conversions in an arm it is _zero_. A V that is too small makes Z too large: in a
+simulation of 500 A/A experiments (9:1 split, 1% rate, 40 looks of 500 users; E2.6 reproduces
+it) the plug-in version told 25.6% of them to stop for an effect that was not there, against 3.8%
+with the variance the platform now uses. The fix was `difference_variance`: add one success and one failure to each arm, `p̃ = (x + 1)/(n + 2)`,
+and take `p̃_c(1−p̃_c)/(n_c + 2) + p̃_t(1−p̃_t)/(n_t + 2)`. It is positive for any counts with n > 0,
+so the "degenerate case" branch the method used to need is gone: two arms with no conversions are
+now a (strong) piece of evidence for the null rather than an error. The centre of everything
+stays the _observed_ difference; only the variance is adjusted.
+
+**Λ is computed in log space and capped.** For an overwhelming difference the exponential does
+not fit in a float. The code works with `log_lambda` and caps it at the log of the largest finite
+double, so the ratio always serialises as a finite JSON number. The cap cuts nothing that was
+finite before, and the capped value is still above `1/alpha` for any usable `alpha`, so it can
+still stop.
 
 Read the shape of Λ. With no difference (`Z_n = 0`) it's `√(V_n/(V_n+τ²)) < 1` — evidence
 slightly _for_ the null, because the mixture spreads probability over alternatives that
@@ -266,13 +288,15 @@ That two-sidedness is what `evidence_strength` classifies:
 `GET /results/{id}/sequential` (404 unless the experiment has `sequential_testing_enabled`)
 reads **current totals**, not a history:
 
-- the **control** and the **first non-control variant** only — a third or fourth arm is not
-  analysed by this route;
+- the **control** and the **first non-control variant** only (the one created first, so the
+  same arm on every call) — a third or fourth arm is not analysed by this route;
 - on the experiment's **primary metric** (else its first metric);
 - `*_total` = assignment rows for the variant; `*_successes` = **converting users**, counted
   exactly as `/results` counts them (`count_converting_users`, Part I Hour 2).
 
-`run_sequential_analysis` then assembles the block: the mSPRT result, the confidence
+The same function builds the `sequential_testing` block embedded in `GET /results/{id}` when
+sequential testing is enabled, so the two answers cannot disagree. `run_sequential_analysis`
+assembles the block: the mSPRT result, the confidence
 sequence (Hour 6), an evidence "trajectory", the long-running-risk estimate and a
 recommended action. The trajectory is a **single point** — the current totals:
 
@@ -349,15 +373,17 @@ Recompute Λ and the always-valid p by hand, then watch how τ² and α change t
 >>> from backend.app.services.sequential_testing_service import SequentialTestingService
 >>> svc = SequentialTestingService()
 >>> r = svc.compute_msprt(400, 10000, 520, 10000); r.lambda_ratio, r.always_valid_p_value, r.can_stop, r.evidence_strength
-(319.32..., 0.00313..., True, <EvidenceStrength.STRONG_FOR_EFFECT: 'strong_for_effect'>)
->>> p_c, p_t = 0.04, 0.052; V = p_c*(1-p_c)/1e4 + p_t*(1-p_t)/1e4; Z = (p_t-p_c)/math.sqrt(V); tau2 = 0.001
+(315.22..., 0.00317..., True, <EvidenceStrength.STRONG_FOR_EFFECT: 'strong_for_effect'>)
+>>> p_c, p_t = 0.04, 0.052; V = svc.difference_variance(400, 10000, 520, 10000); Z = (p_t-p_c)/math.sqrt(V); tau2 = 0.001
 >>> math.sqrt(V/(V+tau2)) * math.exp(tau2*Z**2/(2*(V+tau2)))                      # the same Λ
-319.32...
+315.22...
 >>> [round(svc.compute_msprt(400, 10000, 520, 10000, tau_squared=t).lambda_ratio, 1) for t in (0.0001, 0.001, 0.01)]
-[538.8, 319.3, 108.1]
+[531.8, 315.2, 106.7]
 >>> svc.compute_msprt(400, 10000, 520, 10000, alpha=0.10).boundary             # 1/alpha
 10.0
->>> svc.compute_msprt(0, 5000, 0, 5000).evidence_strength     # degenerate: inconclusive
+>>> svc.compute_msprt(0, 5000, 0, 5000).evidence_strength     # no conversions anywhere: evidence for the null
+<EvidenceStrength.STRONG_FOR_NULL: 'strong_for_null'>
+>>> svc.compute_msprt(0, 0, 0, 5000).evidence_strength        # an empty arm: nothing to say
 <EvidenceStrength.INCONCLUSIVE: 'inconclusive'>
 >>> a = svc.run_sequential_analysis(400, 10000, 520, 10000, {"alpha": 0.05, "actual_days": 10, "expected_days": 30, "required_sample_size": 10000})
 >>> a.recommended_action, a.at_risk, a.alpha_spending, len(a.evidence_trajectory)
@@ -365,7 +391,7 @@ Recompute Λ and the always-valid p by hand, then watch how τ² and α change t
 ```
 
 Compare the classical two-sided p for the same counts (≈ 0.00005 from Part I Hour 2) with the
-always-valid p of 0.0031 — larger, on purpose.
+always-valid p of 0.0032 — larger, on purpose.
 
 ### Key takeaways
 
@@ -390,7 +416,8 @@ read it at any time and it's still a (1 − α) interval.
 The cleanest way to build one is to **invert the test you already have**. The mSPRT tests
 "δ = 0". Run the same mixture test against every other candidate δ₀ instead, and keep the
 δ₀ values it would _not_ reject: Λ(δ₀) < 1/α. That set is an interval centred on δ̂, and with
-the plug-in variance V and the mixing variance τ² its half-width has a closed form:
+the variance V of the difference (the Agresti–Caffo one of Hour 5) and the mixing variance τ² its
+half-width has a closed form:
 
 ```
 half-width = √( V(V + τ²)/τ² · ( 2·ln(1/α) + ln((V + τ²)/V) ) )
@@ -404,7 +431,7 @@ Two properties follow directly, and both are the point:
 2. **It keeps narrowing.** The half-width falls roughly like √(V·log(1/V)) — a little slower
    than a classical interval's √V, which is the price of validity at every look.
 
-### How Experimently does it
+### How Controlvar does it
 
 ```python
 # 📁 backend/app/services/sequential_testing_service.py  (docstring abridged)
@@ -429,11 +456,9 @@ Two properties follow directly, and both are the point:
         p_t = treatment_successes / treatment_total
         delta_hat = p_t - p_c
 
-        V_n = p_c * (1 - p_c) / control_total + p_t * (1 - p_t) / treatment_total
-
-        if V_n <= 0:
-            # ln((V + tau^2) / V) is infinite: no finite interval.
-            return unbounded
+        V_n = self.difference_variance(
+            control_successes, control_total, treatment_successes, treatment_total
+        )
 
         margin = self.confidence_sequence_half_width(V_n, tau_squared, alpha)
 
@@ -455,15 +480,19 @@ Two properties follow directly, and both are the point:
 ```
 
 The result is intersected with [−1, 1], the range a difference of proportions can take, and
-it is exactly [−1, 1] when an arm is empty or the plug-in variance is 0 — the same cases in
-which `compute_msprt` reports Λ = 1. The route passes the same `alpha` and `tau_squared` to
+it is exactly [−1, 1] only when an arm is empty — the same case in which `compute_msprt` reports
+Λ = 1. (An arm with all 0s or all 1s used to have no finite interval, because the plug-in variance
+was 0. With the Agresti–Caffo variance it gets one: two arms of 5,000 with no conversions give
+±0.0011 around 0 and cannot stop.) The route passes the same `alpha` and `tau_squared` to
 both, so the agreement holds at whatever level you asked for.
 
 > **Watch Out!** If you read an older copy of this book, it gave the sequence as
 > δ̂ ± √(V + τ²)·√(2·ln(1/α)). That was the platform's formula before issue #231 was fixed.
 > It never narrowed below about ±0.078 at τ² = 0.001 however much data arrived, and it could
 > contain 0 while `can_stop` said stop. The inverted form above replaced it, in engine
-> version 1.2.0 (Part IV Hour 12).
+> version 1.2.0, and the switch to the Agresti–Caffo variance came with engine version 1.4.0
+> (Part IV Hour 12). Both changes move numbers a client may have stored, which is what the
+> engine version is for.
 
 `backend/tests/unit/stats_validation/test_sequential_confidence_sequence.py` holds the
 replacement to its two properties: agreement with `can_stop` and narrowing as n grows.
@@ -485,7 +514,7 @@ for the number of looks, because the looks are correlated. For two-sided α = 0.
 | OBF, K = 4        | 2.024              | 1.96 (boundaries 1.96/√t)           | ~5.8% — too liberal        |
 | OBF, K = 10       | ~2.09              | 1.96                                | ~6.9% — too liberal        |
 | Pocock, K = 4     | 2.361              | z at α/K = 2.498                    | ~3.5% — too strict         |
-| Pocock, K = 10    | 2.555              | z at α/K = 2.807                    | ~2.6% — too strict         |
+| Pocock, K = 10    | 2.555              | z at α/K = 2.807                    | ~2.5% — too strict         |
 
 (The error rates are 400,000-path simulations of a Brownian motion observed at K equally
 spaced looks; E2.4 reproduces them.)
@@ -506,8 +535,10 @@ stop/continue decision is the mSPRT alone, which stays valid however often anyon
 #### What the Sequential tab shows
 
 `SequentialMonitor` renders the beta notice (`AnalysisNotice`, from `analysis_status` and
-`analysis_notice`), the recommendation, the `at_risk` warning, the evidence-ratio chart (the
-one current point against the boundary), and the confidence sequence. That is the whole
+`analysis_notice`), the recommendation (`EarlyStoppingBanner`, which uses the sign of the
+confidence sequence to say whether a stop means the change is better or worse for the metric,
+when it can tell), the `at_risk` warning, the evidence-ratio chart (the one current point against
+the boundary), and the confidence sequence. That is the whole
 promise: a stop/continue verdict whose false-positive rate is at most α at every look, an
 interval that agrees with it, and advice when the experiment is dragging.
 
@@ -518,11 +549,11 @@ interval that agrees with it, and advice when the experiment is dragging.
 >>> from backend.app.services.sequential_testing_service import SequentialTestingService
 >>> svc = SequentialTestingService()
 >>> cs = svc.compute_always_valid_ci(400, 10000, 520, 10000); round(cs.lower, 4), round(cs.upper, 4), round(cs.width, 4)
-(0.0023, 0.0217, 0.0195)
+(0.0022, 0.0218, 0.0195)
 >>> V = 0.04*0.96/1e4 + 0.052*0.948/1e4; round(2 * 1.96 * math.sqrt(V), 4)    # classical width for comparison
 0.0116
 >>> [round(svc.compute_always_valid_ci(int(0.04*n), n, int(0.052*n), n).width, 4) for n in (1_000, 10_000, 100_000, 1_000_000)]
-[0.057, 0.0195, 0.0068, 0.0023]
+[0.0574, 0.0195, 0.0068, 0.0023]
 >>> # agreement: 0 outside the sequence exactly when can_stop
 >>> all(svc.compute_msprt(c, 10000, 520, 10000).can_stop == (lambda s: s.lower > 0 or s.upper < 0)(svc.compute_always_valid_ci(c, 10000, 520, 10000)) for c in range(300, 460, 2))
 True
@@ -610,15 +641,21 @@ real false-positive rates. For an observed z of 2.5 at look 2, say whether each 
 product manager who asks "so can I ship?" when `recommended_action` is `stop_for_effect`, the
 effect label is "negligible," and the sample-size meter is at 60%.
 
+**E2.6 — Why the variance matters.** Simulate 500 A/A experiments (both arms 1%, control
+gets 450 users and treatment 50 at each of 40 looks, `default_rng(0)`). Count how many ever have
+`can_stop` true under `compute_msprt`, and how many would under the plug-in variance
+`p_c(1−p_c)/n_c + p_t(1−p_t)/n_t` with the same formula for Λ.
+
 ---
 
 ## Solutions
 
 **S2.1** — p_c = 0.04, p_t = 0.048, δ = 0.008; V_n = 0.04·0.96/7500 + 0.048·0.952/7500 ≈
-1.121e−5; Z_n ≈ 2.39; ratio = V/(V+τ²) ≈ 0.01109; Λ ≈ √0.01109 · exp(0.001·5.71/(2·0.0010112))
-≈ 0.1053 · exp(2.824) ≈ 1.77. `can_stop` False (1.77 < 20); always-valid p ≈ 0.565 —
-inconclusive, while the classical two-sided p ≈ 0.017 would have "passed." That gap is Hour 4
-in one number.
+1.121e−5 with the plug-in variance, 1.124e−5 with the Agresti–Caffo variance the platform uses
+(`svc.difference_variance(300, 7500, 360, 7500)`); take the latter. Z_n ≈ 2.39; ratio =
+V/(V+τ²) ≈ 0.01112; Λ ≈ √0.01112 · exp(0.001·5.69/(2·0.0010112)) ≈ 0.1054 · exp(2.813) ≈ 1.76.
+`can_stop` False (1.76 < 20); always-valid p ≈ 0.568 — inconclusive, while the classical
+two-sided p ≈ 0.017 would have "passed." That gap is Hour 4 in one number.
 
 **S2.2**
 
@@ -635,14 +672,15 @@ def first_stop(rng, lift):
     return None
 rng = np.random.default_rng(3); first_stop(rng, 0.10), first_stop(rng, 0.0)      # (None, None)
 rng = np.random.default_rng(42); runs = [first_stop(rng, 0.10) for _ in range(500)]
-sum(d is not None for d in runs) / 500                                              # 0.112
-rng = np.random.default_rng(43); sum(first_stop(rng, 0.0) is not None for _ in range(1000)) / 1000   # 0.011
+sum(d is not None for d in runs) / 500                                              # 0.11
+rng = np.random.default_rng(43); sum(first_stop(rng, 0.0) is not None for _ in range(1000)) / 1000   # 0.009
 ```
 
 With `default_rng(3)` neither case stops. Across 500 runs a 10% lift on a 4% base stops
 within 30 days only about 11% of the time (median day 13 among those that do): at 15,000
-users per arm the effect is too small for this test to resolve in a month. A 30% lift stops
-in 96% of runs (median day 11). With no effect it stopped in 1.1% of 1,000 runs — inside the
+users per arm the effect is too small for this test to resolve in a month. A 30% lift
+(`default_rng(44)`, 500 runs) stops in 96% of runs (median day 11). With no effect it stopped
+in 0.9% of 1,000 runs — inside the
 5% the guarantee allows, and well under it because the guarantee holds for unlimited looks
 and this run took only 30.
 
@@ -676,6 +714,31 @@ the false-positive rate), but the effect is negligible in size and we've seen on
 the users the plan calls for, so the estimate of _how big_ it is will move. Ship it if a
 small win is worth the change; if you need to know the size, keep running until the
 sample-size meter is green."
+
+**S2.6**
+
+```python
+import math, numpy as np
+from backend.app.services.sequential_testing_service import SequentialTestingService
+svc = SequentialTestingService()
+def plug_in_stops(c, nc, t, nt, tau=0.001, alpha=0.05):
+    pc, pt = c / nc, t / nt; V = pc * (1 - pc) / nc + pt * (1 - pt) / nt
+    if V <= 0: return False
+    Z = (pt - pc) / math.sqrt(V)
+    return math.sqrt(V / (V + tau)) * math.exp(tau * Z * Z / (2 * (V + tau))) >= 1 / alpha
+rng = np.random.default_rng(0); old = new = 0
+for _ in range(500):
+    c = t = nc = nt = 0; o = n = False
+    for look in range(40):
+        c += rng.binomial(450, 0.01); t += rng.binomial(50, 0.01); nc += 450; nt += 50
+        o = o or plug_in_stops(c, nc, t, nt); n = n or svc.compute_msprt(c, nc, t, nt).can_stop
+    old += o; new += n
+old / 500, new / 500                                     # (0.256, 0.038)
+```
+
+The plug-in version stops 25.6% of experiments that have no effect, the Agresti–Caffo version
+3.8%. With a small arm and a low rate, the early looks see zero or one conversion in the small
+arm, the plug-in variance collapses, and a tiny observed difference looks enormous.
 
 ---
 

@@ -4,16 +4,16 @@
 
 [Contents](./README.md) · [Part II →](./part-2-aws.md)
 
-Experimently uses the same application images in several deployment environments. Hour 1 compares
-the development and production Compose configurations. Hour 2 covers the
-core and full image targets. Hour 3 follows startup through configuration checks, database readiness,
-bootstrap, seeding and process handoff.
+Before AWS, the stack that runs everywhere else: on a laptop, on a customer's VM, in CI. It's
+two compose files — the development one you build from a checkout and the production one that
+runs the published images (Hour 1) — two images, each built in a `core` and a `full` profile
+(Hour 2), and an entrypoint that checks its settings and turns an empty Postgres into a
+signed-in platform without a human in the loop (Hour 3). Everything in Parts II–IV is a
+different way of running the same images with the same entrypoint — so this Part is the
+foundation, not the warm-up. Have a checkout open and Docker running; every Try It Yourself
+below works on a laptop.
 
-Start with the local stack before moving to AWS; it provides a convenient environment for inspecting
-these behaviors.
-
-> **Verified against** getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
-> changes). One codebase, Apache-2.0 throughout, built in two **profiles**: **core** (`backend/`
+> **Verified against** Controlvar v0.36.4 (`79f8ed18`). One codebase, Apache-2.0 throughout, built in two **profiles**: **core** (`backend/`
 > only) and **full** (adds the optional modules under `modules/`). The profile is decided by
 > whether `import modules` succeeds in the image, and `modules-manifest.txt` is the authority on
 > what is a module.
@@ -30,7 +30,7 @@ The repository has **two**, for two different jobs:
 
 - **`docker-compose.yml`** at the repository root is the **development** stack: it _builds_ the
   images from your checkout, ships demo defaults (a demo admin, demo seeds, localhost CORS
-  origins), and publishes every port on the host. It has four core services — `postgres`,
+  origins), and publishes every port on the host's loopback address (`127.0.0.1`) only. It has four core services — `postgres`,
   `redis`, `api`, `frontend` — and three **compose profiles** that add optional ones: `demo`
   (ShopLab, StreamPulse and their traffic simulators), `tools` (pgAdmin), `aws` (LocalStack for
   the DynamoDB/Kinesis/S3 paths). A compose profile is off unless named.
@@ -53,16 +53,23 @@ declared, not scripted**: `RUN_MIGRATIONS` and `SEED` are environment variables 
 reads (Hour 3), so "a fresh database becomes a usable platform" is a property of the image, not
 of a README.
 
-### How Experimently does it
+### How Controlvar does it
 
 The header is the operator's manual:
 
 ```yaml
 # 📁 docker-compose.yml
-# Experimently — local / self-hosted stack.
+# Controlvar — the LOCAL DEVELOPMENT stack, built from this checkout.
+#
+# It is for one machine: every port below is published on 127.0.0.1 only.
+# ENVIRONMENT=development accepts a short or placeholder SECRET_KEY, and the
+# first start creates a demo administrator with a documented password. To run
+# Controlvar on a server, use the published images in
+# deploy/compose/compose.yml instead.
 #
 #   docker compose up -d --wait            # postgres + redis + api + dashboard
-#   docker compose --profile demo up -d    # + ShopLab (:3200), StreamPulse (:3300)
+#   SEED=demo,shoplab,streampulse docker compose --profile demo up -d --wait
+#                                          # + ShopLab (:3200), StreamPulse (:3300)
 #                                          #   and their traffic simulators
 #   docker compose --profile tools up -d   # + pgAdmin (:5050)
 #   docker compose --profile aws up -d     # + LocalStack (:4566)
@@ -71,7 +78,7 @@ The header is the operator's manual:
 # Every ${VAR:-default} below can be set in a `.env` file next to this file
 # (compose reads it automatically) or in the shell. Defaults are for a local
 # development stack: change SECRET_KEY, FIRST_SUPERUSER_PASSWORD and
-# POSTGRES_PASSWORD before exposing the stack to anyone.
+# POSTGRES_PASSWORD before you ever put the stack in front of anyone else.
 #
 # First start: the api container waits for Postgres, creates the schema
 # (RUN_MIGRATIONS=true -> python -m backend.app.db.bootstrap) and applies the
@@ -79,7 +86,8 @@ The header is the operator's manual:
 # two flags). Seeds run once per database (seed_markers table).
 ```
 
-The image names follow the build profile, so a `core` and a `full` build can sit side by side:
+The image names follow the build profile, so a `core` and a `full` build can sit side by side
+(the local image names kept the pre-rename `experimently-` prefix):
 
 ```yaml
 # 📁 docker-compose.yml
@@ -188,7 +196,7 @@ nginx's static `/healthz`:
       # connect-src of the CSP; add the API origin when NEXT_PUBLIC_API_URL is absolute.
       CSP_CONNECT_SRC: "${CSP_CONNECT_SRC:-'self' ws: wss:}"
     ports:
-      - "${FRONTEND_HOST_PORT:-3000}:8080"
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:8080"
     depends_on:
       api:
         condition: service_healthy
@@ -222,7 +230,7 @@ start:
       - -c
       - >-
         test -f /data/demo/shoplab/.api_key
-        || { echo "no /data/demo/shoplab/.api_key — start the api with SEED=demo,shoplab"; exit 1; };
+        || { echo "no /data/demo/shoplab/.api_key: the shoplab seed has not run. Start the stack with: SEED=demo,shoplab,streampulse docker compose --profile demo up -d --wait"; exit 1; };
         exec python demo/shoplab/simulator/traffic.py
         --api-url http://api:8000
         --api-key "$$(cat /data/demo/shoplab/.api_key)"
@@ -237,39 +245,24 @@ AWS paths use: `SERVICES: dynamodb,s3,kinesis,sqs,cognito-idp`, pointed at with
 #### The production compose file
 
 Hardening the development file with a `.env` is no longer how you self-host. The production file
-is a different contract, stated in its header:
+is a different contract, and it opens by saying so:
 
 ```yaml
 # 📁 deploy/compose/compose.yml
-# Experimently -- production compose file (self-hosting on one Docker host).
+# Controlvar: the production compose file, for one Docker host. It runs the
+# published images and builds nothing.
 #
-# This file runs the PUBLISHED images. It never builds, it ships no demo
-# services and no seeded demo users, and it starts nothing that listens on the
-# host except the dashboard. For a development stack built from a checkout,
-# use the repository's docker-compose.yml instead.
-#
-#   ./generate-env.sh              # writes .env with generated secrets, once
-#   docker compose up -d --wait    # postgres + redis + api + web
-#   docker compose logs -f api     # first start creates the schema and admin
-#
-# Settings come from the `.env` file next to this file. The five marked
-# REQUIRED have no default: compose refuses to start (and `docker compose
-# config` exits non-zero) naming the first one that is unset or empty.
-#
-#   SECRET_KEY                 REQUIRED  signs sessions and tokens
-#   FIRST_SUPERUSER            REQUIRED  email of the first administrator
-#   FIRST_SUPERUSER_PASSWORD   REQUIRED  used only while the users table is empty
-#   POSTGRES_PASSWORD          REQUIRED  the database password
-#   PUBLIC_BASE_URL            REQUIRED  the URL people open, e.g.
-#                                        https://experimently.example.com; the
-#                                        API answers only for this host name
-#   AUDIT_HMAC_KEY             full profile only: signs audit events
-#   EXPERIMENTLY_PROFILE       core (default) or full
-#   HTTP_BIND / HTTP_PORT      where the dashboard listens (127.0.0.1:8080);
-#                              put your TLS reverse proxy in front of it
-#   POSTGRES_SERVER            an external database host instead of the bundled
-#                              one; then start only `docker compose up -d api web`
+# README.md beside this file says how to run it and lists its settings.
 ```
+
+The settings live in `deploy/compose/README.md` ([the app's copy at v0.36.4](https://github.com/Controlvar/controlvar/blob/v0.36.4/deploy/compose/README.md)).
+Five have no default and compose refuses to start, naming the first one that is unset or empty:
+`PUBLIC_BASE_URL` (the URL people open), `SECRET_KEY`, `FIRST_SUPERUSER` (the first
+administrator's email), `FIRST_SUPERUSER_PASSWORD` and `POSTGRES_PASSWORD`. The optional ones:
+`AUDIT_HMAC_KEY` (needed by the `full` profile), `EXPERIMENTLY_PROFILE` (`core` or `full`),
+`HTTP_BIND` / `HTTP_PORT` (where the dashboard listens, `127.0.0.1:8080` by default, for a TLS
+reverse proxy to sit in front of) and `POSTGRES_SERVER` (an external database instead of the
+bundled one; then start only `docker compose up -d api web`).
 
 The "required" is enforced by compose itself, with the `${VAR:?message}` form — there is no
 default to forget to change:
@@ -281,13 +274,15 @@ name: experimently-selfhost
 services:
   ...
   api:
-    image: ghcr.io/getexperimently/experimently:${EXPERIMENTLY_PROFILE:-core}-0.17.0 # x-release-please-version
+    image: ghcr.io/controlvar/controlvar:${EXPERIMENTLY_PROFILE:-core}-0.36.4 # x-release-please-version
+    # Published for linux/amd64 only (#181): an arm64 host runs it emulated.
+    platform: linux/amd64
     environment:
       ENVIRONMENT: production
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: json
       ...
-      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?required: the URL people open, e.g. https://experimently.example.com}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?required: the URL people open, e.g. https://controlvar.example.com}"
       SECRET_KEY: "${SECRET_KEY:?required: generate with openssl rand -hex 32}"
       ...
       RUN_MIGRATIONS: "true"
@@ -296,17 +291,18 @@ services:
       SEED: ""
   ...
   web:
-    image: ghcr.io/getexperimently/experimently-web:${EXPERIMENTLY_PROFILE:-core}-0.17.0 # x-release-please-version
+    image: ghcr.io/controlvar/controlvar-web:${EXPERIMENTLY_PROFILE:-core}-0.36.4 # x-release-please-version
     ...
     ports:
       - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
 ```
 
-Four things to notice. The project name is fixed (`experimently-selfhost`) so it never adopts the
-development stack's containers and volumes. The image tags are literal versions that the release
+Four things to notice. The project name is fixed (`experimently-selfhost`, a name that survived the
+rename on purpose) so it never adopts the development stack's containers and volumes, and so the
+volume names are the same on every host. The image tags are literal versions that the release
 process moves (`core-X.Y.Z` / `full-X.Y.Z`, the `x-release-please-version` marker) — no floating
-tag. The images are public on GHCR (`ghcr.io/getexperimently/experimently` and
-`ghcr.io/getexperimently/experimently-web`), signed with cosign keyless signatures, and built for
+tag. The images are public on GHCR (`ghcr.io/controlvar/controlvar` and
+`ghcr.io/controlvar/controlvar-web`), signed with cosign keyless signatures, and built for
 amd64 only. And `deploy/compose/generate-env.sh` writes the `.env` once — it refuses to overwrite
 an existing one, because a second run would rotate `SECRET_KEY`, and write a
 `FIRST_SUPERUSER_PASSWORD` and a `POSTGRES_PASSWORD` the existing database no longer accepts. The
@@ -375,9 +371,7 @@ Then set `REDIS_REQUIRED=true`, `docker compose stop redis`, and watch `/health/
 
 ---
 
-<a id="hour-2--the-images-two-multi-stage-dockerfiles-and-the-nginx-single-origin-trick"></a>
-
-## Hour 2 — Multi-stage images and single-origin serving
+## Hour 2 — The images: two multi-stage Dockerfiles and the nginx single-origin trick
 
 ### What & why
 
@@ -398,13 +392,13 @@ imports are `backend.app.*`, the dashboard because the modules' dashboard code l
 runtime switch**: `core` and `full` are different images, and each asserts at build time that it
 contains what its profile says.
 
-### How Experimently does it
+### How Controlvar does it
 
 The API image's contract, from its own header:
 
 ```dockerfile
 # 📁 backend/Dockerfile
-# Experimently API image.
+# Controlvar API image.
 #
 # Build context is the REPOSITORY ROOT (the code imports `backend.app.*`):
 #
@@ -439,7 +433,7 @@ RUN pip install --upgrade pip && pip install --require-hashes -r /tmp/runtime.lo
 
 FROM python:${PYTHON_VERSION}-slim AS runtime
 ...
-RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get update && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
         libpq5 \
         postgresql-client \
@@ -528,8 +522,10 @@ COPY --from=modules-tree /modules/frontend/ /app/modules/frontend/
 # absolute URL only when the dashboard is served from a different origin.
 ARG NEXT_PUBLIC_API_URL=""
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-# The documentation site the dashboard links to (frontend/src/services/docs.ts).
-# Empty means the published site; set it for a deployment that hosts its own.
+# Where the dashboard's docs links go (frontend/src/services/docs.ts). Empty,
+# the default here, means the Markdown under docs/ on GitHub's main branch. Set
+# it to the origin of a built MkDocs site (the published one, or one this
+# deployment hosts) to link there instead; only `npm run build:marketing` sets it.
 ARG NEXT_PUBLIC_DOCS_URL=""
 ENV NEXT_PUBLIC_DOCS_URL=${NEXT_PUBLIC_DOCS_URL}
 
@@ -555,9 +551,10 @@ way, an image whose contents disagree with its profile label fails to build rath
 
 The dashboard no longer renders the documentation itself, so `docs/` is not copied into the image.
 "Read the guide" links go out through `docsUrl()` in `frontend/src/services/docs.ts`: by default
-to the Markdown in the GitHub repository, or, with `NEXT_PUBLIC_DOCS_URL` set at build time, to a
-built MkDocs site such as the published one at `https://getexperimently.github.io/experimently/`
-(deployed from release tags by the `docs.yml` workflow).
+to the Markdown under `docs/` in the GitHub repository, or, with `NEXT_PUBLIC_DOCS_URL` set at
+build time, to a built MkDocs site such as the published one at `https://docs.controlvar.com/`
+(deployed from release tags by the `docs.yml` workflow; the repository is the default because it
+cannot be missing, whatever version a self-hosted dashboard happens to be).
 
 The nginx config is a template with exactly two variables expanded — everything else that
 looks like `$var` is nginx syntax and must survive:
@@ -575,7 +572,7 @@ looks like `$var` is nginx syntax and must survive:
 #   /health*    -> API health probes (so `curl :3000/health/ready` reaches the API)
 #   /healthz    -> this container (static liveness for orchestrators)
 #   everything else -> the static export in /usr/share/nginx/html; dynamic Next
-#                      routes come from the generated experimently-routes.conf.
+#                      routes come from the generated controlvar-routes.conf.
 ...
     location /api/ {
         proxy_pass ${API_UPSTREAM};
@@ -693,13 +690,13 @@ Who runs that step depends on where you are. In compose, the single API containe
 (`RUN_MIGRATIONS=true`). On AWS, the API never
 does: a separate migration task does, before each deploy (end of this Hour).
 
-### How Experimently does it
+### How Controlvar does it
 
 The entrypoint's contract, and its safety property:
 
 ```bash
 # 📁 backend/docker-entrypoint.sh
-# Experimently API container entrypoint.
+# Controlvar API container entrypoint.
 #
 #   0. python -m backend.app.core.preflight: the settings check. Every problem
 #      it finds is printed in one list and the container exits 78 (EX_CONFIG)
@@ -714,7 +711,7 @@ The entrypoint's contract, and its safety property:
 #      matching backend/scripts/seed_*.py once. Completed seeds are recorded in
 #      the `seed_markers` table (backend/scripts/seed_markers.py) so a restart
 #      of the container does not re-seed. SEED_FORCE=true re-runs them.
-#      demo, shoplab and streampulse are development-only: they are refused,
+#      Every seed is development-only: SEED=<any of them> is refused,
 #      before step 1, unless ENVIRONMENT is development or test.
 #   4. exec "$@" — by default uvicorn; `--workers ${WEB_CONCURRENCY:-1}` and the
 #      proxy flags are appended when the command is uvicorn and the caller did
@@ -732,7 +729,7 @@ deployment is told everything that is wrong in one go instead of one refusal per
 
 ```bash
 # 📁 backend/docker-entrypoint.sh
-refuse_demo_seeds_outside_development() {
+refuse_seeds_outside_development() {
     local seed_list="${SEED:-}"
     [ -z "$seed_list" ] && return 0
     local env_raw="${ENVIRONMENT:-${APP_ENV:-development}}"
@@ -742,14 +739,14 @@ refuse_demo_seeds_outside_development() {
     esac
     ...
         case "$name" in
-            demo|shoplab|streampulse)
+            demo|shoplab|streampulse|sdk-contract)
                 log "SEED=${seed_list} is for development and is refused when ENVIRONMENT=${env_raw}. Remove SEED."
                 exit 78
                 ;;
         esac
     ...
 }
-refuse_demo_seeds_outside_development
+refuse_seeds_outside_development
 
 cd /app
 
@@ -761,7 +758,8 @@ and production the preflight requires `SECRET_KEY`, `FIRST_SUPERUSER_PASSWORD` a
 `AUDIT_HMAC_KEY` to be present, long enough and not a published placeholder; requires
 `PUBLIC_BASE_URL` (or an explicit `ALLOWED_HOSTS`) and `POSTGRES_SERVER`; and refuses
 `DATABASE_URL`/`DATABASE_URI`, which the image does not read. It never prints a secret's value.
-(`sdk-contract` is not a demo seed and is allowed everywhere.)
+(`sdk-contract` is on that list too: it creates the demo accounts and API keys the SDK contract
+suites use, and those are as unwelcome in production as the demo user.)
 
 Step 1 uses `pg_isready` when present and a raw TCP probe otherwise, with a deadline:
 
@@ -924,7 +922,11 @@ raw `alembic upgrade heads` behaves the same way as the bootstrap.
 Note this is a _blocking_ advisory lock (`pg_advisory_lock`), unlike the schedulers'
 non-blocking `pg_try_advisory_lock` (Hour 9): a container that arrives second should _wait_
 for the schema, not skip it. And the OpenSSL probe near the top of the entrypoint — a
-real-world wrinkle worth knowing:
+real-world wrinkle worth knowing. Only exit 132 (SIGILL) means "this CPU"; any other failure is a
+broken install and is logged as one. The decision is also saved as a marker file so that a Python
+process started later with `docker compose exec` gets the same setting, because the entrypoint's
+`export` reaches only its own children. The marker is removed first on every start, so a stale one
+cannot hide what this CPU does:
 
 ```bash
 # 📁 backend/docker-entrypoint.sh
@@ -932,11 +934,16 @@ real-world wrinkle worth knowing:
 # code paths from the CPU flags the kernel advertises. Some arm64 VMs (Docker
 # Desktop on Apple M4, for one) advertise SVE/SME that the guest cannot
 # execute, and the import dies with SIGILL (exit 132). Probe once; if it
-# crashes, tell OpenSSL to skip the optimised paths for this process tree.
+# crashes, tell OpenSSL to skip the optimised paths.
+...
 if [ -z "${OPENSSL_armcap:-}" ]; then
-    if ! python -c "from cryptography.hazmat.bindings._rust import openssl" >/dev/null 2>&1; then
-        log "cryptography's OpenSSL crashed on this CPU; setting OPENSSL_armcap=0 (asm optimisations off)"
+    openssl_rc=0
+    python -c "from cryptography.hazmat.bindings._rust import openssl" >/dev/null 2>&1 || openssl_rc=$?
+    if [ "$openssl_rc" -eq 132 ]; then
         export OPENSSL_armcap=0
+        ...
+    elif [ "$openssl_rc" -ne 0 ]; then
+        log "the cryptography import failed (exit ${openssl_rc}); not a CPU problem, OPENSSL_armcap left unset"
     fi
 fi
 ```
@@ -1021,7 +1028,7 @@ database and confirm from the logs that one created and the other upgraded (foun
 
 - Entrypoint: demo-seed refusal + settings preflight (exit 78, every problem at once, cannot be
   skipped) → wait (deadline) → bootstrap (`RUN_MIGRATIONS`) → seeds by name, once
-  (`seed_markers`), unknown name fatal, demo seeds development-only → `exec` uvicorn with
+  (`seed_markers`), unknown name fatal, every seed development-only → `exec` uvicorn with
   workers and proxy flags. `set -euo pipefail`: a failed step stops the container.
 - Bootstrap: fresh DB → `create_all` + `stamp heads`; existing → `upgrade heads` (two heads in a
   full checkout); refuses a database a newer release migrated; first superuser if `users` is
@@ -1147,8 +1154,8 @@ sign-in may return to), and `PUBLIC_BASE_URL` is now the API's own origin.
 uses the same `ensure_schema`/`SessionLocal` helpers as `seed_sdk_contract.py`; markers work
 unchanged because they key on the name. The compose comment listing seed names and the
 entrypoint's error message both need the new name. If it creates sample users or data a
-production install must never carry, add it to the `demo|shoplab|streampulse` arm of
-`refuse_demo_seeds_outside_development` too.
+production install must never carry, add it to the `demo|shoplab|streampulse|sdk-contract` arm of
+`refuse_seeds_outside_development` too.
 
 **S1.4** — the single-stage image carries gcc, the libc and kernel headers, libpq-dev and pip.
 Nothing in it is needed at runtime; it is also more surface for the image scan in CI (Hour 10),
