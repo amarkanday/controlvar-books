@@ -1,23 +1,27 @@
 # Build an Experimentation Platform in 28 Days
 
-### _The Experimently Architecture — How a Real A/B-Testing & Feature-Flag Platform Is Actually Built_
+### _The Controlvar Edition — How a Real A/B-Testing & Feature-Flag Platform Is Actually Built_
 
-> **Preface.** This book explains how Experimently's components work together. It assumes the Python,
-> FastAPI and React/Next.js material from the earlier books, then follows an experiment through
-> assignment, event collection, analysis and the dashboard. Later chapters cover targeting,
-> schedulers, SDKs, deployment and operations. Each week ends with a practical exercise that
-> connects the components discussed in that week.
+> **Preface.** You've learned [Python](../learn-python-in-24-hours/README.md),
+> [FastAPI](../learn-fastapi-in-24-hours/README.md) and
+> [React/Next.js](../learn-react-nextjs-in-24-hours/README.md). You can read the code. This
+> book answers the bigger question: **how do all the pieces fit together to make a real
+> platform?** It's a guided tour of the _entire_ Controlvar stack — a FastAPI backend that
+> assigns users to variants and evaluates feature flags, a statistics engine that turns events
+> into decisions, five background schedulers that keep experiments and rollouts moving, a
+> Next.js dashboard, sixteen SDKs speaking one contract, and AWS infrastructure in CDK —
+> explaining not just _what_ each technology is, but _how Controlvar uses it and why._ By
+> Day 28 you'll understand the system well enough to extend it.
 
 ---
 
-<a id="why-28-days-and-not-7"></a>
+## Why 28 days (and not 7)
 
-## How the book is organized
-
-The book is divided into four weeks, each covering a different area of the platform. The order
-starts with the experiment workflow, then adds request handling, advanced features and operations.
-The reviewed system includes optional modules, five schedulers, sixteen SDKs and the application
-checks discussed in the final week.
+A todo app fits in a weekend. **Controlvar is a production system** — a core backend with
+36 API endpoint modules, a set of optional modules beside it, five schedulers, a stats
+engine, a Next.js dashboard, sixteen SDKs (13 of them run against a live backend in CI), and 20
+required status checks on every pull request. Teaching it honestly takes four weeks, one theme
+each:
 
 - **Week 1 — The Core Loop.** Assign a user, track an event, compute a result. The domain
   model, deterministic hashing, conversion matching, and the statistics that turn counts into a
@@ -42,31 +46,30 @@ Each **Day** is a full chapter-length lesson (set aside ~2–3 hours) with the s
 
 1. **What & why** — the technology, the problem it solves, and the _architecture reasoning_
    (the tradeoffs, and the alternatives the team rejected).
-2. **How Experimently does it** — the real subsystem walked thoroughly, with file paths and
+2. **How Controlvar does it** — the real subsystem walked thoroughly, with file paths and
    verified `# 📁` code/config.
 3. **Build It** — a concrete exercise (often: find/trace/modify something in the repo).
 4. **Key takeaways**, then a **Q&A** that pressure-tests what you just read.
 
-Sidebars provide additional context and point out limitations. Each week ends with a capstone
-that traces a feature across components, followed by a workshop with questions, a quiz and worked
-exercise solutions.
+Sams-style sidebars — **By the Way**, **Watch Out!**, **Did You Know?** — run throughout.
+Each **Week** ends with a **Capstone** that traces one real feature end-to-end, then a
+**Workshop**: a quiz (with answers) and exercises (with worked solutions) to lock it in.
 
-> **Convention.** `# 📁 path` = real Experimently source. Snippets are sometimes trimmed for
-> teaching; the file path lets you read the full version. You'll need a clone of the
-> [`getexperimently/experimently`](https://github.com/getexperimently/experimently) repository
-> open alongside this book — the _Build It_ exercises send you into it. Paths are relative to
-> the repository root.
->
-> **Verified against** getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
-> changes, including three breaking ones: #747, #769, #770). This page and Week 1 were checked
-> against that commit.
+> **Convention.** `# 📁 path` = real Controlvar source at v0.36.4. Snippets are sometimes trimmed
+> for teaching (a `...` marks what was left out, and a long signature may be joined onto one
+> line); the file path lets you read the full version. You'll need a clone of the
+> [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar) repository open alongside
+> this book, at tag `v0.36.4` if you want every line to match — the _Build It_ exercises send you
+> into it. Paths are relative to the repository root. Controlvar was called Controlvar before
+> 0.35.0; you will still meet the old name in some identifiers (`experimently.token`,
+> `EXPERIMENTLY_PROFILE`, the `experimentation` database schema), and the text says so where it
+> matters.
 
 ---
 
 ## The whole system on one page
 
-The following diagram shows the main components and request paths. Refer to it when tracing the
-individual services in the chapters.
+Before Day 1, here's the map. Keep it handy; every Day fills in one box.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -81,7 +84,7 @@ individual services in the chapters.
 │  FASTAPI  backend/app/main.py                                                 │
 │   middleware, outermost first: CORS → RequestID → Prometheus →                │
 │     SecurityHeaders → TrustedHost → RateLimit → RelativeSlashRedirect →       │
-│     UnhandledError                                                            │
+│     RequestBodyLimit → UnhandledError                                         │
 │   api/deps.py: get_db · get_current_user · get_api_key · RBAC                 │
 │   api/v1/endpoints/*.py  →  services/*.py  →  models/*.py (SQLAlchemy)        │
 │   + module routers from modules/ (full profile only)                          │
@@ -125,7 +128,7 @@ rollouts, safety, statistics, dashboards — is built around those two rows.
 
 ### Week 1 — The Core Loop _(Days 1–7)_ → [`week-1-core-loop.md`](./week-1-core-loop.md)
 
-1. The big picture: Experimently's architecture and the "0% conversions" bug
+1. The big picture: Controlvar's architecture and the "0% conversions" bug
 2. The repo and the dev loop: venv, PostgreSQL, uvicorn, the dashboard
 3. The domain model: experiments, variants, metrics, assignments, events
 4. Assignment: deterministic hashing and sticky rows
@@ -161,7 +164,7 @@ rollouts, safety, statistics, dashboards — is built around those two rows.
 25. Containers and the compose stack
 26. AWS: the CDK stacks, ECS Fargate, the one-path deploy, and the full-profile data stacks
 27. Observability: structured logs, Prometheus, health probes, alerting
-28. **Capstone:** the whole picture — you can build Experimently
+28. **Capstone:** the whole picture — you can build Controlvar
 
 ---
 
@@ -185,11 +188,19 @@ After this capstone, three **specialization** books go deeper on the hardest sub
 
 _Set aside four weeks. Open the repo. Turn to [Week 1](./week-1-core-loop.md). 🏗️_
 
+## A note on accuracy
+
+Verified against Controlvar v0.36.4 (`79f8ed18`). Every `# 📁` excerpt was copied from the file
+at that tag, and `tools/` in this repository checks that each cited path exists and that every
+identifier in an excerpt occurs in its file. The numbers quoted (the 20 required checks, the 16
+SDKs and the 13 that run live, the 2,191 local-evaluation cases, the nine middleware layers, the
+test counts) were counted in that tree. The commands in the _Build It_ sections were read against
+the code, not run for this edition. Re-check the book yourself by following `tools/README.md`.
+
 ## Related reading — Production Engineering
 
-The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
-book or guide retains its original reference commit. See the book README for scope and verification.
+The Production Engineering specialization is pinned to the same Controlvar release.
 
 - [Complete experiment walkthrough](../production-engineering/part-1-experiment-design.md#hour-2--a-complete-experiment-from-hypothesis-to-removal)
 - [Distributed correctness](../production-engineering/part-2-reliable-systems.md#hour-4--assignments-transactions-and-retries)
-- [Changing Experimently safely](../production-engineering/part-4-safe-change.md#hour-11--changing-experimently-safely)
+- [Changing Controlvar safely](../production-engineering/part-4-safe-change.md) (Hour 11)

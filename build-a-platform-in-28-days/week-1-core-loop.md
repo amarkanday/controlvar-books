@@ -4,53 +4,56 @@
 
 [← Contents](./README.md) · [Week 2 →](./week-2-api-and-data.md)
 
-This week follows the main experiment workflow: assign a variant, record user activity and
-calculate results. The final exercise traces an SDK request through those steps to the result
-shown in the dashboard.
+This week is the product's heartbeat: how a user gets a variant, how what they do afterwards is
+recorded, and how those two facts become a number a product manager can act on. By Day 7 you'll
+trace one experiment from an SDK call all the way to a p-value on the dashboard.
 
-The Python and FastAPI books cover the language and framework. Here the focus is on the design
-choices connecting them: why assignments are persisted, which constraints events must satisfy,
-and how analysis uses both. Read the referenced files in the
-[`getexperimently/experimently`](https://github.com/getexperimently/experimently) repository
-alongside the examples. Blocks marked `# 📁` quote source; omissions are marked with `...`.
-This week was checked against `a4a6dbd2` (0.17.0 plus unreleased changes, including #747, #769
-and #770).
+You already know the language (the Python book) and the framework (the FastAPI book). This week
+is about **architecture** — not "what is a SQLAlchemy model" but "why is an assignment a row in
+PostgreSQL rather than a cookie, and what breaks if you change that." Every Day grounds its lesson
+in real files you can open in the
+[`Controlvar/controlvar`](https://github.com/Controlvar/controlvar) repository.
+Read them alongside the prose; the file paths marked `# 📁` are real source, quoted exactly
+(trimmed where marked `...`), and the whole point is that you can go verify them. This week was
+checked against Controlvar v0.36.4 (`79f8ed18`).
 
-> Assignments record the variant allocated to each user; events record subsequent activity.
-> Analysis connects them by experiment and user, with the variant association checked when counting
-> conversions. Persisted assignments keep allocations stable, and binary conversion metrics count
-> converting users rather than event rows.
+> **The one sentence to carry through Week 1.** _An experiment is two tables — `assignments`
+> (who saw what) and `events` (what they did) — joined by `(experiment_id, user_id)`; assignment
+> is a deterministic hash so the join is stable, tracking is append-only so the join is honest,
+> and every statistic on the platform is a query over that join, counting users, not events._
+> Once you see the join, the rest of the codebase is machinery for filling those two tables
+> correctly and reading them rigorously.
 
-The week is organized as follows:
+A map of the week, so each piece has somewhere to land as it arrives:
 
-| Day | Topic                            | Focus                                  |
+| Day | Topic                            | The one thing it's really about                                  |
 | --- | -------------------------------- | ---------------------------------------------------------------- |
 | 1   | The big picture                  | The shape of the system, and the bug that shows why shape matters |
 | 2   | The repo and the dev loop        | Getting from clone to a running API + dashboard, and staying there |
 | 3   | The domain model                 | Five tables, and the constraints that make them trustworthy       |
 | 4   | Assignment                       | `bucket_of(user_id, experiment.key)` and why the row is sticky    |
 | 5   | Tracking & conversion matching   | Append-only events, and the one helper every analysis must use    |
-| 6   | Results                          | From assigned and converting users to a verdict, with validity checks |
+| 6   | Results                          | From assigned and converting users to a verdict, with honesty checks |
 | 7   | **Capstone:** end-to-end trace   | One experiment through every layer above                          |
 
-Days 1–2 introduce the system and development setup. Days 3–6 cover the model, assignment,
-tracking and analysis. Day 7 combines them in a complete request trace. Read Day 1 before following
-the individual services; it identifies the components and the data passed between them.
+Notice the arc: Days 1–2 set the stage (system shape, tooling), Days 3–6 are the four pillars
+of the core loop (model, assign, track, analyse), and Day 7 walks one real experiment through
+all four at once. Don't skip Day 1 even though it has little code — the mental map it builds is
+what makes every later file make sense.
 
 ---
 
-<a id="day-1--the-big-picture-experimentlys-architecture-and-the-0-conversions-bug"></a>
-
-## Day 1 — Architecture and the experiment data flow
+## Day 1 — The big picture: Controlvar's architecture and the "0% conversions" bug
 
 ### What & why
 
-Experimently is a client-server platform. Two types of client use its API:
+Before any code, hold the shape of the system in your head. Controlvar is a **client-server
+platform with two kinds of client**:
 
 - **Your application**, through one of **sixteen SDKs** (Python, JavaScript, React, React
   Native, Go, Java, iOS/Swift, Android/Kotlin, Ruby, PHP, .NET, Elixir, Flutter, an edge
-  runtime, and two OpenFeature providers, one for JavaScript and one for Python; all at 0.1.0,
-  beta). It authenticates with an **API key** and asks three questions: _which variant is this
+  runtime, and two OpenFeature providers, one for JavaScript and one for Python; each is
+  versioned on its own, and the SDK guide calls the ones on a registry beta). It authenticates with an **API key** and asks three questions: _which variant is this
   user in?_, _is this flag on for this user?_, _record that this user did X._
 - **The dashboard**, a Next.js app that product managers and engineers use to create
   experiments and flags, watch results, and administer the platform. It authenticates with a
@@ -79,7 +82,7 @@ verdict. You saw the one-page diagram in the
 
 The "obvious" alternative is a fully client-side design: ship the experiment configuration to
 the SDK, hash the user locally, never store an assignment at all. It's how several commercial
-flag products work, and it is genuinely faster — no round trip. Experimently rejected it, and
+flag products work, and it is genuinely faster — no round trip. Controlvar rejected it, and
 the reasons are the ones that shape Week 1:
 
 1. **One source of truth for "who saw what."** If sixteen SDKs each bucketed locally, sixteen
@@ -109,9 +112,7 @@ client."
 > Experiments are still assigned only by the server, for the three reasons above. Week 3 covers
 > local evaluation.
 
-<a id="the-bug-that-justifies-the-week"></a>
-
-#### Case study: conversion events missing from analysis
+#### The bug that justifies the week
 
 Abstract architecture is forgettable. Here is a concrete bug that actually shipped in this
 codebase, and it justifies the whole "two tables, one join" way of thinking.
@@ -168,12 +169,12 @@ filter, not a formula.
 > together they are the best argument in this book for driving the platform through its
 > _public_ API in tests (Day 22).
 
-### How Experimently does it
+### How Controlvar does it
 
 The top-level folders map directly onto the architecture:
 
 ```
-experimently/
+controlvar/
 ├── backend/                   # the core profile's backend
 │   ├── app/
 │   │   ├── main.py            # the FastAPI app, middleware, lifespan         ← Week 2
@@ -254,8 +255,8 @@ Clone the repo and just _look_. Map each folder to a box in the README diagram. 
 code yet — build the mental map.
 
 ```bash
-git clone https://github.com/getexperimently/experimently.git
-cd experimently
+git clone https://github.com/Controlvar/controlvar.git
+cd controlvar
 
 # the four layers of the backend this week is about:
 ls backend/app/api/v1/endpoints/ backend/app/services/ backend/app/models/ backend/app/schemas/
@@ -285,7 +286,7 @@ grep -rnE '^\s*(from|import) app\.' backend/ modules/ --include='*.py'
 
 ### Key takeaways
 
-- Experimently = one FastAPI app + PostgreSQL (+ optional Redis), two kinds of client (SDK
+- Controlvar = one FastAPI app + PostgreSQL (+ optional Redis), two kinds of client (SDK
   with an API key, dashboard with a bearer token), two profiles (core, and full with
   `modules/`).
 - The core loop is **assign → track → analyse**, and it is two tables joined on
@@ -303,7 +304,7 @@ faster?**
 Faster, yes — and it's how some products work. But then "who saw what" would exist only in
 client memory, eligibility (holdouts, mutual exclusion, targeting) would need the client to
 know about every other experiment, and the analysis would have to reconstruct the denominator
-from exposure events. Experimently pays one network call per _first_ assignment (SDKs cache
+from exposure events. Controlvar pays one network call per _first_ assignment (SDKs cache
 after that) to get one implementation, one stored answer and an exact sample size.
 
 **Q. The events table has both `event_type` and `event_name`. Which one means what?**
@@ -334,9 +335,9 @@ ignore the directory.
 
 ### What & why
 
-A working local setup makes it easier to trace requests and test changes. This lesson sets up the
-API and dashboard development loop, then explains the environment settings most likely to cause
-local startup or connection failures.
+A backend you can't run is a backend you can't learn. Today is about the **edit → run → see
+it** loop for both halves of the system and the small number of environment facts that,
+if wrong, produce the most confusing failures in the repo.
 
 The backend needs three things: a **Python 3.11 virtual environment** with the pinned
 dependencies, a **PostgreSQL** server on `localhost:5432`, and a handful of **environment
@@ -400,7 +401,7 @@ like a missing migration.
 > `uvicorn backend.app.main:app` stops at start-up. `make dev` sets `ENVIRONMENT=development`
 > for you.
 
-### How Experimently does it
+### How Controlvar does it
 
 The everyday commands, from the repository root:
 
@@ -587,9 +588,10 @@ both. The API's CORS defaults include 3000, 3001, 3100, 3200 (ShopLab), 3300 (St
 
 ### What & why
 
-The core workflow uses five tables in the `experimentation` schema. This lesson examines their
-columns, relationships and constraints. The constraints are particularly important: they enforce
-invariants even when several requests or processes write to the same database.
+Every experimentation platform has the same five nouns. Controlvar's are five tables in the
+`experimentation` schema, and today is about their _shape_ and, more importantly, their
+_constraints_ — because in this system the database is where invariants are enforced, not
+just where data is kept.
 
 - An **experiment** is the unit of decision: a name, a stable `key` for the SDKs, a status
   (`draft → active → paused/completed → archived`), an owner, optional targeting rules and
@@ -610,7 +612,7 @@ invariants even when several requests or processes write to the same database.
 #### Why constraints live in the database
 
 You could enforce "traffic allocations sum to 100" or "one assignment per user per
-experiment" in Python and hope every code path remembers. Experimently enforces the ones that
+experiment" in Python and hope every code path remembers. Controlvar enforces the ones that
 _must_ hold in PostgreSQL, where they hold regardless of which service, script, seed or
 migration wrote the row:
 
@@ -627,7 +629,7 @@ The Pydantic layer (Week 2) enforces the _friendlier_ rules earlier — "at leas
 constraint violation. Two layers, deliberately: the schema layer for good errors, the database
 for guarantees.
 
-### How Experimently does it
+### How Controlvar does it
 
 Every table inherits two things from `models/base.py`: a UUID primary key with timestamps, and
 a `to_dict()` helper.
@@ -683,8 +685,10 @@ class Experiment(Base, BaseModel):
         UUID(as_uuid=True),
         ForeignKey(f"{get_schema_name()}.users.id", ondelete="SET NULL"),
     )
-    start_date = Column(DateTime)
-    end_date = Column(DateTime)
+    # UTC, stored without a zone; see UTCDateTime.
+    start_date = Column(UTCDateTime)
+    end_date = Column(UTCDateTime)
+    ...
     targeting_rules = Column(JSONB)  # For user segmentation
     ...
     # Issue #22: MAB optimization type
@@ -700,10 +704,35 @@ class Experiment(Base, BaseModel):
     # EP-021: Sequential testing configuration
     sequential_testing_enabled = Column(Boolean, default=False, nullable=False)
     ...
+    # #580: how the frequentist results judge this experiment. The results,
+    # the sample-size plan, the export and the report use these unless a
+    # request names its own. Both are locked once the experiment leaves draft.
+    # The server defaults are what the migration backfills, and what lets an
+    # older image that does not know the columns keep inserting experiments.
+    correction_method = Column(
+        String(32),
+        nullable=False,
+        default=DEFAULT_CORRECTION_METHOD,
+        server_default=text("'benjamini_hochberg'"),
+    )
+    confidence_level = Column(
+        Float,
+        nullable=False,
+        default=DEFAULT_CONFIDENCE_LEVEL,
+        server_default=text("0.95"),
+    )
+    ...
     # Relationships
     owner = relationship("User", back_populates="experiments")
     variants = relationship(
-        "Variant", back_populates="experiment", cascade="all, delete-orphan"
+        "Variant",
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        # Creation order, the id as the tie-breaker, so that "the first
+        # treatment" is the same arm on every call (#929). Without an ORDER BY
+        # PostgreSQL returns the rows in their physical order, which a row
+        # rewritten later in the heap or a plain ANALYZE can change.
+        order_by="[Variant.created_at, Variant.id]",
     )
     metric_definitions = relationship(
         "Metric", back_populates="experiment", cascade="all, delete-orphan"
@@ -716,14 +745,29 @@ class Experiment(Base, BaseModel):
     )
 ```
 
-Two things to notice. First, the **`key`** column: it is what the SDKs send
+Four things to notice. First, the **`key`** column: it is what the SDKs send
 (`experiment_key: "hero_banner"`), it's unique, and it's generated from the name on create when
 omitted (`"Button Color Test"` → `button-color-test-3f9a2c`). An experiment without a key is
 invisible to the tracking API — which was another of the ShopLab bugs: the demo seed never set
 it. Second, the **relationships with `cascade="all, delete-orphan"`**: deleting an experiment
 through the ORM deletes its variants, metrics, assignments _and events_. In practice that is
 rare, because the API deletes only **draft** experiments (anything else answers 400), and a
-draft has no traffic.
+draft has no traffic. Third, **`UTCDateTime`**: `start_date` and `end_date` are `timestamp
+without time zone` columns holding UTC, but the API binds them in three shapes (an aware
+datetime, an ISO string, a naive one), and PostgreSQL converts an aware value to the *session's*
+zone on the way in while ignoring the offset in a string. On a server whose zone is not UTC the
+two dates drifted apart by the offset; west of UTC an end date could land before its start and
+completing the experiment answered 500. The `TypeDecorator` converts every bound value to naive
+UTC, whatever the session says, with no migration because the database type did not change.
+Fourth, the columns **`correction_method`** and **`confidence_level`** (default
+`benjamini_hochberg` and 0.95, with check constraints that allow `none`, `bonferroni` or
+`benjamini_hochberg`, and 0.80 to 0.99): the experiment now *carries* how its results are judged
+instead of every request choosing, and both are locked once it leaves draft. Their server
+defaults are what lets a previous release's image, which does not know the columns, keep
+inserting experiments during a rolling upgrade — Day 13's expand-then-contract rule at work. And
+`variants` is ordered by `(created_at, id)`, so that "the first treatment" is the same arm on
+every call: without an `ORDER BY`, PostgreSQL returns rows in physical order, which a rewritten
+row or a plain `ANALYZE` can change.
 
 The status itself is guarded the same way. It changes **only** through the lifecycle actions
 `POST /api/v1/experiments/{id}/start`, `/pause`, `/complete` and `/archive`; a `PUT` that tries
@@ -815,7 +859,10 @@ the results engine can find a variant's events without a join), and — a real w
 `DateTime`. The wart is contained by `UTCTimestampString`, a `TypeDecorator` that normalises
 every bound value, on insert and in every comparison, to one canonical UTC ISO-8601 string
 (any offset is converted; a naive time is taken as UTC), so string order is time order.
-Stored event times were rewritten to that form when it was introduced.
+Stored event times were rewritten to that form when it was introduced. `Event` also
+redeclares `updated_at` without the mixin's `onupdate`: it means "received at", set once on insert,
+because CUPED (Day 19) reads a user's history only if it was stored before the user was assigned,
+and an ORM update that re-tagged an event would otherwise silently drop it out of every covariate.
 
 > **Did You Know?** The `metrics` table has a `lower_is_better` flag and an
 > `event_value_path` (a JSON path into the event's metadata for revenue-style metrics), and
@@ -882,10 +929,15 @@ the existing row before ever hashing. Reassignment exists (`AssignmentService.re
 for admin overrides, and it updates the existing row in place, because the
 `(experiment_id, user_id)` pair is unique.
 
-**Q. Why store `context` on the assignment?**
-It's the targeting context the SDK sent at assignment time. It lets you audit _why_ a user
-was eligible, and the dimensional-analysis breakdowns (Week 3) can segment by attributes that
-were true at assignment rather than at conversion.
+**Q. What is `Assignment.context` for?**
+It is a JSONB column for "the user attributes used for targeting", and it is easy to
+overestimate. `POST /tracking/assign` does **not** write it: the new-user path builds the row
+from `user_id`, `experiment_id` and `variant_id` alone (`context` feeds the eligibility check and
+is then dropped). Only an admin reassignment (`AssignmentService.reassign_user`) stores a
+context on the row. The one reader is the segment audience preview, which samples stored
+contexts to estimate how many users a set of segment rules would match. Treat the column as
+optional, mostly empty data; the breakdowns on the results page (Week 3) are computed from event
+data, not from it.
 
 ---
 
@@ -893,7 +945,8 @@ were true at assignment rather than at conversion.
 
 ### What & why
 
-Assignment must satisfy four requirements. The implementation has to preserve them together:
+"Which variant is this user in?" has to satisfy four properties at once, and the tension
+between them is the whole design:
 
 1. **Deterministic.** The same user must get the same variant every time, on every device,
    from every SDK, even before the platform has stored anything about them.
@@ -908,7 +961,7 @@ Assignment must satisfy four requirements. The implementation has to preserve th
 Property 1 rules out random assignment and rules in hashing: `hash(user_id, experiment.key)`
 is a function, so it's the same everywhere. Property 3 rules out _only_ hashing — because the
 inputs to eligibility change over time — and rules in a stored row that is consulted first.
-Experimently does both: hash to decide, store to remember, and always prefer the stored row.
+Controlvar does both: hash to decide, store to remember, and always prefer the stored row.
 
 #### The hash: first four bytes of MD5, little-endian, divided by 2³²
 
@@ -981,14 +1034,14 @@ table of every _other_ bucketing hash in the platform, each deliberately its own
 | ---------------------------------- | ----------------------------------------------------------- |
 | Experiment assignment              | `bucket_of(user, experiment.key)`: first 4 bytes LE ÷ 2³²   |
 | Feature-flag rollout               | `MD5("{user}:{flag.key}")`, **whole** digest, `% 100`       |
-| Global holdout / mutual exclusion  | `MD5("{user}:{salt}")`, first 4 bytes LE, `% 100` / ÷ 2³²   |
+| Global holdout / mutual exclusion  | `MD5("{user}:{salt}")`, first 4 bytes LE, `% 100` / ÷ 2³² (the holdout's own salt) |
 | Bandit routing                     | `MD5("{user}:{experiment.id}:bandit")`, whole digest, `% 10000` |
 
 So the flag rollout function is the one that still reads the whole digest (bucket 79 for
 `user-123`/`my-flag`), and it did not change. Do not assume "one hash everywhere": changing any
 of these re-buckets users, so none is changed in passing.
 
-### How Experimently does it
+### How Controlvar does it
 
 The whole decision is one method:
 
@@ -1023,8 +1076,15 @@ eligibility second, hash last**:
 
 ```python
 # 📁 backend/app/services/assignment_service.py
-    def assign_user(self, user_id, experiment_id, track_exposure=True,
-                    override_variant_id=None, context=None) -> Dict[str, Any]:
+    def assign_user(
+        self,
+        user_id: str,
+        experiment_id: Union[str, UUID],
+        track_exposure: bool = True,
+        override_variant_id: Optional[Union[str, UUID]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        ...
         # Get experiment with variants
         experiment = (
             self.db.query(Experiment)
@@ -1032,6 +1092,7 @@ eligibility second, hash last**:
             .filter(Experiment.id == experiment_id)
             .first()
         )
+
         if not experiment:
             raise ValueError(f"Experiment {experiment_id} not found")
 
@@ -1042,41 +1103,75 @@ eligibility second, hash last**:
             )
 
         # Check for existing assignment (sticky assignment)
-        existing_assignment = (
-            self.db.query(Assignment)
-            .filter(Assignment.user_id == user_id, Assignment.experiment_id == experiment_id)
-            .order_by(desc(Assignment.created_at))
-            .first()
-        )
+        existing_assignment = self._stored_assignment(user_id, experiment_id)
 
         if existing_assignment:
-            assignment_dict = self._assigned_result(user_id, experiment_id)
-            if track_exposure:
-                self.event_service.track_exposure(
-                    user_id=user_id,
-                    experiment_id=str(experiment_id),
-                    variant_id=str(existing_assignment.variant_id),
-                    properties=context,
-                )
-            return assignment_dict
+            logger.debug(f"Using existing assignment in experiment {experiment_id}")
+            return self._sticky_result(
+                user_id, experiment_id, existing_assignment, track_exposure, context
+            )
+
+        # A new user.  The active holdout is loaded once.  When it is
+        # measurable the user is recorded in its population whatever the
+        # answer below is (held out, assigned or refused): every user seen
+        # goes in their arm.  The INSERT is executed, not committed: the
+        # assigned path commits it with the assignment, the ineligible paths
+        # once, after building their result (#445).
+        holdout = self.global_holdout_service.get_active_holdout()
+        holdout_check = self.global_holdout_service.is_user_in_holdout(
+            user_id, holdout=holdout
+        )
+        recorded = self._record_holdout_population(holdout, user_id, holdout_check[0])
 
         # Eligibility gate for new users: holdout -> mutual exclusion -> targeting
-        eligibility = self.check_eligibility(user_id, experiment, context)
+        eligibility = self.check_eligibility(
+            user_id, experiment, context, holdout_check=holdout_check
+        )
         if not eligibility["eligible"]:
-            return self._ineligible_result(user_id, experiment, eligibility)
+            logger.debug(
+                f"Not eligible for experiment {experiment_id}: {eligibility['reason']}"
+            )
+            result = self._ineligible_result(user_id, experiment, eligibility)
+            if recorded:
+                self.db.commit()
+            return result
 
         # Determine variant assignment
         if override_variant_id:
-            variant_id = override_variant_id
             ...
         else:
             # Use deterministic hashing to assign variant
             variant_id = self._hash_user_to_variant(user_id, experiment)
 
         # Create new assignment
-        assignment = Assignment(user_id=user_id, experiment_id=experiment_id, variant_id=variant_id)
+        assignment = Assignment(
+            user_id=user_id,
+            experiment_id=experiment_id,
+            variant_id=variant_id,
+        )
+
         self.db.add(assignment)
-        self.db.commit()
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            # The check above and this insert are two statements, and another
+            # API process can store this user's first assignment between them:
+            # the unique index on (experiment_id, user_id) then refuses this
+            # row (#1026). The user is assigned, so the answer is the stored
+            # row, given as a sticky hit gives it. Any other refusal, or a
+            # duplicate with no stored row to answer, is raised as before.
+            self.db.rollback()
+            stored = (
+                self._stored_assignment(user_id, experiment_id)
+                if _is_unique_violation(exc)
+                else None
+            )
+            if stored is None:
+                raise
+            ...
+            return self._sticky_result(
+                user_id, experiment_id, stored, track_exposure, context
+            )
         self.db.refresh(assignment)
         ...
         return self._assigned_result(user_id, experiment_id)
@@ -1089,11 +1184,31 @@ are returned unchanged even if the user would no longer be eligible"_). A new us
 **before** hashing — so an ineligible user gets no row and no exposure event, and therefore
 never appears in a denominator.
 
+Two newer details are the kind of thing only production teaches. **The holdout's population is
+recorded for every new user**, held out or not, in the same transaction as whatever else this
+request writes (`INSERT ... ON CONFLICT DO NOTHING`, executed here and committed with the
+assignment, or once after building an ineligible result). A holdout can only be *measured* if
+you know who was in each arm, including the users the experiment then refused; recording them
+anywhere later would shrink one arm silently. And the **unique-violation handler** is the
+sticky guarantee defended against a race. "Check for a row, then insert" is two statements, and
+two API processes can both see no row for a user's first call; the unique index on
+`(experiment_id, user_id)` refuses the second insert. That used to surface as a 500 to the
+second caller. Now the service rolls back, looks the stored row up, and answers with it exactly
+as a sticky hit would. Note how it decides that it *is* a duplicate: from the driver's SQLSTATE
+(`23505`), never from the error message, and it does not name the index, "because its name
+depends on how the schema was built". Anything else that fails the insert is raised as before.
+
 #### The eligibility gate
 
 ```python
 # 📁 backend/app/services/assignment_service.py
-    def check_eligibility(self, user_id, experiment, context=None) -> Dict[str, Any]:
+    def check_eligibility(
+        self,
+        user_id: str,
+        experiment: Experiment,
+        context: Optional[Dict[str, Any]] = None,
+        holdout_check: Optional[Tuple[bool, int, int]] = None,
+    ) -> Dict[str, Any]:
         """
         Decide whether a *new* user may be assigned to ``experiment``.
 
@@ -1110,30 +1225,55 @@ never appears in a denominator.
            does not match them (reason ``targeting``).
         """
         # 1. Global holdout
-        in_holdout, holdout_percentage, bucket = self.global_holdout_service.is_user_in_holdout(user_id)
+        if holdout_check is None:
+            holdout_check = self.global_holdout_service.is_user_in_holdout(user_id)
+        in_holdout, holdout_percentage, bucket = holdout_check
         if in_holdout:
-            return {"eligible": False, "reason": REASON_HOLDOUT, "detail": ...}
+            return {
+                "eligible": False,
+                "reason": REASON_HOLDOUT,
+                "detail": ...,
+            }
 
         # 2. Mutual exclusion group
         group_id = getattr(experiment, "mutual_exclusion_group_id", None)
         if group_id:
-            if not self.mutual_exclusion_service.is_user_eligible_for_experiment(user_id, experiment.id):
-                return {"eligible": False, "reason": REASON_MUTUAL_EXCLUSION, "detail": ...}
+            if not self.mutual_exclusion_service.is_user_eligible_for_experiment(
+                user_id, experiment.id
+            ):
+                return {
+                    "eligible": False,
+                    "reason": REASON_MUTUAL_EXCLUSION,
+                    "detail": ...,
+                }
 
         # 3. Targeting rules
         if getattr(experiment, "targeting_rules", None):
             targeting_context = self._build_targeting_context(user_id, context)
-            targeting = self._evaluate_experiment_targeting(experiment, targeting_context)
+            targeting = self._evaluate_experiment_targeting(
+                experiment, targeting_context, user_id=user_id
+            )
             if not targeting["eligible"]:
-                return {"eligible": False, "reason": REASON_TARGETING, "detail": targeting.get("reason")}
+                return {
+                    "eligible": False,
+                    "reason": REASON_TARGETING,
+                    "detail": targeting.get("reason"),
+                }
 
         return {"eligible": True, "reason": REASON_ASSIGNED, "detail": None}
 ```
 
 Each gate is its own hash with its own salt, and that's not incidental. The **global holdout**
-hashes `user_id:<HOLDOUT_SALT>` to a bucket 0–99 and holds out users below the configured
-percentage — a fixed slice of your audience that is in _no_ experiment, so you can measure
-the cumulative effect of everything you've shipped. A **mutual-exclusion group** hashes
+hashes `user_id:<the holdout's own salt>` to a bucket 0–99 and holds out users below the
+configured percentage — a fixed slice of your audience that is in _no_ experiment, so you can
+measure the cumulative effect of everything you've shipped. Each holdout carries a random
+`hash_salt` of its own (the pre-#445 holdouts all shared one fixed salt, `global_holdout_v1`, which
+is the "legacy" salt), so successive holdouts select *different* slices of users, and a holdout is
+only *measurable* if it has a non-legacy salt and an `activated_at` stamp: the population table the
+assign path fills needs to know who was seen while it was active. Two lifecycle rules protect that
+measurement: the percentage cannot change once a holdout has been active (changing it would move
+users between the holdout and the rest and mix the two groups), and a holdout that has been
+deactivated has ended and cannot restart; a new one is created instead. A **mutual-exclusion group** hashes
 `user_id:<group salt>` to `[0, 1)`, excludes users at or above the group's
 `traffic_allocation`, and carves the rest into equal slots, one per active experiment, so a
 user is in at most one of the "checkout" experiments. The hash is not the whole rule: a user
@@ -1145,17 +1285,21 @@ being held out is uncorrelated with which variant you'd otherwise have got.
 
 ```python
 # 📁 backend/app/services/global_holdout_service.py
-    @staticmethod
-    def _get_holdout_bucket_static(user_id: str) -> int:
-        """Get holdout bucket for a user (0-99). Static version."""
-        combined = f"{user_id}:{HOLDOUT_SALT}".encode("utf-8")
-        hash_bytes = hashlib.md5(combined, usedforsecurity=False).digest()[:4]
-        hash_int = struct.unpack("<I", hash_bytes)[0]
-        return hash_int % 100
+def holdout_bucket(user_id: str, salt: str) -> int:
+    """The user's holdout bucket, 0-99, under ``salt``.
+
+    ``md5("<user_id>:<salt>")``, first four bytes little-endian, modulo 100:
+    with the legacy salt this is exactly the bucket every pre-#445 holdout
+    used.
+    """
+    combined = f"{user_id}:{salt}".encode("utf-8")
+    hash_bytes = hashlib.md5(combined, usedforsecurity=False).digest()[:4]
+    hash_int = struct.unpack("<I", hash_bytes)[0]
+    return hash_int % 100
 ```
 
 Notice this one also takes the **first four bytes little-endian**, like `bucket_of`, but
-`% 100` over a fixed salt rather than ÷ 2³² over the experiment key. Same reading of the
+`% 100` over the holdout's salt rather than ÷ 2³² over the experiment key. Same reading of the
 digest, different input and different reduction: the holdout bucket and the variant bucket
 are independent functions, which is exactly what you want.
 
@@ -1184,9 +1328,10 @@ render the default experience without logging a failure. The SDKs treat `variant
 the answer and fall back to `"control"` only on transport errors.
 
 > **Watch Out!** Multi-armed bandits change one line of this flow. For
-> `optimization_type != "fixed"` the endpoint computes an `override_variant_id` from the
-> current `BanditState.variant_weights` (hashing `user_id:experiment_id:bandit` into the
-> cumulative _weights_ instead of the fixed allocations) and passes it to `assign_user`.
+> `optimization_type != "fixed"` the endpoint gets an `override_variant_id` from
+> `bandit_chooser(db, experiment)` (`backend/app/services/bandit_routing.py`), which reads the
+> current `BanditState.variant_weights` once and hashes `user_id:experiment_id:bandit` into the
+> cumulative _weights_ instead of the fixed allocations; the result goes to `assign_user`.
 > Sticky rows still win, eligibility still runs, and the override is deterministic per user,
 > so a bandit doesn't break any of the four properties — it just replaces the fixed
 > distribution with a learned one. Day 19 covers how the weights are learned.
@@ -1239,6 +1384,9 @@ Then read the unit tests that pin the gate order — they are the specification:
   independent.
 - Ineligible users get 200 + control + `assigned: false` + a `reason`; no row, no exposure.
 - Bandits swap the fixed distribution for learned weights via a deterministic override.
+- Assigning a list of users has its own route, `POST /api/v1/tracking/assign/batch` (beta,
+  `sdk:ruleset` key): up to 1,000 distinct users, each answered as a single call would be, with
+  every user's context checked before anyone is assigned.
 
 ### Q&A
 
@@ -1253,7 +1401,7 @@ Nothing — they keep their variant. `assign_user` returns the existing row befo
 (`reassign_user` / deleting assignments), not something the platform does silently.
 
 **Q. Does `context` affect the hash?**
-No. `context` feeds targeting (eligibility) and is stored on the row for auditing; the hash
+No. `context` feeds targeting (eligibility) and is not stored by the assign path; the hash
 input is exactly `user_id:experiment.key`. Two requests with the same user id and different
 contexts get the same variant.
 
@@ -1271,9 +1419,10 @@ a holdout, mutual-exclusion group or targeting rule may make them ineligible (co
 
 ### What & why
 
-An event records user activity: who performed an action, when it occurred and, where applicable,
-its numeric value. The tracking API accepts these records from SDKs and attaches identifiers used
-by analysis. Treating events as append-only records leads to three design decisions:
+The second table. An **event** is an append-only fact — "user X did Y at time T, worth V" —
+and the tracking API's job is to accept those facts from any SDK at high volume, attach the
+identifiers the analysis will need, and never lose one. Three design decisions follow from
+"append-only fact":
 
 1. **Events are never updated.** There's no `PUT /events/{id}`. A wrong event is corrected by
    another event or by excluding it at analysis time, never by mutation — because the
@@ -1289,32 +1438,42 @@ by analysis. Treating events as append-only records leads to three design decisi
 #### `experiment_key` vs `feature_flag_key`, and the fan-out rule
 
 An event can be tied to an experiment, a feature flag, or both. The public `/track` endpoint
-takes keys; `/tracking/events` takes ids for server-side integrations that already hold them;
-`/tracking/batch` takes up to 100 events at once and reports per-event failures without
-failing the batch. And the SDKs add one rule of their own: an event tracked _without_ a key
+takes keys; `/tracking/events` takes ids for server-side integrations that already hold them (an
+id that is not a UUID answers 422, and a UUID that names no stored experiment, flag or variant
+answers 404 naming the field, with nothing stored); `/tracking/batch` takes up to 100 events at
+once and reports per-event failures without failing the batch. And the SDKs add one rule of their own: an event tracked _without_ a key
 **fans out** to every experiment the SDK has a cached assignment for and every flag it has
 evaluated for that user — so `track('purchase')` from your checkout page counts for the hero
 test, the sort bandit and the buy-button test simultaneously. That rule is what makes a
 single metric definition (`event_name: "purchase"`) reusable across experiments.
 
-### How Experimently does it
+### How Controlvar does it
 
 The request schema is permissive by design (an SDK should never fail to record an event
-because of a shape quibble) but insists on the one thing the join needs:
+because of a shape quibble):
 
 ```python
 # 📁 backend/app/schemas/tracking.py
-class EventRequest(BaseModel):
+class EventRequest(StorableTextModel):
     event_type: str = Field(..., min_length=1, max_length=100)
     event_name: Optional[str] = Field(None, max_length=255)
     user_id: str = Field(..., min_length=1, max_length=255)
     experiment_key: Optional[str] = Field(None, max_length=100)
     feature_flag_key: Optional[str] = Field(None, max_length=100)
     ...
-    @model_validator(mode="after")
-    def validate_experiment_or_feature_flag(self) -> "EventRequest":
-        ...
+    # Both keys are optional (#217). With neither, the endpoint stores the
+    # event as history; a key that is given but not found answers 404.
 ```
+
+That last comment is a policy worth reading twice. The schema used to *require* one of the two
+keys, so a key-less `track('page_view')` was a 422. Now both are optional, and the endpoint
+distinguishes three cases: **no key given** — the event is stored as history, tagged with no
+experiment and no flag, and counts in no experiment's results; **a key given and found** — the
+event is tagged, as below; **a key given and not found** — a 404 that names only the keys that
+were given, so a typo in `experiment_key` cannot silently turn a real conversion into
+untagged history. (Internally a key-less event is built as `UntaggedEventCreate`, because
+`EventCreate` still refuses an event with neither id, and the service takes an `allow_untagged`
+flag that only `/track` and `/batch` pass.)
 
 The endpoint resolves keys to ids, finds the assignment, and hands a column-shaped
 `EventCreate` to the service:
@@ -1342,7 +1501,7 @@ The endpoint resolves keys to ids, finds the assignment, and hands a column-shap
             if assignment:
                 variant_id = assignment.variant_id
     ...
-    event_data = EventCreate(
+    event_data = _event_model(experiment_id, feature_flag_id)(
         user_id=request.user_id,
         event_type=request.event_type,
         event_name=request.event_name or request.event_type,
@@ -1353,7 +1512,7 @@ The endpoint resolves keys to ids, finds the assignment, and hands a column-shap
         properties=request.metadata,
         timestamp=request.timestamp or datetime.now(timezone.utc),
     )
-    event = EventService(db).track_event(event_data)
+    event = EventService(db).track_event(event_data, allow_untagged=True)
     record_event_tracked(str(event_data.event_type))
 ```
 
@@ -1394,7 +1553,12 @@ dict, schema field names or column names — and strict about _identity_:
 ```python
 # 📁 backend/app/services/event_service.py
     @classmethod
-    def build_event(cls, event_data: Union[EventCreate, Mapping[str, Any]]) -> Event:
+    def build_event(
+        cls,
+        event_data: Union[EventCreate, UntaggedEventCreate, Mapping[str, Any]],
+        *,
+        allow_untagged: bool = False,
+    ) -> Event:
         data = cls._as_dict(event_data)
 
         user_id = data.get("user_id")
@@ -1403,7 +1567,7 @@ dict, schema field names or column names — and strict about _identity_:
 
         experiment_id = _to_uuid(data.get("experiment_id"))
         feature_flag_id = _to_uuid(data.get("feature_flag_id"))
-        if experiment_id is None and feature_flag_id is None:
+        if experiment_id is None and feature_flag_id is None and not allow_untagged:
             raise ValueError("Either experiment_id or feature_flag_id must be provided")
 
         metadata = next((data[k] for k in _METADATA_KEYS if data.get(k) is not None), None)
@@ -1473,7 +1637,7 @@ git grep -n 'event_type == "conversion"\|event_type=="conversion"' backend/app m
 
 Exactly one line comes back, and it is the docstring in `event_matching.py` describing the
 legacy fallback (`conversion_event_filter` with no metric `event_name`). The only code that
-still compares `event_type` with `"conversion"` is that fallback, inside the helper.
+still compares `event_type` with `"conversion"` is that fallback, inside the two filter helpers.
 
 ### Key takeaways
 
@@ -1503,7 +1667,8 @@ Yes — `timestamp` is optional and defaults to server time; the seeds use it to
 of history. It's stored as sent (normalised to UTC), so daily breakdowns honour it.
 
 **Q. Why is `/tracking/batch` limited to 100 events?**
-Request body size (the app caps bodies at 1 MB) and failure isolation: each event is
+Failure isolation, and a bound on the work one request can ask for (the app caps every body at
+5 MiB, and the batch schema caps the list at 100 events); the first reason matters more:: each event is
 validated and stored independently and the response reports `success_count`,
 `failure_count` and per-event `errors`. The SDKs chunk larger batches client-side.
 
@@ -1513,9 +1678,11 @@ validated and stored independently and the response reports `success_count`,
 
 ### What & why
 
-Results combine assignment and event data. For each variant, the service reports assigned users,
-converting users, a conversion rate and a statistical comparison with control. This lesson follows
-that calculation and the checks used when producing a recommendation.
+You have two tables. A result is, at its heart, four numbers per variant — assigned users,
+converting users, a rate, and how sure you are that the rate differs from control — plus a
+recommendation. Today is about how the platform gets from two counts to "ship treatment",
+and about the **honesty checks** it runs on the way, because a results page that only shows
+the flattering number is worse than no results page.
 
 The primary path is deliberately simple statistics — a contingency table per variant vs
 control, a test of whether the proportions differ, a confidence interval on each rate —
@@ -1540,7 +1707,7 @@ treatment's result reports `statistical_test_used: "fisher_exact"`.
 > metrics (Welch's t-test from sufficient statistics) exist only in the warehouse module, in the
 > full profile, as a beta.
 
-### How Experimently does it
+### How Controlvar does it
 
 The spine is `AnalysisService.calculate_metric_results`. Read it as three steps: count assigned
 users per variant, count **converting users** per variant (with the Day 5 helper), and hand the
@@ -1624,54 +1791,93 @@ The test and the interval live in `sufficient_stats_analysis.binomial_variant_re
                 is_significant = p_value < alpha
 ```
 
-The request's `confidence_level` (0.80–0.99, default 0.95) drives **both** the interval and
-the significance decision: the interval is the normal approximation
+The confidence level (0.80–0.99) drives **both** the interval and the significance decision. It
+is the request's `confidence_level` if the request names one, otherwise the experiment's stored
+`confidence_level` (0.95 unless its creator chose otherwise). The interval is the normal approximation
 `p ± z·√(p(1−p)/n)` with `z = norm.ppf(1 − (1 − confidence_level)/2)` (1.6449 at 0.90, 1.96 at
 0.95), clamped to `[0, 100]`, and a treatment is significant when `p_value < 1 −
 confidence_level`. Effect sizes (Cohen's h, `2·asin√p₁ − 2·asin√p₀`) are labelled
 negligible/small/medium/large so the dashboard can say "significant but negligible" — the most
 useful sentence in experimentation.
 
-<a id="the-honesty-checks"></a>
+#### The honesty checks
 
-#### Result validation checks
-
-The dashboard calls `GET /api/v1/results/{experiment_id}`. The endpoint applies the following
-checks around the statistical calculation:
+The endpoint that the dashboard calls, `GET /api/v1/results/{experiment_id}`, wraps the
+computation with checks that stop it lying:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
 @router.get("/{experiment_id}", response_model=ExperimentResultsResponse)
 def get_experiment_results(
     experiment_id: UUID,
-    confidence_level: float = Query(default=0.95, ge=0.80, le=0.99),
-    correction_method: str = Query(default="none", pattern="^(none|bonferroni|benjamini_hochberg)$"),
+    confidence_level: Optional[float] = Query(
+        default=None,
+        ge=0.80,
+        le=0.99,
+        description=(
+            "Confidence level for this request. Omit it to use the "
+            "experiment's stored confidence_level (0.95 unless set otherwise)."
+        ),
+    ),
+    correction_method: Optional[str] = Query(
+        default=None,
+        pattern="^(none|bonferroni|benjamini_hochberg)$",
+        description=(
+            "Multiple-comparison correction for this request. Omit it to use "
+            "the experiment's stored correction_method (benjamini_hochberg "
+            "unless set otherwise). 'none' shows the uncorrected numbers."
+        ),
+    ),
     use_cache: bool = Query(default=True),
-    breakdown: Optional[str] = Query(default=None, ...),
+    ...
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> ExperimentResultsResponse:
     ...
+    cache_key = _results_cache_key(
+        experiment_id,
+        settings.confidence_level,
+        settings.correction_method,
+        breakdown,
+    )
+    ...
         # --- P0 statistical credibility: sample-ratio mismatch ---
-        srm_response = _compute_srm(experiment_id, db)
+        srm_response = _srm_block(experiment_id, result.get("srm"))
 
         response = ExperimentResultsResponse(
             ...
+            # What the numbers were computed under, from the computation
+            # itself rather than from the request (#580).
+            confidence_level=result["confidence_level"],
+            correction_method=result["correction_method"],
             sample_size_adequate=result.get("sample_size_adequate", False),
+            ...
             summary=summary_data,
             metrics=metrics_data,
-            sequential_testing=result.get("sequential_testing"),
+            sequential_testing=_embedded_sequential(experiment, db),
             breakdown=breakdown_response,
             bayesian_results=result.get("bayesian_results"),
             srm=srm_response,
         )
 ```
 
+Notice that both parameters default to `None`, not to `0.95` and `"none"`. The experiment now
+stores how it is judged (Day 3), so the route first *resolves* the settings
+(`resolve_analysis_settings`: the request's value where it names one, otherwise the
+experiment's own) and only then builds the cache key, so an answer computed under one setting
+is never served for another. The response reports `result["confidence_level"]`, "from the
+computation itself rather than from the request": the page can only claim what the numbers were
+actually computed under. And the audit snapshot (below) is written only when the settings equal
+the stored ones, so a what-if request with `?correction_method=none` cannot leave a row that
+reads as the experiment's official results.
+
 **Sample-ratio mismatch (SRM).** If you configured 50/50 and observe 60/40, the randomiser
 is broken and every p-value below is meaningless. The check is a chi-square goodness-of-fit
 of observed assignment counts against `traffic_allocation`, flagged at p < 0.001. It is
 computed only for `fixed` experiments: a bandit allocates from learned weights, so its counts
-are _supposed_ to drift from the configured split, and its `srm` is null:
+are _supposed_ to drift from the configured split, and its `srm` is null. The test lives in
+`srm_service.py` (`sample_ratio_check` returns it as a plain dict, or `None` when it is
+undefined or failed):
 
 ```python
 # 📁 backend/app/services/srm_service.py
@@ -1686,14 +1892,25 @@ because dashboards are polled many times.
 """
 ```
 
-SRM is reported **beside** the recommendation, not inside it: `_summarise_decision` looks at
-the primary metric's winner and at the sample size only, so an SRM warning does not change
-`recommendation`. Reading the `srm` block is your job.
+SRM is reported in its own `srm` block **and it overrides the recommendation**. That is a
+change worth knowing about: `AnalysisService.get_experiment_results` runs the check right after
+`_summarise_decision` and applies `recommendation_under_srm`, so when the check warns, the
+recommendation becomes `INCONCLUSIVE` with a reason naming the mismatch and its p-value, whatever
+the numbers say. Not even `CONTINUE_TESTING` survives, because more data does not repair a broken
+randomiser. `has_winner` and `winning_variant_id` are left alone (they describe significance), and
+a check that returned `None` changes nothing. The override lives in the service, not the
+endpoint, so `/results`, the data export and the report, which all read the same dict, give the
+same answer. The rule fails open: if it raises, `srm` is `None` and the engine's own
+recommendation stands.
 
-**Multiple-testing correction.** With several metrics, `correction_method=bonferroni|
-benjamini_hochberg` adjusts the p-values, and the dashboard labels each p-value "unadjusted" or
-"adjusted (Bonferroni|BH)" and shows one significance decision. The primary metric is listed
-first.
+**Multiple-testing correction.** `correction_method=bonferroni|benjamini_hochberg` adjusts the
+p-values across the treatments of a metric, and the dashboard labels each p-value "unadjusted" or
+"adjusted (Bonferroni|BH)" and shows one significance decision. The default is no longer "none":
+a new experiment stores `benjamini_hochberg` unless its creator picked otherwise, and a request
+that sends `correction_method=none` asks for the uncorrected numbers for that request only. An
+unknown spelling used to mean "no correction", silently; now it raises
+`UnknownCorrectionMethodError`, deliberately not a `ValueError` (the route answers a `ValueError`
+with 404, which would hide the typo) and so a 500. The primary metric is listed first.
 
 **The sample-size gate.** Since the ShopLab fix, a significant winner on the primary metric is
 only recommended as `SHIP_VARIANT` once _every_ variant has reached the primary metric's
@@ -1708,8 +1925,9 @@ experiment is active and 24 hours in any other status (paused, draft, completed,
 error.
 
 Then the response is **snapshotted** (`_record_results_snapshots`) into `analysis_snapshots`
-for auditing, so a number a stakeholder saw last Tuesday can be recovered even after the
-events table has grown.
+for auditing (a `frequentist` row, plus a `bayesian` row when that analysis is on and a
+`sequential` row when sequential testing is), so a number a stakeholder saw last Tuesday can be
+recovered even after the events table has grown.
 
 > **Did You Know?** Every Monte Carlo computation on the platform — the Bayesian
 > probability-to-be-best, expected loss, Thompson-sampling weights — is seeded from
@@ -1763,8 +1981,9 @@ would have overstated the primary metric.
 - One test on `/results`: Fisher's exact, for every metric, analysed as a proportion.
   `confidence_level` sets both the interval and the significance threshold.
 - Honesty checks wrap every result: SRM (chi-square, p < 0.001, fixed experiments only,
-  reported beside the recommendation), multiple-testing correction, and minimum-sample-size
-  gating of the recommendation.
+  and a failed check turns the recommendation into `INCONCLUSIVE`), multiple-testing correction
+  (stored per experiment, Benjamini-Hochberg by default), and minimum-sample-size gating of the
+  recommendation.
 - Results are cached with a status-aware TTL and snapshotted for audit.
 - Monte Carlo is seeded per `(experiment, day, n_samples)`; the engine has a version.
 
@@ -1798,9 +2017,9 @@ experiment gets the long TTL too. Both are bypassed by `use_cache=false`.
 
 ### What & why
 
-This exercise traces one experiment across the layers covered in Days 3–6. Start at the React SDK
-hook in ShopLab, follow the request through the API and storage services, and finish at the
-`p_value` displayed in the results page. Identify the file responsible for each step.
+Days 3–6 each took one layer. Today you walk one experiment through all of them in order, from
+the React SDK hook in ShopLab's home page to the `p_value` on the results dashboard, and you
+name the file at every hop. If you can narrate this trace from memory, Week 1 has done its job.
 
 The experiment is ShopLab's **hero A/B** (`shoplab_hero_banner`): variant `control` shows an
 image hero, variant `video_hero` shows a video hero, 50/50. The primary metric is the hero's
@@ -1877,14 +2096,15 @@ with the admin's bearer token. Cache miss (or `use_cache=false`) →
 `AnalysisService.get_experiment_results` → for each metric, primary first,
 `calculate_metric_results`: assignments per variant, `count_converting_users(...,
 "hero_cta_click")` per variant (each assigned visitor once, however many times they clicked),
-Fisher's exact test vs control, a normal-approximation interval at the requested confidence
-level.
+Fisher's exact test vs control, a normal-approximation interval at the experiment's confidence
+level (0.95 here, stored on the experiment, unless the request names another).
 
-**10. The validity checks run.** `_compute_srm` chi-squares the assignment counts against
+**10. The honesty checks run.** `sample_ratio_check` chi-squares the assignment counts against
 50/50 and reports the result in `srm`; `sample_size_adequate` checks every variant against
 the primary metric's `minimum_sample_size` (2,000 here); the summary recommends
 `SHIP_VARIANT` only if the primary metric has a significant winner _and_ the sample size is
-adequate. An SRM warning is shown beside the recommendation; it does not change it.
+adequate. An SRM warning overrides all of that: the recommendation becomes `INCONCLUSIVE`
+with the mismatch as its reason.
 
 **11. The response is cached and snapshotted**, then rendered by
 `frontend/src/components/results/` — the metric comparison table, the confidence-interval
@@ -1924,8 +2144,8 @@ experiment.
 - Then: `track` (fan-out) → `/tracking/track` → key → id, assignment → `variant_id` →
   `EventService` → row.
 - Then: `/results/{id}` → `calculate_metric_results` (assigned users, converting users,
-  Fisher, CI) → SRM beside, sample-size gate on the recommendation → cache + snapshot →
-  dashboard.
+  Fisher, CI) → SRM check (a warning overrides the recommendation), sample-size gate on the
+  recommendation → cache + snapshot → dashboard.
 - Every layer is a file you can open; every number is a query you can rerun.
 
 ---
@@ -1952,12 +2172,14 @@ stored row, and which column does a metric with `event_name: "signup"` match on?
 Both are `"signup"` (`/track` copies `event_type` into `event_name` when the latter is
 absent). The metric matches on `event_name`, via `conversion_event_filter("signup")`.
 
-**4. Which three validity checks wrap a results response, and which of them can change the
+**4. Which three honesty checks wrap a results response, and which of them can change the
 recommendation?**
 Sample-ratio mismatch (chi-square, warning at p < 0.001, for fixed-allocation experiments),
 multiple-testing correction (Bonferroni / Benjamini-Hochberg), and the minimum-sample-size gate
-on the `SHIP_VARIANT` recommendation. Only the sample-size gate (with the primary metric's
-winner) decides the recommendation; SRM is reported beside it.
+on the `SHIP_VARIANT` recommendation. The sample-size gate (with the primary metric's winner)
+and a failed SRM check both change it: the gate holds a winner at `CONTINUE_TESTING`, and an SRM
+warning turns any recommendation into `INCONCLUSIVE`. The correction changes the p-values the
+winner is judged on.
 
 **5. Why does an ineligible user get HTTP 200 rather than 403 or 404?**
 Because not being in the experiment is the normal outcome, not an error: the app should

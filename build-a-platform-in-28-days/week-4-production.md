@@ -4,19 +4,23 @@
 
 [← Week 3](./week-3-hard-parts.md) · [Contents](./README.md)
 
-> Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased changes, including
-> three breaking ones: #747, #769, #770).
+> Verified against Controlvar v0.36.4 (`79f8ed18`).
 
-Week 4 covers testing, the dashboard, container builds, AWS deployment and observability. It
-examines the evidence provided by each test layer and the steps between merging code and serving
-a release. Day 28 brings these components together in an architecture review.
+Three weeks of _how it works_. This week is _how you know it works, and how it gets to
+production_: the test pyramid and the lesson the team learned about mocked seams, the dashboard's
+architecture, the checks a pull request must pass, the container images and the two compose
+files, the AWS deployment in CDK, and the logs, metrics and alerts that tell you it's healthy.
+Day 28 hands you the whole map and asks you to draw it from memory.
 
-> At the reviewed revision, branch protection requires 20 checks. Releases produce signed images,
-> and the Deploy workflow runs a migration task before shifting API traffic through CodeDeploy.
-> Deployment alarms can trigger rollback. Health probes, metrics and scheduler run history provide
-> separate evidence about the running service; none alone establishes that every feature works.
+> **The one sentence to carry through Week 4.** _A change is real when it has passed the 20
+> checks branch protection requires on `main`; when it ships as a signed, immutable image from a
+> release tag, through one Deploy workflow that refuses before it changes anything, runs the
+> migration task as the only schema writer, and shifts traffic blue/green under 5xx alarms that
+> roll it back; and when `/health/ready`, `/metrics` and the scheduler run history say it's
+> alive. Every one of those gates exists because something once slipped through without it, and
+> every one has been broken on purpose to prove it fires._
 
-| Day | Topic                    | Focus                                                      |
+| Day | Topic                    | The one thing it's really about                                                      |
 | --- | ------------------------ | ------------------------------------------------------------------------------------ |
 | 22  | Testing strategy         | The pyramid, the harness, two profiles, and why mocked seams hid the hot-path bugs   |
 | 23  | The dashboard            | A thin Next.js client: one fetch wrapper, one auth context, a modules seam           |
@@ -32,9 +36,12 @@ a release. Day 28 brings these components together in an architecture review.
 
 ### What & why
 
-Experimently has more test code than application code. The app's README puts it at **5,400+
-backend tests and 640+ dashboard tests**, and the optional modules carry their own suite on top
-(the Module Tests job's comment counts 1,629). Each layer answers a different question:
+Controlvar has several times more test code than application code: `backend/tests` is about
+314,000 lines against about 78,000 in `backend/app` (counted with `cat | wc -l`, Python only).
+Counting `def test_` functions gives about 11,000 under `backend/tests`, 240 more beside the
+Lambda handlers, and about 2,100 in the optional modules' own suite; counting `it(` and `test(`
+calls gives about 1,800 dashboard test cases. These are static counts of test *functions*;
+parametrised tests run more cases than that. Each layer answers a different question:
 
 | Layer               | Where                                    | Question it answers                                         | Runs in                                                  |
 | ------------------- | ---------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------- |
@@ -47,7 +54,7 @@ backend tests and 640+ dashboard tests**, and the optional modules carry their o
 | Contract            | `tests/sdk-contract/`, `backend/tests/contract/` | Does each SDK hash identically and speak the real API? | **SDK Contract Tests** + **SDK Live Contract** (required) |
 | Profile builds      | `scripts/core_build.sh`                  | Does each profile stand alone?                              | **core-build** / **full-build** (required)               |
 | Frontend            | `frontend/src/tests/`                    | Do pages, services, hooks, contexts behave?                 | **Frontend Tests** (required; Jest + tsc + build)        |
-| Browser             | `frontend/tests/e2e/`                    | Does the whole thing work in a browser?                     | **Browser E2E** on every PR; a11y and visual nightly     |
+| Browser             | `frontend/tests/e2e/`                    | Does the whole thing work in a browser?                     | **Browser E2E** on every PR; the accessibility audit nightly (the visual spec has no baselines and runs nowhere yet) |
 | Performance         | `backend/tests/performance/`             | Is the rules engine still as fast as it was?                | `performance-tests.yml` (scheduled or by hand)           |
 
 The two Lambda handlers under `backend/lambda/` (`event_processor`, `feature_flag_evaluation`)
@@ -107,7 +114,7 @@ autogenerate against a freshly bootstrapped database must produce an empty migra
 `test_newer_database_rollback.py`. A silent reorder fails loudly with a diff instead of
 quietly proposing `op.drop_table` against production.
 
-### How Experimently does it
+### How Controlvar does it
 
 The harness is the root `conftest.py`. Its decisions shape every DB-backed test:
 
@@ -321,8 +328,8 @@ Six pieces carry the architecture:
    `protected`) decides whether a page gets the shell and the auth gate.
 4. **`services/*.ts`** — one object per resource (`ExperimentsService`, `FeatureFlagsService`,
    `ResultsService`, `AdminService`, …) with typed methods that mirror the API's routes
-   one-to-one. Core `frontend/src/services/` holds admin, api, docs, experiments, featureFlags,
-   modules and results.
+   one-to-one. Core `frontend/src/services/` holds admin, api, bandit, docs, experiments,
+   featureFlags, modules, password, results and segments.
 5. **`hooks/useApi.ts`** — `data/loading/error/refetch` around any fetcher, with a mounted
    guard.
 6. **The modules seam** — `contexts/ModulesContext.tsx` (`ModulesProvider`) asks the API which
@@ -331,7 +338,7 @@ Six pieces carry the architecture:
    for example, is `modules/frontend/src/services/workspaces.ts`. A core build type-checks against
    `tsconfig.core.json`, and the Frontend Tests job fails if a core build carries a module route.
 
-### How Experimently does it
+### How Controlvar does it
 
 The fetch wrapper's contract is written at the top of the file:
 
@@ -394,16 +401,16 @@ Route classification and the gate:
 /**
  * Routes rendered without the application shell. `/sso/complete` is one so
  * that it is never `protected`: RequireAuth would bounce an anonymous visitor
- * to `/login?next=`, carrying the SSO hand-off fragment along (C2b).
+ * to `/login?next=`, carrying the SSO hand-off fragment along.
  */
 const BARE_ROUTES = new Set<string>(['/login', '/', '/sso/complete']);
 
 /**
  * Routes inside the shell that do not require a session. The API is still the
  * enforcement point; these pages are either static or call public endpoints
- * (the power calculator).
+ * (the power calculator). `/privacy` is the public site's privacy notice.
  */
-const OPEN_ROUTE_PREFIXES = ['/docs', '/power-calculator', '/404', '/500', '/_error'];
+const OPEN_ROUTE_PREFIXES = ['/docs', '/power-calculator', '/privacy', '/404', '/500', '/_error'];
 
 export function routeKind(pathname: string): RouteKind {
   if (BARE_ROUTES.has(pathname)) return 'bare';
@@ -482,7 +489,8 @@ panel is `components/experiments/LiveResultsPanel.tsx`, driven by
 `hooks/useExperimentStream.ts`, a WebSocket hook with auto-reconnect. Browsers cannot set
 headers on a WebSocket handshake, but they can offer subprotocols, so the token rides as
 `Sec-WebSocket-Protocol: experimently.bearer, <token>` and the backend echoes
-`experimently.bearer` on accept. The token never goes in the URL, because URLs end up in access
+`experimently.bearer` on accept (the subprotocol's name predates the rename and is a wire
+contract, so it stays). The token never goes in the URL, because URLs end up in access
 logs. (A non-browser client may send an ordinary `Authorization: Bearer` header instead.) The
 targeting rule builder (`components/targeting/`) writes the _dashboard_ rule shape from Week 3,
 Day 16 — `TargetingRuleBuilder → RuleGroupCard → ConditionRow`, with the operator list in
@@ -492,11 +500,11 @@ Testing is Jest + React Testing Library + jsdom, with `global.fetch` mocked per 
 Recharts replaced by a mock (`src/__mocks__/recharts.tsx`, mapped in `jest.config.js`) so
 charts render as inspectable stubs. The pages tests (`src/tests/pages/*.test.tsx`) are the
 integration layer: render a page, mock the fetches it makes, assert the DOM and the request
-bodies. Playwright lives in `frontend/tests/e2e/`: five fail-hard journeys (login, experiment
-lifecycle, feature flag, RBAC, admin panel) and an SSO sign-in spec run on **every pull
+bodies. Playwright lives in `frontend/tests/e2e/`: eight fail-hard journeys (login, experiment
+lifecycle, feature flag, RBAC, admin panel, results checks, segments, header breakpoint) and an SSO sign-in spec run on **every pull
 request** in the required **Browser E2E** job, against a real API and the static export served
 the way the nginx image serves it; the SSO steps use a fake OIDC provider, on the same origin
-and on a different one. Accessibility (axe) and visual regression run nightly.
+and on a different one. The accessibility audit (axe) runs nightly; the visual-regression spec has no committed baselines and no workflow runs it yet.
 
 > **By the Way.** The container image is a **static export** (`output: 'export'` → `out/`)
 > served by nginx-unprivileged on 8080, with `/api/`, `/ws/` and `/health*` proxied to
@@ -508,8 +516,8 @@ and on a different one. Accessibility (axe) and visual regression run nightly.
 > deliberately `http://127.0.0.1:1`, so a stray `/api` request gets a 502 instead of being
 > forwarded somewhere. The build context is the repository root because the full-profile
 > build copies `modules/frontend` in. The dashboard's `/docs` page links to the published
-> documentation site (`NEXT_PUBLIC_DOCS_URL`, empty meaning the published site); it renders
-> nothing from `docs/` itself.
+> documentation (`NEXT_PUBLIC_DOCS_URL`; empty means the Markdown under `docs/` on GitHub, and
+> only the public-site build points at the built site); it renders nothing from `docs/` itself.
 
 ### Build It
 
@@ -546,8 +554,9 @@ The dashboard is a static export (no server components), and the pages tests are
 
 **Q. How does the dashboard know the user's role for the nav?**
 `AuthContext.hasRole()` over the `UserMe` returned by `/auth/me` (`role`, `is_superuser`).
-The nav items carry `roles: ['ADMIN', 'DEVELOPER']`; `RequireAuth` accepts a `roles` prop for
-page-level gating.
+A nav item carries `roles` (the Audit Log item lists all four) or `superuser: true` (the Admin
+item, because `role` and `is_superuser` are independent and the admin API checks the second);
+`RequireAuth` accepts `roles` and `superuser` props for page-level gating.
 
 **Q. Where's the OpenAPI type generation?**
 There isn't one — types in `src/types/*.ts` are hand-written to match the schemas.
@@ -568,9 +577,8 @@ the API's CORS defaults.
 
 ### What & why
 
-Branch protection on `main` requires **20 status checks** (read with
-`gh api repos/getexperimently/experimently/branches/main/protection/required_status_checks`;
-`strict` is off). They come from about a dozen workflows, and each exists because of a specific
+Branch protection on `main` requires **20 status checks** (the list is `REQUIRED_CHECKS` in `scripts/configure-repo.sh`, which writes it to branch
+protection with `strict` on, so a branch must be up to date with `main` to merge). They come from about a dozen workflows, and each exists because of a specific
 class of regression:
 
 | Check                                        | Workflow                    | Catches                                                                 |
@@ -600,9 +608,9 @@ can merge, and then it silently drops out of the changelog (see "Releasing" belo
 Doc Examples (`doc-examples.yml`), which runs the examples in the app's own documentation. CodeQL
 has a workflow of its own.
 
-**`pr-qa-gate.yml`** has eleven jobs: _Detect docs-only change_, Unit Tests, Module Tests, Base
-Requirements Only, Smoke Tests, Frontend Tests, SDK Contract Tests, the `profile-build` matrix
-(core-build and full-build), SDK Live Contract, Browser E2E and Docker Smoke. Its concurrency
+**`pr-qa-gate.yml`** has twelve jobs: _Detect docs-only change_, Unit Tests, Module Tests, Base
+Requirements Only, Smoke Tests, Frontend Tests, SDK Contract Tests, core-build, full-build, SDK
+Live Contract, Browser E2E and Docker Smoke. Its concurrency
 group is keyed on the pull request **number**, because two forks' `patch-1` branches share a
 branch name and used to cancel each other's runs.
 
@@ -639,7 +647,7 @@ against it. A Dockerfile can build with a broken entrypoint; docker smoke starts
 in. Both are slower than unit tests (the live contract installs several toolchains), which is
 why they run as separate jobs in parallel rather than serially.
 
-### How Experimently does it
+### How Controlvar does it
 
 The live contract is a caller of the reusable workflow `_platform.yml`, which owns the services,
 toolchains and the boot sequence:
@@ -703,7 +711,7 @@ commit subject that release-please parses: it must be a conventional commit,
 chore revert style`. A breaking change takes `!` and a `BREAKING CHANGE:` footer; before 1.0 it
 bumps the **minor** version (`bump-minor-pre-major`). Release-please opens a release pull request,
 and when that merges it calls `release.yml` itself (as a reusable workflow), which builds,
-signs and publishes the images and attaches the Helm chart to the GitHub release. Nobody
+signs and publishes the images. Nobody
 needs to dispatch `release.yml` by hand, and doing so rebuilds and re-points the release's image tags; it is dispatched only to
 recover a failed run, after `git ls-remote --tags origin vX.Y.Z` shows the tag. The documentation
 site is deployed separately, by dispatching `docs.yml` on the tag.
@@ -751,15 +759,17 @@ deploy     (the one environment-bound job: one approval, before anything in AWS 
   refuse:  an API alarm firing (checked again, before the migration)
   migrate: snapshot the database · run the migration task (the only schema writer)
   API:     register the task definition · refuse a revision that would migrate on start
-           · CodeDeploy blue/green: 10% canary for 5 minutes, then the rest, under the
+           · CodeDeploy blue/green: 10% canary for 15 minutes, then the rest, under the
              5xx alarms · smoke test through the public URL
   web:     dashboard rolling deploy · smoke test through the public URL
   recover: named branches for an unapproved shift, an alarm rollback, a half-done deploy
   report:  run summary · notify
 ```
 
-The canary is 10% for 5 minutes at the reference commit; the project has decided to lengthen it
-to 15 minutes before production. What judges the canary is the two API 5xx alarms (one per
+The canary is 10% of the API's traffic for 15 minutes (`CANARY_10_PERCENT_15_MINUTES`). The CDK
+stack's comment says why it is not five: at launch traffic, 10% of a few requests a minute often
+does not reach the alarms' thresholds inside five minutes, so a broken release went to 100%
+before an alarm could act; the shift deadline in `deploy.yml` is sized to include it. What judges the canary is the two API 5xx alarms (one per
 target group), not a health check: while either is in ALARM, CodeDeploy stops the deployment and
 rolls it back by itself. A release that answers wrongly with a 2xx still reaches 100%, which is
 what the smoke tests are for. The old task set is kept for an hour after the shift. A
@@ -806,7 +816,8 @@ Then tamper-test one gate: in a scratch branch, change one value in
 
 ### Key takeaways
 
-- 20 required checks: eleven from the PR QA gate, plus integration-tests, the release gate and
+- 20 required checks: eleven from the PR QA gate (twelve jobs, one of which only detects docs-only
+  changes), plus integration-tests, the release gate and
   security scan summaries, lint, CDK Stack Tests, SDK Unit Tests, regression-guard, DCO and
   Leak Guard. `conventional-title` reports but is not required.
 - Docs-only changes skip the heavy jobs, but every required check still reports.
@@ -853,23 +864,24 @@ The API and dashboard each have core and full images. Compose combines them with
 and cache for local development or a production Docker host. The design goal: `docker compose up -d --wait` on a laptop with nothing but Docker, and you can log
 in — and the same images, unchanged, in production.
 
-- **`experimently-api`** (`backend/Dockerfile`): a multi-stage Python 3.11 image — the builder
+- **the API image** (`backend/Dockerfile`; a local build is tagged `experimently-api` in the
+  compose file, a tag the rename left alone): a multi-stage Python 3.11 image — the builder
   installs the runtime requirement set into a venv; the runtime copies the venv and `backend/`,
   runs as a non-root user, `HEALTHCHECK GET /health/live`, `ENTRYPOINT
   backend/docker-entrypoint.sh`. Two targets: **`core`** (the default, `backend/` only) and
   **`full`** (adds `modules/` and the module-only dependencies from `modules/requirements.lock`).
-- **`experimently-web`** (`frontend/Dockerfile`): builds the Next.js static export, generates
+- **the dashboard image** (`frontend/Dockerfile`; locally `experimently-web`): builds the Next.js static export, generates
   nginx location blocks for dynamic routes, and serves with nginx-unprivileged on 8080,
   proxying `/api/`, `/ws/` and `/health*` to the API. It too builds `core` or `full`
   (`EXPERIMENTLY_PROFILE`; full copies `modules/frontend`).
 
 Releases publish all four to GitHub Container Registry, public and signed:
-`ghcr.io/getexperimently/experimently:{core,full}-X.Y.Z` and
-`ghcr.io/getexperimently/experimently-web:{core,full}-X.Y.Z` (plus floating `:core`/`:full` for
+`ghcr.io/controlvar/controlvar:{core,full}-X.Y.Z` and
+`ghcr.io/controlvar/controlvar-web:{core,full}-X.Y.Z` (plus floating `:core`/`:full` for
 final releases). Each is signed with cosign keyless and carries an SPDX SBOM attestation; images
 are amd64 only, and a secret scan runs on each before it is pushed.
 
-### How Experimently does it
+### How Controlvar does it
 
 The image's contract is in the Dockerfile header:
 
@@ -904,7 +916,7 @@ appends `--workers ${WEB_CONCURRENCY:-1}` and the proxy flags. Its contract is i
 #      matching backend/scripts/seed_*.py once. Completed seeds are recorded in
 #      the `seed_markers` table (backend/scripts/seed_markers.py) so a restart
 #      of the container does not re-seed. SEED_FORCE=true re-runs them.
-#      demo, shoplab and streampulse are development-only: they are refused,
+#      Every seed is development-only: SEED=<any of them> is refused,
 #      before step 1, unless ENVIRONMENT is development or test.
 #   4. exec "$@" — by default uvicorn; `--workers ${WEB_CONCURRENCY:-1}` and the
 #      proxy flags are appended when the command is uvicorn and the caller did
@@ -930,12 +942,17 @@ features the guest can't execute and dies with SIGILL; the entrypoint probes onc
 deliberately — so `docker compose up --wait` fails loudly instead of leaving you with an API
 that has no experiments.
 
-The development compose file's header is the operator's cheat sheet:
+The development compose file's header is the operator's cheat sheet, and its first lines are a
+warning: it is for one machine. Every port is published on `127.0.0.1` only, the development
+`ENVIRONMENT` accepts a placeholder `SECRET_KEY`, and the first start creates a demo
+administrator with a documented password; to run Controlvar on a server, use the published images
+in `deploy/compose/compose.yml`.
 
 ```yaml
 # 📁 docker-compose.yml
 #   docker compose up -d --wait            # postgres + redis + api + dashboard
-#   docker compose --profile demo up -d    # + ShopLab (:3200), StreamPulse (:3300)
+#   SEED=demo,shoplab,streampulse docker compose --profile demo up -d --wait
+#                                          # + ShopLab (:3200), StreamPulse (:3300)
 #                                          #   and their traffic simulators
 #   docker compose --profile tools up -d   # + pgAdmin (:5050)
 #   docker compose --profile aws up -d     # + LocalStack (:4566)
@@ -1038,13 +1055,13 @@ docker compose down -v && SEED=demo,nope docker compose up -d --wait; echo "exit
 
 # the entrypoint with production settings it does not have: step 0 refuses (exit 78)
 docker compose run --rm -e ENVIRONMENT=production -e SEED= api true; echo "exit=$?"
-# and a demo seed outside development: refused before anything else runs (exit 78)
+# and a seed outside development: refused before anything else runs (exit 78)
 docker compose run --rm -e ENVIRONMENT=production api true; echo "exit=$?"
 ```
 
 The first of the last two runs prints the preflight's list of every problem it found, in one go,
-instead of one refusal per restart; the second never reaches the preflight, because the demo
-seed refusal comes first. Then inspect the layers: `docker history experimently-api:core`, and
+instead of one refusal per restart; the second never reaches the preflight, because the seed
+refusal comes first (every seed, `sdk-contract` included, is development-only now). Then inspect the layers: `docker history experimently-api:core`, and
 confirm the runtime image has no compiler (`docker run --rm --entrypoint sh experimently-api:core
 -c 'command -v gcc || echo none'`; `--entrypoint` skips the preflight, which would otherwise
 refuse a container with no `ENVIRONMENT`).
@@ -1055,7 +1072,7 @@ refuse a container with no `ENVIRONMENT`).
   entrypoint) and web (static export + nginx proxy). Releases publish all four, signed, with SBOM
   attestations, to public GHCR.
 - The entrypoint runs the preflight (exit 78 with every problem listed), waits for Postgres,
-  bootstraps (`upgrade heads`), seeds once (demo seeds development-only), then execs uvicorn —
+  bootstraps (`upgrade heads`), seeds once (every seed development-only), then execs uvicorn —
   and stops the container if any step fails.
 - Compose uses the API container as the schema writer. AWS uses a separate migration task,
   and API tasks run with `RUN_MIGRATIONS=false`.
@@ -1076,8 +1093,11 @@ while a required setting is empty, and the API's preflight refuses production de
 (Week 2, Day 9).
 
 **Q. Can I point the containerised API at LocalStack?**
-`docker compose --profile aws up -d` and `AWS_ENDPOINT_URL=http://localstack:4566` on the API
-service; DynamoDB counters, Kinesis and S3 paths then talk to LocalStack.
+`docker compose --profile aws up -d` starts LocalStack, but setting `AWS_ENDPOINT_URL` in your
+shell or `.env` does **not** reach the API: the compose file names each variable it passes through.
+Add `AWS_ENDPOINT_URL: http://localstack:4566` to the API's environment in an override file
+(`docker compose -f docker-compose.yml -f <override> ...`); the DynamoDB counters, Kinesis and S3
+paths then talk to LocalStack.
 
 ---
 
@@ -1123,7 +1143,7 @@ The account and region come **only** from the environment (`CDK_DEFAULT_ACCOUNT`
 `AWS_ACCOUNT_ID`), never hard-coded. The API runs 3 tasks in prod, 2 in staging and dev, 1 in
 demo; staging gets one small Redis node.
 
-### How Experimently does it
+### How Controlvar does it
 
 The app wires stacks with explicit dependencies so `cdk deploy --all` orders them:
 
@@ -1241,7 +1261,7 @@ migration task.
 
 ```python
 # 📁 infrastructure/cdk/stacks/fargate_service_stack.py
-            deployment_config=codedeploy.EcsDeploymentConfig.CANARY_10_PERCENT_5_MINUTES,
+            deployment_config=codedeploy.EcsDeploymentConfig.CANARY_10_PERCENT_15_MINUTES,
             role=codedeploy_role,
             alarms=self.api_5xx_alarms,
             ignore_poll_alarms_failure=False,
@@ -1303,7 +1323,7 @@ cd ../.. && python -m pytest infrastructure/tests -q -p no:cov
 
 - Nine core CDK stacks per environment, three more from the modules, explicit dependencies,
   account/region from the environment only, no API Gateway.
-- Runtime: the API on ECS Fargate behind an ALB with CodeDeploy blue/green (10% for 5 minutes),
+- Runtime: the API on ECS Fargate behind an ALB with CodeDeploy blue/green (10% for 15 minutes),
   rolled back by its 5xx alarms; the dashboard as its own rolling ECS service behind the same
   ALB; Aurora (35-day backups in prod and staging); ElastiCache.
 - Secrets by complete ARN as synth inputs; database credentials from Aurora's own secret; no
@@ -1334,7 +1354,7 @@ repository is the step-by-step. The `demo` environment is the same stacks with o
 
 **Q. What does blue/green actually do for us?**
 CodeDeploy stands up the new task set on the green target group. Once the shift is approved, 10%
-of traffic goes to it for 5 minutes, then the rest; the old task set stays an hour. The
+of traffic goes to it for 15 minutes, then the rest; the old task set stays an hour. The
 automatic rollback is driven by the API's 5xx alarms (on both target groups), not by a health
 check, and the alarms need a few minutes of data, so a broken release is often caught after the
 shift. A release that is wrong but answers 2xx goes to 100%: that is what the smoke tests and
@@ -1346,7 +1366,7 @@ your own canary judgement are for.
 
 ### What & why
 
-The platform exposes four types of operational signal, each intended for a different consumer:
+You can't operate what you can't see. Four signals, each with a specific consumer:
 
 1. **Structured logs** (`structlog`) — JSON in staging/production for CloudWatch Logs
    Insights, coloured console in development; every line carries `request_id`, `path`,
@@ -1364,10 +1384,10 @@ The platform exposes four types of operational signal, each intended for a diffe
 
 The middleware order matters for all of it. Registered last means outermost, so from the
 outside in: CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost → RateLimit →
-RelativeSlashRedirect → UnhandledError → the routers. CORS is outermost so that even an error
+RelativeSlashRedirect → RequestBodyLimit → UnhandledError → the routers. CORS is outermost so that even an error
 response carries the CORS headers a dashboard on another origin needs to read it.
 
-### How Experimently does it
+### How Controlvar does it
 
 Logging is configured before anything else in `main.py`, and the request-ID middleware binds
 context that every subsequent log line inherits:
@@ -1403,6 +1423,13 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 ```
 
+Two things the logger does that you only notice when they are missing: uvicorn's access lines and
+WebSocket-handshake lines carry the request target, query string included, so a filter on those
+loggers replaces the values of the sensitive query parameters
+(`backend/app/core/query_redaction.py`); and the HTTP client libraries' own loggers (`httpx`,
+`httpcore`) are held at WARNING, because at INFO they write the full URL of every request, which
+for a warehouse call includes the customer's account host.
+
 A `contextvars.ContextVar` is per-async-task, so concurrent requests don't leak ids into each
 other's lines, and an upstream `X-Request-ID` (from the ALB or a caller) is honoured for
 distributed tracing. The same id is echoed on the response, so a support ticket with a request
@@ -1435,7 +1462,11 @@ rate_limit_rejections_total: Counter = Counter(
 )
 ```
 
-plus the scheduler series Day 17 mentioned. `/metrics` is guarded: with `METRICS_TOKEN` set
+plus the scheduler series Day 17 mentioned, and two Day 9's rate limiter publishes
+(`rate_limit_redis_fallback_active`, a gauge that reads 1 while a process counts per process
+because Redis failed, and `rate_limit_redis_fallbacks_total`) and an `audit_write_failures_total`
+counter, which is the only place a failed audit entry is visible once the change it described has
+committed. `/metrics` is guarded: with `METRICS_TOKEN` set
 it requires the token (bearer or `?token=`); without it, it's open only in development/test
 and 403 elsewhere; `METRICS_ENABLED=false` makes it a 404.
 
@@ -1460,13 +1491,14 @@ Health probes are deliberately asymmetric:
 """
 ```
 
-A database outage should fail readiness so the load balancer stops routing requests to the
-instance. It should not fail liveness and cause the orchestrator to restart a healthy process;
-restarts do not repair the database and can increase reconnect load when it returns. Because the
-probe is unauthenticated, errors are scrubbed. Checks report exception types, while the modules
-check passes free text through `_scrub`. That function limits the message to one line and 200
-characters, removes URL credentials, ARN account IDs and named secret assignments, and drops a
-message that still mentions a password.
+The distinction is the whole point: a database outage must take the service _out of the load
+balancer_ (readiness fails) without making the orchestrator _restart_ every healthy process
+(liveness still passes) — restarting wouldn't fix the database and would add a thundering
+herd of reconnects when it comes back. The probe is unauthenticated, so what it reports is
+scrubbed: the checks report only an error's type, and the one free-text failure (the modules
+check) goes through `_scrub`, which keeps one line of at most 200 characters, strips URL
+credentials, ARN account ids and named secret assignments, and drops a message that still
+mentions a password.
 
 Alerting closes the loop from Week 3: `NotificationService.notify_safety_rollback`,
 `notify_experiment_started`, `notify_experiment_ended` and `notify_rollout_advanced` fan out to
@@ -1513,7 +1545,7 @@ Then read `backend/app/core/health.py::check_redis` and confirm that without
 - Logs: structlog, JSON outside development, `request_id`/`path`/`method` bound per request
   via a `ContextVar`; `X-Request-ID` honoured and echoed, even on an unhandled 500.
 - Middleware outer to inner: CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost →
-  RateLimit → RelativeSlashRedirect → UnhandledError.
+  RateLimit → RelativeSlashRedirect → RequestBodyLimit → UnhandledError.
 - Metrics: one Prometheus registry; HTTP histogram, business counters, rate-limit and
   scheduler series; `/metrics` token-guarded outside dev/test.
 - Probes: live never touches dependencies; ready requires Postgres, reports Redis and the
@@ -1544,13 +1576,12 @@ acceptable; user ids are not).
 
 ---
 
-## Day 28 — Capstone: the whole picture — you can build Experimently
+## Day 28 — Capstone: the whole picture — you can build Controlvar
 
 ### What & why
 
-The final exercise is an architecture review. Draw the components and data flows covered in the
-previous lessons, then explain each connection. Use the source files to check any part you cannot
-account for.
+Twenty-seven days, four weeks, one system. Today you draw it from memory and explain every
+arrow — the test of whether the architecture is in your head rather than in this book.
 
 ### The map, with every day's box filled in
 
@@ -1566,7 +1597,7 @@ account for.
 │ FASTAPI  main.py (Day 8)                                                          │
 │  CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost → RateLimit       │
 │  (auth 10/min · SDK 6000/min · 300/min) → RelativeSlashRedirect →                │
-│  UnhandledError → api/api.py routers (+ module routers in the full profile)       │
+│  RequestBodyLimit → UnhandledError → api/api.py routers (+ module routers)        │
 │  deps.py: get_db · get_current_user (bypass → local JWT → Cognito) · get_api_key  │
 │           (Day 10) · access by role, owner recorded but not a rule (Day 11)       │
 │  Settings: ENVIRONMENT, fail-closed validators, preflight (Day 9)                 │
@@ -1603,9 +1634,9 @@ account for.
    TESTS (Day 22): unit · modules · lambda · integration · db transitions · smoke ·
    sdk contract · live contract · core/full builds · frontend · browser e2e · perf
    CI (Day 24): 20 required checks · release-please → release.yml · deploy.yml · rollback.yml
-   CONTAINERS (Day 25): experimently-api {core,full} (entrypoint: preflight → wait →
+   CONTAINERS (Day 25): the API image {core,full} (entrypoint: preflight → wait →
                         bootstrap where it is the writer → seed → uvicorn)
-                        experimently-web {core,full} (static export + nginx proxy)
+                        the dashboard image {core,full} (static export + nginx proxy)
                         dev compose · production compose
 ```
 
@@ -1617,14 +1648,14 @@ produces:
 
 1. SDK → `/tracking/assign` → `assignments` row.
 2. SDK → `/tracking/track` → `events` row with `variant_id`.
-3. Dashboard → `/results/{id}` → `p_value` (and the three validity checks).
+3. Dashboard → `/results/{id}` → `p_value` (and the three honesty checks).
 4. Client error → `/tracking/errors` → safety tick → `rollout_percentage` change (at 0% the flag
    is also turned off for everyone and its rollout schedule paused) →
    `safety_rollback_records` row.
 5. Pull request → 20 required checks → release → signed image → Deploy: migration task →
    blue/green → smoke.
 
-If you can do that without opening the repo, you can build Experimently. If you can't, the
+If you can do that without opening the repo, you can build Controlvar. If you can't, the
 day whose arrow you missed is the day to reread — that's what the table of contents is for.
 
 ### Where to go next
@@ -1635,8 +1666,10 @@ day whose arrow you missed is the day to reread — that's what the table of con
   the contract harness or the demo apps.
 - **[Platform Operations](../platform-operations/README.md)** if you'll run it — compose, CDK,
   Fargate, observability, releases.
-- The **[usage guide](../guides/usage.md)** to see the product as a product manager does, and
-  the **[troubleshooting guide](../guides/troubleshooting.md)** for the day something breaks.
+- The app's **[user guide](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/guides/user-guide.md)**
+  to see the product as a product manager does, and its
+  **[self-hosting pages](https://github.com/Controlvar/controlvar/tree/v0.36.4/docs/self-hosting)**
+  for the day you run it yourself.
 
 ---
 
@@ -1671,7 +1704,7 @@ won't fix the database.
 Preflight with no AWS credential (main, profile, a release tag on main, the Release Gate passed)
 → one approval → refusals (account, stacks, secrets, ECR, an active deployment, an API alarm
 firing) → image built once, by digest → alarms checked again → database snapshot → the migration
-task → an API revision that does not migrate on start → CodeDeploy blue/green, 10% for 5 minutes
+task → an API revision that does not migrate on start → CodeDeploy blue/green, 10% for 15 minutes
 under the 5xx alarms → API smoke → dashboard rolling deploy and smoke → notify. Migrations run
 before traffic shifts and are backward-compatible, and API tasks never migrate
 (`RUN_MIGRATIONS=false`), so the old revision keeps serving against the new schema and a rollback
@@ -1734,9 +1767,9 @@ the flag and config through the API, posts errors to `/tracking/errors`, loops
 
 **S4.2** — `/login` → bare (no shell, no gate). `/` → bare. `/sso/complete` → bare (an anonymous
 visitor must not be bounced to `/login` mid-hand-off). `/docs` → open (shell, no gate; it links to
-the published documentation site). `/power-calculator` → open (shell, no gate; calls public
+the documentation: the repository's `docs/` on GitHub unless the build names a built site). `/power-calculator` → open (shell, no gate; calls public
 endpoints). `/experiments/[id]` → protected (shell + `RequireAuth`). `/admin/safety` → protected
-(shell + `RequireAuth`; the page additionally passes `roles` so non-admins see the inline 403).
+(shell + `RequireAuth`; `withAdminGuard` makes it superuser-only by default, so anyone else sees the inline 403). `/privacy` → open (shell, no gate: the public site's privacy notice).
 
 **S4.3** — A "Lifespan smoke" job: start uvicorn with `ENVIRONMENT=development` against the
 service Postgres, wait for `/health/ready`, then assert `GET /scheduler/health` lists all five
@@ -1753,7 +1786,7 @@ branch and watch the step fail; a step only ever seen green proves nothing.
     profiles: ["docs"]
     image: nginx:alpine
     volumes:
-      - ../experimently-docs:/usr/share/nginx/html:ro
+      - ../controlvar-books:/usr/share/nginx/html:ro
     ports:
       - "${DOCS_HOST_PORT:-3400}:80"
     healthcheck:
