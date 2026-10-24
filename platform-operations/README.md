@@ -109,4 +109,4 @@ file at that tag and checked by the repository's gates (`tools/README.md`): each
 exist at the tag and each identifier in an excerpt must occur in its file. Nothing here was run
 against a real AWS account; the AWS lessons are read from the CDK source, and anything the book
 says about behaviour in a deployed account is intent unless stated otherwise. To re-check, run
-`EXPERIMENTLY_APP=<your clone> REF=v0.36.4 bash tools/check.sh platform-operations`.
+`CONTROLVAR_APP=<your clone> bash tools/check.sh platform-operations`.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """V5: the Try-It numbers in learn-python and statistics, re-run at REF. (STUB)
 
-What it will do (PR7/PR8 implement it; plan-v2 section 5):
+What it is meant to do (not built yet):
   * extract each `>>>` line with its printed output, and each line carrying an
     expectation comment (`# ≈ X` or `# → X`);
   * run them in the RELEASED image at REF's tag, never a local venv:
@@ -48,8 +48,8 @@ def main() -> int:
     if books_in_scope:
         print(f"V5: in scope: {prompts} `>>>` lines, {count} `# ≈`/`# →` expectation comments, {timing} perf_counter lines; "
               f"books: {', '.join(books_in_scope)}")
-        print("V5: NOT IMPLEMENTED -- the numbers are not re-run yet. PR7/PR8 must implement this gate "
-              "(released image at the REF tag) before either book merges.")
+        print("V5: NOT IMPLEMENTED -- this tool does not re-run the numbers yet (the books' numbers were re-run by "
+              "hand at REF); the other five gates are the ones that must pass.")
         return 3
     print(f"V5: out of scope (no Try-It book in scope; {count} expectation lines seen)")
     return 0

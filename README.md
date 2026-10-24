@@ -116,7 +116,9 @@ request numbers in their subjects, and those numbers mean something else on the 
 commit hashes for that period.
 
 Six checks hold the books to the pinned release: banned terms, paths, quoted snippets, links, Try-It numbers and
-secrets. Run them with `make check` when you change a book; see [`tools/README.md`](./tools/README.md).
+secrets. Run them with `make check` when you change a book; see [`tools/README.md`](./tools/README.md). Five
+must pass; the Try-It numbers check is not built yet and always reports "not implemented" (the numbers were
+re-run by hand at v0.36.4).
 
 Found something wrong or unclear? Open an issue with the book, the lesson and what you expected. Corrections are
 welcome as pull requests; run `make check` and paste its summary.

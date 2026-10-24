@@ -1448,7 +1448,7 @@ export function useFlag(key: string) {
 ```tsx
 interface WorkspaceValue { workspaceId: string | null; select: (id: string | null) => void }
 const WorkspaceContext = createContext<WorkspaceValue | undefined>(undefined);
-const KEY = 'experimently.workspace';
+const KEY = 'controlvar.workspace';
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [workspaceId, setWorkspaceId] = useState<string | null>(() => {
