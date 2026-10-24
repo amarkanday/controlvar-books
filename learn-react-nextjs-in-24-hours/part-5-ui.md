@@ -4,9 +4,11 @@
 
 [← Part IV](./part-4-data-and-forms.md) · [Contents](./README.md) · [Part VI →](./part-6-production.md)
 
-Hours 18–20 cover three UI subsystems: Tailwind styling, the targeting-rule builder and Recharts
-visualizations. The examples show how the rule builder produces the JSON expected by the API and
-how chart components are rendered in Jest tests without a browser canvas.
+Three hours on what the user sees. Tailwind — utility classes as the design system, and the
+few tokens the dashboard adds (Hour 18); the targeting rule builder — the most complex piece
+of client state, shaped exactly like the JSON the backend expects (Hour 19); and charts with
+Recharts, including the mocking trick that lets hundreds of Jest tests render charts without
+a canvas (Hour 20).
 
 ---
 
@@ -120,9 +122,20 @@ a contrast decision written down next to the value it justifies.
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
-const ACTION_META: Record<LifecycleAction, { label: string; pending: string; className: string; confirm?: string }> = {
-  start: { label: 'Start', pending: 'Starting…', className: 'bg-green-600 text-white hover:bg-green-700' },
-  pause: { label: 'Pause', pending: 'Pausing…', className: 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50' },
+const ACTION_META: Record<
+  LifecycleAction,
+  { label: string; pending: string; className: string; confirm?: string }
+> = {
+  start: {
+    label: 'Start',
+    pending: 'Starting…',
+    className: 'bg-green-600 text-white hover:bg-green-700',
+  },
+  pause: {
+    label: 'Pause',
+    pending: 'Pausing…',
+    className: 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50',
+  },
   ...
 };
 ```
@@ -151,17 +164,21 @@ function LoadingSkeleton() {
 }
 ```
 
-Responsive prefixes (`sm:`, `md:`, `lg:`) are mobile-first: `hidden md:flex` in the shell's
-nav means "hidden by default, flex from the medium breakpoint" — the desktop nav — while a
-separate mobile menu handles small screens. The empty state of the rule builder uses a
-dashed border and centred text — a pattern reused for every "nothing here yet":
+Responsive prefixes (`sm:`, `md:`, `lg:`, `xl:`) are mobile-first: the shell's primary nav is
+`hidden xl:flex`, meaning "hidden by default, flex from the extra-large breakpoint" — the
+desktop nav — while a separate mobile menu (`xl:hidden`) handles everything narrower. (The
+breakpoint is that wide because the header row is crowded; Hour 11 mentions the item that was
+moved into the "More" group to keep it from wrapping.) The empty state of the rule builder uses a
+dashed border and centred text — a pattern reused for every "nothing here yet" (the sentence itself is the `emptyText` prop, which
+defaults to `'No targeting rules — all users will match'`; a page that means something else by an
+empty ruleset can say so):
 
 ```tsx
 // 📁 frontend/src/components/targeting/TargetingRuleBuilder.tsx
       {rules.groups.length === 0 && (
         <div className="rounded-lg border-2 border-dashed border-slate-200 p-6 text-center">
           <p className="text-sm text-slate-500 mb-3">
-            No targeting rules — all users will match
+            {emptyText}
           </p>
 ```
 
@@ -238,7 +255,8 @@ export type OperatorType =
   | 'greater_than_or_equal' | 'less_than_or_equal'
   | 'in' | 'not_in' | 'regex' | 'is_null' | 'is_not_null'
   | 'semver_eq' | 'semver_gt' | 'semver_lt' | 'semver_gte' | 'semver_lte'
-  | 'geo_within_radius' | 'time_window' | 'array_contains' | 'array_intersects';
+  | 'geo_within_radius' | 'time_window' | 'array_contains' | 'array_intersects'
+  | 'in_segment' | 'not_in_segment';
 
 export type LogicalOperator = 'AND' | 'OR';
 
@@ -269,8 +287,8 @@ export const OPERATORS_BY_TYPE: Record<string, OperatorType[]> = {
 };
 ```
 
-That `OperatorType` union is the same list as the backend adapter's `_SIMPLE_OPERATOR_MAP` +
-`_SEMVER_OPERATOR_MAP` (Build book, Day 16). Add an operator to the dashboard without the
+That `OperatorType` union is the same list as the backend adapter's operator maps
+(`_SIMPLE_OPERATOR_MAP`, `_SEMVER_OPERATOR_MAP` and the two segment entries; Build book, Day 16). Add an operator to the dashboard without the
 backend and every save that uses it is refused with a 422 (`unknown operator`) — the mirror
 discipline again, with a real failure mode.
 
@@ -285,6 +303,8 @@ interface TargetingRuleBuilderProps {
   className?: string;
   /** Which operators the condition dropdowns offer; see `OperatorOptions`. */
   operatorOptions?: OperatorOptions;
+  /** What the builder says with no groups; flag and experiment rules match everyone then. */
+  emptyText?: string;
 }
 
 export function TargetingRuleBuilder({
@@ -293,6 +313,7 @@ export function TargetingRuleBuilder({
   readOnly = false,
   className = '',
   operatorOptions,
+  emptyText = 'No targeting rules — all users will match',
 }: TargetingRuleBuilderProps) {
   const rules = value ?? createEmptyRules();
 
@@ -345,8 +366,12 @@ export function ConditionRow({
   operatorOptions,
 }: ConditionRowProps) {
   const availableOperators = getOperatorsForAttribute(condition.attribute, operatorOptions);
-  const showValueInput = !NO_VALUE_OPERATORS.includes(condition.operator);
+  // The operator, not the attribute, decides what kind of row this is: a
+  // context attribute called `segment` compared with `equals` is a text row.
+  const isSegmentRow = isSegmentOperator(condition.operator);
+  const showValueInput = !isSegmentRow && !NO_VALUE_OPERATORS.includes(condition.operator);
   const isMultiValue = MULTI_VALUE_OPERATORS.includes(condition.operator);
+  const segmentsOffered = operatorOptions?.allowSegments !== false;
 
   const handleAttributeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newAttribute = e.target.value;
@@ -355,12 +380,20 @@ export function ConditionRow({
     const newOperator = newOperators.includes(condition.operator)
       ? condition.operator
       : newOperators[0];
-    onChange({ ...condition, attribute: newAttribute, operator: newOperator });
+    // A segment id is not a text value, and text is not a segment id.
+    const kindChanged = isSegmentOperator(newOperator) !== isSegmentOperator(condition.operator);
+    onChange({
+      ...condition,
+      attribute: newAttribute,
+      operator: newOperator,
+      value: kindChanged ? '' : condition.value,
+    });
   };
 
   const handleOperatorChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const newOperator = e.target.value as OperatorType;
-    const newValue = NO_VALUE_OPERATORS.includes(newOperator) ? null : condition.value;
+    const kindChanged = isSegmentOperator(newOperator) !== isSegmentOperator(condition.operator);
+    const newValue = NO_VALUE_OPERATORS.includes(newOperator) ? null : kindChanged ? '' : condition.value;
     onChange({ ...condition, operator: newOperator, value: newValue });
   };
 ```
@@ -368,7 +401,10 @@ export function ConditionRow({
 Read `handleAttributeChange`: changing `country` (string) to `app.version` (semver) checks
 whether the current operator (`equals`) is valid for the new type; it isn't, so the operator
 resets to `semver_eq`. The invariant "operator is valid for attribute type" is maintained by
-the handler, not by a validator after the fact. `e.target.value as OperatorType` is a
+the handler, not by a validator after the fact. Notice `kindChanged`: switching between a text
+operator and a segment operator also clears the value, because "a segment id is not a text value,
+and text is not a segment id" — the invariant has grown from "operator fits attribute" to
+"value fits operator", and it is still kept in the handler. `e.target.value as OperatorType` is a
 justified assertion — the `<select>`'s options are built from `OperatorType` values. `label`
 ("Group 1, condition 2") only builds accessible names: the attribute input is announced as
 "Group 1, condition 2 attribute", not as one of a dozen identical "attribute" fields.
@@ -402,6 +438,32 @@ export const COMMON_ATTRIBUTES: AttributeSuggestion[] = [
 
 (The suggestions use the `user.`/`app.` prefixes the backend's `expand_context` aliases, so
 a rule written as `user.country` matches an SDK that sent `{"country": "US"}`.)
+
+#### Segments: a condition whose value is chosen, not typed
+
+The newest operators are `in_segment` and `not_in_segment`. A segment is a named, reusable audience
+(managed on the `/segments` pages from Hour 10); a condition `{"attribute": "segment", "operator":
+"in_segment", "value": "<segment id>"}` asks the server whether the user is a member. Three details
+show how the builder absorbs a new kind of row without a new tree shape:
+
+- `getOperatorsForAttribute('segment')` appends the two segment operators (`SEGMENT_OPERATORS`) to
+  the usual text ones, unless the page passed `allowSegments: false`. A segment's *own* rule
+  builder passes `SEGMENT_RULES_OPERATOR_OPTIONS`, because a segment cannot contain a segment.
+  The attribute still keeps its text operators: a context attribute that happens to be called
+  `segment` is compared with `equals` like any other, and only the operator decides what the row is.
+- The value control of a segment row is `SegmentPicker`, a `<select>` of the active segments by
+  name, fed by a React context that `TargetingRuleBuilder` provides. The builder loads the segment
+  list with `useSegmentList` only when some condition already uses a segment operator
+  (`segmentConditions.length > 0`), so a ruleset without one makes no request.
+- A stored value naming a segment that is no longer active stays selected, labelled "Inactive
+  segment: ..." or "Unknown segment", with a warning beside it (`UNAVAILABLE_SEGMENT_WARNING`), and
+  a ruleset may name at most ten distinct segments (`MAX_SEGMENTS_PER_RULESET`), which the API
+  enforces too. The warning's text is the contract in plain words: no one can be matched against an
+  inactive, archived or unknown segment, so a flag using it answers every user "off" and an
+  experiment using it enrols no new users.
+
+The state is still the API's shape; the new operator is one more member of the union, one more
+entry in `validateRules`'s list, and a different value control.
 
 Validation and serialisation — errors as a list of human sentences, and ids stripped for the
 API:
@@ -439,7 +501,11 @@ export function rulesToJson(rules: TargetingRules): RulesJson {
     logical_operator: rules.logical_operator,
     groups: rules.groups.map((group) => ({
       logical_operator: group.logical_operator,
-      conditions: group.conditions.map(({ attribute, operator, value }) => ({ attribute, operator, value })),
+      conditions: group.conditions.map((condition) => ({
+        attribute: condition.attribute,
+        operator: condition.operator,
+        value: condition.value,
+      })),
     })),
   };
 }
@@ -460,12 +526,13 @@ function generateId(): string {
 ```
 
 > **Watch Out!** The `id` fields exist for React `key`s and stable `datalist` ids. The API
-> **refuses unknown keys** in targeting rules, at every level, with a 422 (`unknown key`; a
-> change made after 0.17.0), and it accepts `id` on groups and conditions only because a
-> stored rule may carry one. That is why the experiment form's `rules as unknown as
-> Record<string, unknown>` still passes — and why any *other* client-only field you add to a
-> condition would make every save fail. `rulesToJson` sends exactly the documented fields;
-> prefer it. (The API also caps rules at 10 levels of nesting and 1,000 nodes in total.)
+> **refuses unknown keys** in targeting rules, at every level, with a 422 (`unknown key`), and it
+> accepts `id` on groups and conditions only because a stored rule may carry one. That is why
+> the experiment form's `rules as unknown as Record<string, unknown>` still passes — and why any
+> *other* client-only field you add to a condition would make every save fail. `rulesToJson`
+> sends exactly the documented fields; prefer it. (The API also bounds the size of what it will
+> evaluate: dashboard-shape rules may have at most 1,000 groups and conditions in all, and the
+> native shape may nest at most 10 levels deep.)
 
 > **Did You Know?** "No targeting rules — all users will match" in the empty state is
 > literally the backend's semantics: an experiment or flag with `targeting_rules: null`
@@ -572,6 +639,19 @@ export function ConversionChart({ variants }: ConversionChartProps) {
     );
   }
 
+  // With nothing to plot, an empty chart would draw an axis of its own
+  // choosing (0-400%), so say so instead (#1244).
+  if (variants.every((v) => !isFiniteNumber(v.mean) || v.mean === 0)) {
+    return (
+      <div
+        className="flex items-center justify-center h-48 text-slate-500"
+        data-testid="conversion-chart-empty"
+      >
+        No conversions yet
+      </div>
+    );
+  }
+
   // Build one data-point per variant for side-by-side comparison
   const chartData = variants.map((v, idx) => ({
     name: v.variant_name,
@@ -587,11 +667,16 @@ export function ConversionChart({ variants }: ConversionChartProps) {
   return (
     <div className="w-full h-72" data-testid="conversion-chart">
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 5 }}>
+        <BarChart
+          data={chartData}
+          margin={{ top: 20, right: 30, left: 20, bottom: 5 }}
+        >
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="name" />
           <YAxis tickFormatter={(v: number) => `${(v * 100).toFixed(1)}%`} />
-          <Tooltip formatter={(v) => [`${((v as number) * 100).toFixed(2)}%`, 'Rate']} />
+          <Tooltip
+            formatter={(v) => [`${((v as number) * 100).toFixed(2)}%`, 'Rate']}
+          />
           <Legend />
           {chartData.map((entry) => (
             <Bar
@@ -627,14 +712,23 @@ export function TrendChart({ series }: TrendChartProps) {
 
   if (!series.length) {
     return (
-      <div className="flex items-center justify-center h-48 text-slate-500" data-testid="trend-empty">
+      <div
+        className="flex items-center justify-center h-48 text-slate-500"
+        data-testid="trend-empty"
+      >
         No trend data available
       </div>
     );
   }
 
   // Collect all unique dates across all series
-  const allDates = Array.from(new Set(series.flatMap((s) => ...
+  const allDates = Array.from(
+    new Set(
+      series.flatMap((s) =>
+        (viewMode === 'cumulative' ? s.cumulative : s.values).map((d) => d.date)
+      )
+    )
+  ).sort();
 ```
 
 The mock — every chart primitive becomes an inspectable `div`:
@@ -650,19 +744,35 @@ export const BarChart = ({ children }: any) => (
 );
 
 export const Bar = ({ name, children, 'data-is-control': dataIsControl, ...rest }: any) => (
-  <div data-testid="variant-bar" data-is-control={dataIsControl} data-fill={rest.fill}>
+  <div
+    data-testid="variant-bar"
+    data-is-control={dataIsControl}
+    data-fill={rest.fill}
+  >
     {String(name ?? '')}
     {children}
   </div>
 );
 
-export const LineChart = ({ children }: any) => <div data-testid="line-chart">{children}</div>;
-export const Line = ({ name, children }: any) => <div data-testid="trend-line">{String(name ?? '')}{children}</div>;
+export const LineChart = ({ children }: any) => (
+  <div data-testid="line-chart">{children}</div>
+);
+
+export const Line = ({ name, children }: any) => (
+  <div data-testid="trend-line">
+    {String(name ?? '')}
+    {children}
+  </div>
+);
+
 export const XAxis = () => <div data-testid="x-axis" />;
 export const YAxis = () => <div data-testid="y-axis" />;
 export const CartesianGrid = () => <div />;
 export const Tooltip = () => <div />;
 export const Legend = () => <div />;
+export const ErrorBar = () => <div />;
+export const Cell = () => <div />;
+export const ReferenceLine = () => <div />;
 ```
 
 and the mapping that turns it on for every test:
@@ -701,17 +811,21 @@ series in parallel, and the sample size **on its own**:
     // Only the latest request may write state, so a slow answer for an
     // earlier experiment never lands on this one.
     const request = ++sampleSizeRequest.current;
+    const planned = Object.keys(overrides).length === 0;
+    const plannedRequest = planned ? ++plannedSampleRequest.current : 0;
     setSampleSizeOverrides(overrides);
     setSampleSizeLoading(true);
     setSampleSizeError(null);
     try {
-      ...
+      // Only what the user changed is sent; with nothing changed, nothing is.
+      const s = planned
+        ? await ResultsService.getSampleSize(experimentId)
+        : await ResultsService.getSampleSize(experimentId, overrides);
+      if (planned && plannedRequest === plannedSampleRequest.current) setPlannedSample(s);
       if (request !== sampleSizeRequest.current) return;
       setSampleSize(s);
     } catch (e) {
-      if (request !== sampleSizeRequest.current) return;
-      setSampleSize(null);
-      setSampleSizeError(e instanceof Error ? e.message : 'Request failed');
+      ...
     } finally {
       if (request === sampleSizeRequest.current) setSampleSizeLoading(false);
     }
@@ -723,10 +837,22 @@ series in parallel, and the sample size **on its own**:
     // Started alongside the results, but never awaited with them. A reload
     // starts from the server's inputs again: nothing typed on the tab is kept.
     setSampleSize(null);
+    setPlannedSample(undefined);
     void fetchSampleSize();
     try {
+      // The dashboard sends the experiment's stored correction and confidence
+      // level. If the experiment cannot be read, the results are still asked
+      // for, with no settings, and the server uses the stored ones.
+      const experimentRequest = readExperiment(experimentId);
+      const resultsRequest = experimentRequest.then(({ settings, bayesianEnabled: b }) => {
+        setStored(settings);
+        setBayesianEnabled(b);
+        return settings
+          ? ResultsService.getResults(experimentId, settings)
+          : ResultsService.getResults(experimentId);
+      });
       const [r, d] = await Promise.all([
-        ResultsService.getResults(experimentId),
+        resultsRequest,
         ResultsService.getDailyResults(experimentId),
       ]);
       setResults(r);
@@ -734,11 +860,19 @@ series in parallel, and the sample size **on its own**:
 ```
 
 `Promise.all` — two requests in flight at once, one `await`; a single failure rejects the
-whole thing into the `catch`, and the page shows its error with a "Try again". The sample size
-used to be the third member of that `Promise.all`; one failing sample-size call then blanked
-the whole results page. Now it is started alongside but never awaited with the others, and it
-has its own loading, error and "Try again" on the Sample Size tab, where the user can also
-change the inputs (`SampleSizeOverrides`, Hour 14) and recalculate.
+whole thing into the `catch`, and the page shows its error with a "Try again". One of those
+two is itself a small chain: `readExperiment` fetches the experiment and never rejects (a
+failure becomes "no settings"), and `resultsRequest` waits for it so that the results are
+asked for with the experiment's stored correction and confidence level, falling back to
+letting the server use its own. The errors shown are fixed sentences chosen by status
+(`resultsErrorMessage`: 404, 403, 5xx, unreachable, anything else), never the server's text,
+for the reason Hour 15 gave. The sample size used to be a member of that `Promise.all`; one
+failing sample-size call then blanked the whole results page. Now it is started alongside but
+never awaited with the others, and it has its own loading, error and "Try again" on the Sample
+Size tab, where the user can also change the inputs (`SampleSizeOverrides`, Hour 14) and
+recalculate. A second counter, `plannedSampleRequest`, keeps the "Planned sample" card on the
+server's own inputs: only a request with no overrides may update it, so what the user tries on
+the tab never changes the card.
 
 `sampleSizeRequest` is a **request counter in a ref**: every call takes the next number, and
 only the call whose number is still the latest may write state. It is the same problem as Hour
@@ -950,7 +1084,7 @@ expect(bars[1]).toHaveAttribute('data-fill', '#dc2626');   // for current/requir
   }, [experimentId, fetchSampleSize]);
 ```
 
-(The sequential-results lookup that follows a successful `r` is unchanged.) The trend tab renders `dailyError` inline (`data-testid="trend-error"`) while the overview
+(The sequential-results lookup that follows a successful `r` is unchanged, and so is the first step of the real `fetchAll`, which reads the experiment's stored settings and sends them with `getResults`; the same `allSettled` shape works with `resultsRequest` in place of the first call.) The trend tab renders `dailyError` inline (`data-testid="trend-error"`) while the overview
 uses `results` as before.
 
 ---

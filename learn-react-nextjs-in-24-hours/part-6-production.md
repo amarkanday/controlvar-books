@@ -4,10 +4,12 @@
 
 [← Part V](./part-5-ui.md) · [Contents](./README.md)
 
-The final Part covers testing and deployment of the dashboard. Hour 21 uses Jest and React Testing
-Library for unit and page tests. Hour 22 covers Playwright journeys and the visual and accessibility
-suites. Hour 23 follows the production build through the container and nginx, including the API URL
-guard. Hour 24 collects the dashboard's coding conventions for use during review.
+The last four hours are about trusting and shipping the dashboard: unit and page tests with
+Jest and React Testing Library, and the mocking shapes the codebase standardises on (Hour 21);
+Playwright for the browser journeys that gate every pull request, plus the nightly accessibility
+suite and a visual-regression spec that no workflow runs yet (Hour 22);
+the build, the image, nginx, and the URL guard that keeps every service path honest against
+the live OpenAPI spec (Hour 23); and the style guide that collects the whole book (Hour 24).
 
 ---
 
@@ -15,7 +17,8 @@ guard. Hour 24 collects the dashboard's coding conventions for use during review
 
 ### What & why
 
-The dashboard's tests — "640+ dashboard tests" by the app README's count — run in **Jest**
+The dashboard's tests — about 1,800 `it(` and `test(` calls, counted with `grep` across 131 test
+files under `frontend/src` and 23 more beside the modules' code — run in **Jest**
 with **jsdom** (a DOM in Node) and **React
 Testing Library** (RTL), whose philosophy shapes every test here: _test what the user sees
 and does_. Render a component, find elements the way a user would (by role, by text, by
@@ -124,7 +127,9 @@ function install(current: Experiment) {
 }
 
 const calledWith = (method: string, path: string) =>
-  mockedApiFetch.mock.calls.some(([p, o]) => p === path && ((o?.method ?? 'GET').toUpperCase() === method));
+  mockedApiFetch.mock.calls.some(
+    ([p, o]) => p === path && ((o?.method ?? 'GET').toUpperCase() === method),
+  );
 
 beforeEach(() => {
   mockedApiFetch.mockReset();
@@ -208,6 +213,8 @@ const moduleTargets = full
 
 module.exports = {
   testEnvironment: 'jsdom',
+  // Pins the process zone to America/Los_Angeles; see the file for why.
+  globalSetup: '<rootDir>/jest.global-setup.js',
   setupFilesAfterEnv: ['<rootDir>/jest.setup.ts'],
   roots: full ? ['<rootDir>', MODULES_DIR] : ['<rootDir>'],
   modulePaths: ['<rootDir>/node_modules'],
@@ -252,6 +259,15 @@ maps to the modules tree first and the stub second. In a core run (`modules/` de
 ignored. `modulePaths` lets files outside the package find `react` in the dashboard's own
 `node_modules`.
 One known limit is written into the file: coverage does not include the modules tree.
+
+The `globalSetup` line deserves a story. CI runners are in UTC, where "a time read as local" and
+"the same time read as UTC" are the same number, so a test that says "this time is shown in the
+viewer's zone" passes whether or not the code converts anything. `jest.global-setup.js` therefore
+sets the process zone to `America/Los_Angeles` (a non-zero offset, with daylight saving) before any
+worker starts. It has to be there and not in a test file, because `process.env.TZ = ...` inside a
+test changes a copy of the environment that Jest gives each test, not the process's zone; the file
+records that the offset stayed 0 when it was tried. The zone-less API timestamps behind Hour 1's
+`parseApiTimestamp` are exactly the kind of code that needs this.
 
 ```ts
 // 📁 frontend/jest.setup.ts
@@ -309,22 +325,29 @@ cd frontend && npx jest src/tests/pages/feature-flag-detail.test.tsx --watchAll=
 Jest proves components behave with a mocked API. **Playwright** proves the whole thing
 works in a real browser against a real backend: log in through the real `/login`, create an
 experiment through the real guided setup, start it, read results, archive it. The specs live
-under `frontend/tests/e2e/`, and `playwright.config.ts` sorts them into three **projects** by
+under `frontend/tests/e2e/`, and `playwright.config.ts` sorts them into four **projects** by
 file name:
 
-- **`journeys`** — the five `*.journey.spec.ts` click paths: `login`, `experiment-lifecycle`,
-  `feature-flag`, `admin-panel`, `rbac`. Serial, asserting on `data-testid`s. These are the
+- **`journeys`** — the eight `*.journey.spec.ts` click paths: `login`, `experiment-lifecycle`,
+  `feature-flag`, `admin-panel`, `rbac`, `results-checks`, `segments` and `header-breakpoint`.
+  Serial, asserting on `data-testid`s. These are the
   **required `Browser E2E` check on every pull request**: CI builds the static export, starts a
   real seeded backend and runs `npx playwright test --project=journeys`. A journey that fails
   twice (one retry absorbs network jitter) fails the PR.
 - **`sso`** — `sso-sign-in.sso.spec.ts`, signing in with single sign-on from the dashboard. It
   needs its own API process and a fake identity provider, which the same `Browser E2E` job
   starts as extra steps.
-- **`extended`** — everything else: visual regression (`visual-regression.spec.ts`,
-  screenshots compared to committed snapshots) and accessibility (`accessibility.spec.ts`,
+- **`extended`** — everything else, which today means accessibility (`accessibility.spec.ts`,
   `@axe-core/playwright` scans of five pages that fail on critical or serious WCAG 2.1 AA
-  violations). These run **nightly**, not in the PR gate: screenshots and full-page audits are
-  slower and noisier than a click path.
+  violations, plus keyboard, label, contrast and alt-text checks). This runs **nightly**, not in
+  the PR gate: full-page audits are slower and noisier than a click path, but a failure there
+  fails the night.
+- **`visual`** — `visual-regression.spec.ts` only. It is a project of its own because **no
+  baseline screenshot has been committed**, so every test in it fails on its first comparison, and
+  no workflow runs it. `npm run test:visual` selects it by file name and
+  `npm run test:visual:update` is how the baselines will be written. Say that sentence out loud
+  before you tell anyone the dashboard "has visual regression tests": it has the spec, not the
+  safety net.
 
 The split is the point: the journeys are few, fail-hard and fast enough to block a merge; the
 rest are broad and informative. The `scenario-runner` agent in `.claude/agents/` drives the
@@ -379,7 +402,15 @@ export default defineConfig({
     {
       name: "extended",
       testMatch: /\.spec\.ts$/,
-      testIgnore: [/\.journey\.spec\.ts$/, /\.sso\.spec\.ts$/],
+      // The visual spec has its own project below, until its baselines exist.
+      testIgnore: [/\.journey\.spec\.ts$/, /\.sso\.spec\.ts$/, /visual-regression\.spec\.ts$/],
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      // Not run by any workflow. Move it back into `extended` (delete the
+      // ignore above and this project) in the change that commits the images.
+      name: "visual",
+      testMatch: /visual-regression\.spec\.ts$/,
       use: { ...devices["Desktop Chrome"] },
     },
   ],
@@ -429,7 +460,9 @@ export const TEST_USERS = {
 /**
  * Log in through the real `/login` page and wait until the app has navigated
  * away from it. Fails loudly if the credentials are rejected — there is no
- * "dev mode skips login" tolerance. ...
+ * "dev mode skips login" tolerance. The only thing tolerated is the platform's
+ * own 10/min brute-force limit on `POST /auth/login`, which `submitResilient`
+ * waits out (the whole suite logs in from one IP).
 ```
 
 A journey — serial, timestamped data so reruns don't collide, page objects, assertions on
@@ -525,8 +558,8 @@ npx playwright test --project=journeys                             # the PR gate
 npx playwright test --project=journeys experiment-lifecycle        # one journey
 npm run test:e2e:headed                                            # everything, watching the browser
 npm run test:e2e:ui                                                # Playwright's UI mode
-npm run test:visual                                                # compare screenshots
-npm run test:visual:update                                         # accept new snapshots (review the diff!)
+npm run test:visual                                                # compare screenshots (no baselines are committed yet, so it fails)
+npm run test:visual:update                                         # write baselines (review the images!)
 npm run test:a11y                                                  # axe audits
 npx playwright show-report
 ```
@@ -536,10 +569,12 @@ npx playwright show-report
 > mode throws. The login error carries `data-testid="login-error"` for this reason; the
 > `LoginPage` page object uses it.
 
-> **Did You Know?** `npm run test:visual:update` rewrites the committed screenshots. A PR
-> that touches snapshots should show the before/after images in review — Playwright's HTML
-> report renders the diff. Updating snapshots to make a red test green without looking is
-> how a regression ships with a "fix" in the commit message.
+> **Did You Know?** `npm run test:visual:update` writes the screenshots a visual test is
+> compared against. Once baselines are committed, a PR that touches them should show the
+> before/after images in review — Playwright's HTML report renders the diff. Updating snapshots
+> to make a red test green without looking is how a regression ships with a "fix" in the commit
+> message. Today there is nothing to update: the project exists so that the first baselines can be
+> committed together with the change that switches it on.
 
 ### Try It Yourself
 
@@ -557,15 +592,18 @@ npx playwright test --project=journeys experiment-lifecycle --headed
 - **Fixed names** across runs — collisions on unique keys.
 - **A slow or flaky check in the `journeys` project** — it blocks every pull request; broad
   scans belong in `extended`.
+- **Telling a reader a check protects them when no workflow runs it** — the visual-regression
+  spec is the live example; read the workflow before you write the sentence.
 - **`getByRole('alert')` on pages with the route announcer.**
-- **Blindly updating visual snapshots.**
+- **Blindly updating visual snapshots** (once there are any).
 
 ### Key takeaways
 
 - Playwright: real browser, real backend, real login via fixtures; serial specs with
   timestamped data; page objects own selectors.
-- Three projects: `journeys` (five `*.journey.spec.ts`) and `sso` are the required `Browser E2E`
-  PR check; `extended` (visual regression, accessibility) runs nightly.
+- Four projects: `journeys` (eight `*.journey.spec.ts`) and `sso` are the required `Browser E2E`
+  PR check; `extended` (accessibility) runs nightly; `visual` is not run by any workflow until its
+  baselines are committed.
 - `tests/e2e/env.ts` holds `BASE_URL` (3100 default) and `API_URL`; `PLAYWRIGHT_WEB_SERVER`
   picks reuse, static export or dev server; traces kept on failure; HTML report.
 
@@ -610,13 +648,13 @@ The guard's contract:
  *
  * ## Profiles
  *
- * The dump is taken from a full-profile build and carries 59 paths that only
+ * The dump is taken from a full-profile build and carries 56 paths that only
  * the modules serve. A core backend serves the rest, so the rule "every URL
  * literal exists in the dump" needs a profile, not a single document. Rather
  * than keeping two dumps in sync, one dump is kept and
  * `openapi.module-paths.json` names the modules' subset:
  *
- *   EXPERIMENTLY_PROFILE=core  →  those 59 paths are removed from the
+ *   EXPERIMENTLY_PROFILE=core  →  those 56 paths are removed from the
  *                                 document, and only the core tree
  *                                 (`frontend/src`, minus anything the manifest
  *                                 still lists there) is scanned.
@@ -650,7 +688,7 @@ The scripts:
 ```json
 // 📁 frontend/package.json
   "scripts": {
-    "dev": "next dev -p 3100",
+    "dev": "next dev -p 3100 -H 127.0.0.1",
     "build": "next build",
     "start": "next start",
     "lint": "cd .. && eslint --config frontend/eslint.config.mjs --no-error-on-unmatched-pattern --max-warnings 0 frontend/src modules/frontend/src",
@@ -663,14 +701,17 @@ The scripts:
     "test:visual:update": "playwright test visual-regression --update-snapshots",
     "test:a11y": "playwright test accessibility",
     "openapi:dump": "cd .. && python -m backend.scripts.dump_openapi --profile full frontend/src/tests/fixtures/openapi.json",
-    "build:marketing": "NEXT_PUBLIC_SITE_MODE=marketing NEXT_PUBLIC_DOCS_URL=https://getexperimently.github.io/experimently next build && NEXT_PUBLIC_SITE_MODE=marketing node scripts/prune-marketing-site.mjs out"
+    "build:marketing": "NEXT_PUBLIC_SITE_MODE=marketing NEXT_PUBLIC_DOCS_URL=https://docs.controlvar.com/ next build && ...",
   },
 ```
 
 Next 16 removed `next lint`, so `lint` runs ESLint 9 directly with the **flat config** in
 `frontend/eslint.config.mjs` (one exported array of config objects, no `.eslintrc`). It runs
 from the repository root so it can lint `modules/frontend/src` too, and `--max-warnings 0`
-makes a warning fail it. `build:marketing` is the public-site build from Hour 13.
+makes a warning fail it. `build:marketing` (shortened in the excerpt) is the public-site build from
+Hour 13, and it chains three commands: `next build` in marketing mode against the published docs
+site, `frontend/scripts/prune-marketing-site.mjs` to remove the dashboard routes from `out/`, and
+`frontend/scripts/fetch-site-media.mjs` to fetch the site's media.
 
 `next build` type-checks and writes the static export to `out/` because of `output: 'export'`;
 it no longer lints. CI splits the work:
@@ -679,7 +720,9 @@ it no longer lints. CI splits the work:
 - the **`Frontend Tests`** job runs `npm ci`, `npm test` and `npm run build` — and then the same
   three things **as the core profile**: `npx tsc --noEmit -p tsconfig.core.json`,
   `EXPERIMENTLY_PROFILE=core npx jest`, and `EXPERIMENTLY_PROFILE=core npm run build`, failing if
-  the core bundle mentions a module route. Without those steps every check would resolve
+  the core bundle mentions a module route (and, as the other half, if the stub page's text is
+  missing). It also runs `frontend/scripts/check-platform-export.mjs` over the export, which asserts that
+  the platform build carries none of the public site's walkthrough videos. Without the core steps every check would resolve
   `@modules/*` to the real modules first, and a core page that leaned on module code would ship
   through a green CI.
 
@@ -729,11 +772,14 @@ RUN npm run build \
 
 FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
 ...
-LABEL ... \
+LABEL org.opencontainers.image.title="Controlvar Dashboard" \
+      ...
       io.experimently.profile="${EXPERIMENTLY_PROFILE}"
 ...
 USER root
-RUN apk upgrade --no-cache
+...
+RUN printf 'OS packages refreshed: %s\n' "${OS_PACKAGES_REFRESHED}" \
+    && apk upgrade --no-cache
 ```
 
 `FROM modules-tree-${EXPERIMENTLY_PROFILE}` picks a stage by name, because `COPY` has no
@@ -747,7 +793,9 @@ path and must contain the stub page's own text; a full bundle must contain a mod
 positive half matters as much as the negative: without it, a page that vanished entirely would
 also pass "contains no module path". (It greps for a string, not a chunk filename, because
 Turbopack emits flat content-hashed chunks.) The runtime stage takes Alpine's security fixes at
-build time (`apk upgrade`) and labels the image with its profile. A build that half-succeeds
+build time (`apk upgrade`, with a date argument so a cached layer is reused only by builds that
+pass the same date) and labels the image with its title, its source repository and its profile
+(the label key, `io.experimently.profile`, is another identifier the rename left alone). A build that half-succeeds
 fails.
 
 The compose wiring and the PR-gate docker smoke that boots it, logs in and mints a key
@@ -777,7 +825,7 @@ cd frontend && npm run openapi:dump && npx jest src/tests/services/url-literals.
 Finally, build the image from the repo root and check the nginx routes it generated:
 
 ```bash
-docker build -f frontend/Dockerfile -t experimently-web:scratch . && docker run --rm experimently-web:scratch cat /etc/nginx/experimently-routes.conf | head
+docker build -f frontend/Dockerfile -t controlvar-web:scratch . && docker run --rm controlvar-web:scratch cat /etc/nginx/controlvar-routes.conf | head
 ```
 
 ### Common mistakes
@@ -803,7 +851,7 @@ docker build -f frontend/Dockerfile -t experimently-web:scratch . && docker run 
 
 ---
 
-## Hour 24 — Putting it together: the Experimently dashboard style guide
+## Hour 24 — Putting it together: the Controlvar dashboard style guide
 
 ### What & why
 
@@ -892,7 +940,7 @@ judgement half is below.
 - Pages mock `apiFetch` with `routedApi` (misses throw), `useRouter`, `useAuth`, `next/head`;
   hooks and services mock `global.fetch`/`WebSocket`; `mockReset` in `beforeEach`.
 - Playwright: the `journeys` project is the required `Browser E2E` PR check, `extended`
-  (visual, accessibility) runs nightly; fixtures log in for real; page objects own selectors;
+  (accessibility) runs nightly, the `visual` spec is run by nothing yet; fixtures log in for real; page objects own selectors;
   timestamped data; serial specs; snapshots updated only with a reviewed diff.
 - The URL guard passes; `npm run openapi:dump` after backend route changes.
 
@@ -954,9 +1002,10 @@ It installs exactly the lock file and fails if `package.json` and the lock disag
 catching a forgotten `npm install` instead of silently resolving new versions.
 
 **Q7. Which Playwright tests can block a merge, and which cannot?**
-The `journeys` project (the five `*.journey.spec.ts` files) and the `sso` project run in the
-required `Browser E2E` check on every pull request. The `extended` project — visual regression
-and accessibility — runs nightly and reports; it does not gate a merge.
+The `journeys` project (the eight `*.journey.spec.ts` files) and the `sso` project run in the
+required `Browser E2E` check on every pull request. The `extended` project — the accessibility
+audit — runs nightly; it does not gate a merge, though a failure fails the night. The `visual`
+project runs nowhere until its baseline screenshots are committed.
 
 **Q8. Why does CI build and test the dashboard a second time with `EXPERIMENTLY_PROFILE=core`?**
 Every other step resolves `@modules/*` to the real modules first, so a core page that imports
@@ -965,8 +1014,8 @@ is what a core build actually has.
 
 **Quiz.** Which two Playwright suites should never be "fixed" by updating an artefact
 without looking, and what's the artefact?
-→ Visual regression (committed screenshots — review the diff) and accessibility (there's no
-artefact to update; fix the markup).
+→ Visual regression (the baseline screenshots, once they are committed — review the images) and
+accessibility (there's no artefact to update; fix the markup).
 
 ---
 

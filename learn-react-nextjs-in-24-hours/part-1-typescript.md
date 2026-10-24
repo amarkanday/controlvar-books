@@ -4,20 +4,17 @@
 
 [← Back to Contents](./README.md)
 
-This Part introduces the TypeScript features used by the dashboard. Hours 1 and 2 cover compiler
-checks and the types used to describe API data. Hour 3 covers generics and `unknown` through the
-shared `apiFetch` client. Hour 4 covers narrowing, optional chaining and the correspondence between
-frontend types and backend schemas.
-
-You can run the small language examples in the [TypeScript Playground](https://www.typescriptlang.org/play).
-Read the compiler errors as part of each example; they explain which assumptions the type system
-can check.
+Four hours of TypeScript — exactly the subset the dashboard uses, taught through the code that
+uses it. Why a JavaScript codebase volunteers for a compiler (Hour 1); the type vocabulary
+that describes API data — interfaces, literal unions, `Record` (Hour 2); generics and
+`unknown`, which are how one `apiFetch` serves every endpoint safely (Hour 3); and narrowing,
+optional chaining and the discipline of mirroring the backend's schemas field for field
+(Hour 4). Open a [Playground](https://www.typescriptlang.org/play) tab and type the examples —
+TypeScript is learned through red squiggles.
 
 ---
 
-<a id="hour-1--why-typescript-the-field-that-wasnt-there"></a>
-
-## Hour 1 — TypeScript and API response checks
+## Hour 1 — Why TypeScript? The field that wasn't there
 
 ### What & why
 
@@ -32,9 +29,7 @@ doesn't stop a malformed API response from delivering `"ACTIVE"` where `"active"
 expected. So the discipline is twofold: precise types for data you _control_, and validation
 (or defensive parsing) at the edges for data you _don't_.
 
-<a id="the-field-that-wasnt-there"></a>
-
-#### Case study: an incorrect response-field assumption
+#### The field that wasn't there
 
 The dashboard's results hook parses WebSocket snapshots from the server. The server sends
 snake_case JSON; the hook converts it to camelCase. Before the fields were typed and parsed
@@ -80,10 +75,9 @@ The complementary discipline is at the top of the types file:
  */
 ```
 
-The dashboard's TypeScript types are maintained by hand to match the Pydantic schemas, including
-snake_case field names. There is no generated client. Tests check response shapes, while the URL
-guard described in Hour 23 checks route usage. Backend schema changes may therefore require a
-corresponding frontend type change.
+The dashboard's types are hand-written mirrors of the Pydantic schemas, snake_case included.
+There's no generated client; the mirror is kept honest by tests that hit the real shapes and
+by a URL guard (Hour 23). When the backend adds a field, someone adds it here.
 
 ### In the wild
 
@@ -101,14 +95,24 @@ corresponding frontend type change.
     "jsx": "react-jsx",
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"],
-      "@modules/*": ["../modules/frontend/src/*", "./src/modules-stub/*"],
+      "@/*": [
+        "./src/*"
+      ],
+      "@modules/*": [
+        "../modules/frontend/src/*",
+        "./src/modules-stub/*"
+      ],
       ...
     },
     ...
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx",
-              "../modules/frontend/src/**/*.ts", "../modules/frontend/src/**/*.tsx"]
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    "../modules/frontend/src/**/*.ts",
+    "../modules/frontend/src/**/*.tsx"
+  ]
 }
 ```
 
@@ -248,7 +252,8 @@ export interface Experiment {
   status: ExperimentStatus;
   targeting_rules: Record<string, unknown> | null;
   tags?: string[] | null;
-  owner_id: string;
+  /** Null once the creator's account has been removed. */
+  owner_id: string | null;
   start_date: string | null;
   end_date: string | null;
   created_at: string;
@@ -263,7 +268,10 @@ Read the nuances: `key: string | null` (present, may be null — the column is n
 `description?: string | null` (may be absent or null); `experiment_type: ExperimentType |
 string` (the union plus `string` — deliberately loose, because the backend may add a type
 before the dashboard does, and rendering an unknown type as text beats a crash);
-`configuration?: Record<string, unknown> | null` (a JSON object of unknown shape).
+`configuration?: Record<string, unknown> | null` (a JSON object of unknown shape); and
+`owner_id: string | null` (the doc comment says why: it is null once the creator's account has been
+removed, so any code that compares it to the signed-in user is comparing against a value that can be
+absent).
 
 Completeness-checked lookup tables:
 
@@ -405,10 +413,10 @@ function knowing anything about experiments. That's how one fetch wrapper serves
 endpoints with full typing at each call site. Generic _classes_ and _hooks_ work the same
 way: `useApi<T>(fetcher: () => Promise<T>)` returns `{ data: T | null, ... }`.
 
-`unknown` describes a value whose structure has not yet been checked. Unlike `any`, it requires
-narrowing before most operations, using `typeof`, `instanceof`, `in` or a type guard. This is useful
-for parsed JSON, an error's `detail` and caught exceptions, all of which enter the dashboard from
-outside the immediate function's guarantees.
+**`unknown`** is the type for "a value we haven't looked at yet." Unlike `any`, you can't
+_do_ anything with an `unknown` until you narrow it (`typeof`, `instanceof`, `in`, a type
+guard). It's the honest type for a parsed JSON body, an error's `detail`, or a caught
+exception — and the dashboard uses it at every edge.
 
 #### Why `apiFetch` is generic but `ApiError.detail` is `unknown`
 
@@ -427,7 +435,15 @@ export async function apiFetch<T = unknown>(
   path: string,
   options: ApiFetchOptions = {},
 ): Promise<T> {
-  const { query, json, auth = true, redirectOn401 = true, headers: extraHeaders, body: rawBody, ...rest } = options;
+  const {
+    query,
+    json,
+    auth = true,
+    redirectOn401 = true,
+    headers: extraHeaders,
+    body: rawBody,
+    ...rest
+  } = options;
 
   const url = apiUrl(path, query);
   const headers: Record<string, string> = { Accept: 'application/json', ...(extraHeaders ?? {}) };
@@ -436,17 +452,47 @@ export async function apiFetch<T = unknown>(
   if (json !== undefined) {
     body = JSON.stringify(json);
     if (!hasHeader(headers, 'content-type')) headers['Content-Type'] = 'application/json';
+  } else if (typeof rawBody === 'string' && !hasHeader(headers, 'content-type')) {
+    headers['Content-Type'] = 'application/json';
   }
-  ...
+
   const token = auth ? getToken() : null;
   if (token && !hasHeader(headers, 'authorization')) {
     headers.Authorization = `Bearer ${token}`;
   }
-  ...
+
+  const init: RequestInit = { ...rest, headers };
+  if (body !== undefined) init.body = body;
+
+  let response: LooseResponse;
+  try {
+    response = (await fetch(url, init)) as LooseResponse;
+  } catch (err) {
+    throw new ApiError({ status: 0, detail: unreachableMessage(), cause: err });
+  }
+
   if (response.ok) {
     return readSuccessBody<T>(response, path);
   }
 
+  throw await failureFrom(response, auth, redirectOn401);
+}
+```
+
+The wrapper reads top to bottom as the life of one request: build the URL, build the headers (JSON
+body gets its `Content-Type`, the bearer token is attached unless the caller passed an
+`Authorization` header of its own), call `fetch`, and branch. A thrown `fetch` (the browser could
+not reach the API at all) becomes an `ApiError` with `status: 0`. A 2xx goes to `readSuccessBody<T>`.
+Anything else is handed to `failureFrom`, which builds the error:
+
+```typescript
+// 📁 frontend/src/services/api.ts
+/** The `ApiError` for a non-2xx response; a 401 also clears the token. */
+async function failureFrom(
+  response: LooseResponse,
+  auth: boolean,
+  redirectOn401: boolean,
+): Promise<ApiError> {
   const status = response.status ?? 0;
   const { detail, json: bodyIsJson } = await readErrorDetail(response);
   const requestId = readRequestId(response);
@@ -469,17 +515,20 @@ export async function apiFetch<T = unknown>(
     ...
   }
 
-  throw new ApiError({ status, detail, message, requestId });
+  return new ApiError({ status, detail, message, requestId, retryAfter: readRetryAfter(response) });
 }
 ```
 
 Two details in the error half are about the people reading the message, not the compiler.
-`readErrorDetail` returns `{ detail, json }`, so `apiFetch` knows whether the body was JSON at
+`readErrorDetail` returns `{ detail, json }`, so `failureFrom` knows whether the body was JSON at
 all; a 5xx whose body is not JSON (a proxy's HTML page) gets `serverErrorMessage(status,
 requestId)` instead of a garbled `statusText`. And `readRequestId` reads the `X-Request-ID`
 response header: a 5xx message carries `Request ID: ...`, which an administrator searches the
-API log for. `ApiError` keeps it as `requestId`, and its `isServerError` getter is
-`status >= 500`.
+API log for. `ApiError` keeps it as `requestId`, keeps a `Retry-After` header as `retryAfter`
+(the API's rate limiter sends one with a 429), and its `isServerError` getter is `status >= 500`.
+The error is built in its own function because a second caller needs it: `apiDownload`, which
+fetches a file (the audit-log export) with the same token and the same error handling but does not parse the
+body as JSON.
 
 Typed call sites — the service supplies `T`:
 
@@ -506,6 +555,8 @@ export class ApiError extends Error {
   readonly status: number;
   readonly detail: unknown;
   readonly code?: string;
+  readonly requestId?: string;
+  readonly retryAfter?: number;
   ...
 }
 
@@ -526,7 +577,9 @@ export function messageForDetail(status: number, detail: unknown): string {
       .map((item) => {
         if (item && typeof item === 'object') {
           const rec = item as Record<string, unknown>;
-          const loc = Array.isArray(rec.loc) ? rec.loc.filter((p) => p !== 'body').join('.') : '';
+          const loc = Array.isArray(rec.loc)
+            ? rec.loc.filter((p) => p !== 'body').join('.')
+            : '';
           const msg = typeof rec.msg === 'string' ? rec.msg : '';
           return loc && msg ? `${loc}: ${msg}` : msg || loc;
         }
@@ -588,13 +641,15 @@ Record<string, unknown>>` — so `keyof T` is usable for field names:
 
 ```typescript
 // 📁 frontend/src/hooks/useForm.ts
-export function useForm<T extends Record<string, unknown>>(options: UseFormOptions<T>): UseFormResult<T> {
+export function useForm<T extends Record<string, unknown>>(
+  options: UseFormOptions<T>,
+): UseFormResult<T> {
 ```
 
-> **Watch Out!** A type assertion with `as` does not convert or validate a value at runtime.
-> In `readErrorDetail`, the check `'detail' in (parsed as object)` precedes access through
-> `(parsed as { detail: unknown }).detail`. Review assertions together with the runtime checks
-> that justify them.
+> **Watch Out!** `as` is not a conversion; it's you telling the compiler to believe you.
+> `(parsed as { detail: unknown }).detail` in `readErrorDetail` is guarded by
+> `'detail' in (parsed as object)` — the check makes the assertion honest. An `as` with no
+> check nearby is a review comment.
 
 > **Did You Know?** `Promise<T>` and `Promise<void>` are how async functions are typed;
 > `apiFetch<void>` on a DELETE returns `undefined` for a 204, and `readSuccessBody` handles
@@ -714,10 +769,16 @@ absent dates:
 // 📁 frontend/src/pages/experiments/[id].tsx
 function formatDate(value: string | null | undefined): string {
   if (!value) return '—';
-  const d = new Date(value);
+  const d = parseApiTimestamp(value);
   return Number.isNaN(d.getTime()) ? value : d.toLocaleString();
 }
 ```
+
+`parseApiTimestamp` (`frontend/src/utils/apiTimestamp.ts`) is a small defence against a real trap: the
+API sends some times without a zone (`2026-10-11T05:02:00`), and `new Date()` would read that as the
+browser's local time instead of UTC. The helper appends `Z` only to a string that names no zone and
+otherwise falls back to `new Date(value)`. Note what the guard does with an unparseable string: it
+shows the raw value rather than "Invalid Date".
 
 Optional chaining into a JSON blob the app doesn't control, with a typed reader that
 normalises it — from the demo app that consumes the SDK:
