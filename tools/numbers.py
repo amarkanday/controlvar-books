@@ -6,7 +6,7 @@ What it will do (PR7/PR8 implement it; plan-v2 section 5):
     expectation comment (`# ≈ X` or `# → X`);
   * run them in the RELEASED image at REF's tag, never a local venv:
       docker run --rm --platform linux/amd64 --entrypoint python \\
-        ghcr.io/getexperimently/experimently:full-X.Y.Z
+        ghcr.io/controlvar/controlvar:full-X.Y.Z
     (`--entrypoint` skips the migrate-on-start entrypoint);
   * compare with a stated relative tolerance and fixed seeds;
   * exclude timing lines (`perf_counter`) by name.

@@ -10,7 +10,7 @@ A path is one of the app's top-level directories followed by `/...`. A token
 preceded by `/`, `.`, a word character or `-` is not a path (URLs, `../x`,
 `foo-backend/`). `:NN`, `#L..` and trailing punctuation are stripped. Tokens
 holding a placeholder (`<`, `{`, `*`, `$`, `...`) are skipped. Existence is
-`git -C $EXPERIMENTLY_APP cat-file -e REF:path`, so a file and a directory both
+`git -C $CONTROLVAR_APP cat-file -e REF:path`, so a file and a directory both
 count.
 """
 
