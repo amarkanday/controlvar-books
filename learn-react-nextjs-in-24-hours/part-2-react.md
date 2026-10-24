@@ -4,12 +4,12 @@
 
 [← Part I](./part-1-typescript.md) · [Contents](./README.md) · [Part III →](./part-3-nextjs.md)
 
-The dashboard uses function components and hooks. Hour 5 covers JSX and component composition;
-Hour 6 covers props and local state. Hours 7 and 8 explain effects, request cancellation and custom
-hooks. Hour 9 covers the authentication and toast contexts shared by pages.
-
-Run `make web` while working through the component examples so you can compare state changes with
-what the browser renders.
+React in five hours, the way the dashboard uses it: components as functions returning JSX
+(Hour 5), the one-way flow of props in and state held by `useState` (Hour 6), effects for
+"do something after render" and the cancellation discipline that stops stale responses
+(Hour 7), custom hooks — the unit of reuse — and the rules that make them work (Hour 8), and
+context for the two things every page needs without prop-drilling: who's logged in and how
+to show a toast (Hour 9). Have `make web` running and edit a component to see it hot-reload.
 
 ---
 
@@ -190,7 +190,7 @@ A fragment (`<>...</>`) to return siblings without a wrapper element, from the a
       <Head>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-        <title>Experimently</title>
+        <title>Controlvar</title>
       </Head>
       <ModulesProvider>
         <AuthProvider>
@@ -353,7 +353,7 @@ export function allocationTotalOf(variants: VariantFormData[]): number {
 
 ```tsx
 // 📁 frontend/src/components/experiments/new/VariantsEditor.tsx
-export function VariantsEditor({ variants, dispatch }: VariantsEditorProps) {
+export function VariantsEditor({ variants, dispatch, revealProblems = 0 }: VariantsEditorProps) {
   const allocationTotal = allocationTotalOf(variants);
 ```
 
@@ -781,17 +781,45 @@ export function useApi<T>(
   const [error, setError] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
-  const execute = useCallback(async () => { ... }, deps);
+  const execute = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await fetcher();
+      if (mountedRef.current) {
+        setData(result);
+      }
+    } catch (err) {
+      if (mountedRef.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (mountedRef.current) {
+        setLoading(false);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
 
-  useEffect(() => { ... }, [execute, immediate]);
+  useEffect(() => {
+    mountedRef.current = true;
+    if (immediate) {
+      execute();
+    }
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [execute, immediate]);
 
   return { data, loading, error, refetch: execute, setData };
 }
 ```
 
 Usage: `const { data: flags, loading, refetch } = useApi(() => FeatureFlagsService.list(), []);`.
-The `setData` in the result is for optimistic updates — a toggle can update the row locally
-after the API confirms, without a refetch.
+The `setData` in the result is there for local updates — a row could be changed in place after
+the API confirms, without a refetch. At this release no page calls it (the flag list in Hour 16
+keeps its own state, which lets it also guard against overlapping requests), so treat it as
+available rather than established.
 
 `useForm` — a generic form hook with validators per field and a submit pipeline. It is a good
 example of a generic hook, but be clear what it is: **no page uses it today** (only its own
@@ -808,7 +836,9 @@ export interface UseFormOptions<T extends Record<string, unknown>> {
   onSubmit: (values: T) => Promise<void> | void;
 }
 
-export function useForm<T extends Record<string, unknown>>(options: UseFormOptions<T>): UseFormResult<T> {
+export function useForm<T extends Record<string, unknown>>(
+  options: UseFormOptions<T>,
+): UseFormResult<T> {
   const { initialValues, validators, onSubmit } = options;
   const [values, setValues] = useState<T>(initialValues);
   const [errors, setErrors] = useState<FormErrors<T>>({});
@@ -1086,15 +1116,27 @@ render, and the hook throws without a provider:
 ```tsx
 // 📁 frontend/src/contexts/AuthContext.tsx (shape)
   const value = useMemo<AuthContextValue>(
-    () => ({ user, status, isAuthenticated: status === 'authenticated', login, logout, refresh: loadMe, hasRole, sessionError }),
+    () => ({
+      user,
+      status,
+      isAuthenticated: status === 'authenticated',
+      login,
+      logout,
+      refresh: loadMe,
+      hasRole,
+      sessionError,
+    }),
     [user, status, login, logout, loadMe, hasRole, sessionError],
   );
+
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth(): AuthContextValue {
   const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth must be used within AuthProvider');
+  if (!ctx) {
+    throw new Error('useAuth must be used within AuthProvider');
+  }
   return ctx;
 }
 
@@ -1125,7 +1167,14 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
-  const removeToast = useCallback((id: string) => { ... }, []);
+  const removeToast = useCallback((id: string) => {
+    const timer = timersRef.current.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      timersRef.current.delete(id);
+    }
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   const addToast = useCallback(
     (message: string, variant: ToastVariant = 'info', duration = 5000) => {
@@ -1162,10 +1211,14 @@ Consumers read what they need — the nav reads `status` and `user`; the detail 
   ...
   const mayChange = canChangeExperiment(user);
   ...
-  const isOwner = user !== null && user.id === experiment.owner_id;
+  // A null owner (the creator's account was removed) is nobody, so it is
+  // never you.
+  const isOwner =
+    user !== null && experiment.owner_id !== null && user.id === experiment.owner_id;
 ```
 
-Ownership labels; it does not grant. Access to experiments and flags is by role (Hour 16).
+Ownership labels; it does not grant. Notice the null check: `owner_id` is `string | null` (Hour 1), and
+a removed creator must never compare equal to anyone. Access to experiments and flags is by role (Hour 16).
 
 And the providers are mounted once, in order, around every page:
 
@@ -1322,7 +1375,7 @@ and a `useWorkspace()` that throws without a provider.
 function Row({ flag }: { flag: Flag }) {
   const [on, setOn] = useState(flag.enabled);
   if (!flag.key) return null;
-  const { addToast } = useNotification();
+  const { addToast } = useNotifications();
   useEffect(async () => { await FeatureFlagsService.get(flag.key); }, []);
   return <FlagToggle on={on} onChange={() => { flag.enabled = !on; setOn(flag.enabled); addToast('ok'); }} label={flag.key} />;
 }
@@ -1416,7 +1469,7 @@ export function useWorkspace(): WorkspaceValue {
 }
 ```
 
-**S2.5** — (1) `useNotification()` is called after an early return — a rules-of-hooks
+**S2.5** — (1) `useNotifications()` is called after an early return — a rules-of-hooks
 violation (hook count changes when `flag.key` is falsy); move the return below all hooks.
 (2) `useEffect(async () => ...)` returns a promise — wrap in a sync callback with `void`, and
 add the cancelled flag; also the deps `[]` ignore `flag.key`. (3) `flag.enabled = !on`

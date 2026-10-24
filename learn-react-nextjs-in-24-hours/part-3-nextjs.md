@@ -4,13 +4,14 @@
 
 [← Part II](./part-2-react.md) · [Contents](./README.md) · [Part IV →](./part-4-data-and-forms.md)
 
-Next.js provides the dashboard's routing, development server and production build. Hours 10–12
-cover file-based routes, `_app.tsx`, page wrappers, authentication and dynamic route parameters.
-Hour 13 covers environment configuration and the static export served by nginx.
-
-The reviewed dashboard uses Next.js 16, React 19 and the pages router (`src/pages/`). Next.js 16
-uses Turbopack for `next build` by default; `next build --webpack` selects webpack. The configuration
-supports both build paths.
+Next.js is the framework around React that gives the dashboard routing, a build, a dev server
+and a production artefact. Four hours: files are routes (Hour 10); `_app.tsx`, the shell, and
+how a route's _kind_ decides what wraps it (Hour 11); the client-side auth gate, `useRouter`,
+and dynamic routes (Hour 12); and the environment/base-URL contract plus the static export
+that ships behind nginx (Hour 13). The dashboard runs **Next.js 16 with React 19** and uses the
+**pages router** (`src/pages/`), not the app router — deliberately, and this Part explains why.
+Since Next 16, `next build` bundles with **Turbopack** by default;
+`next build --webpack` still selects webpack, and the config keeps both working (below).
 
 ---
 
@@ -51,6 +52,9 @@ frontend/src/pages/
 ├── index.tsx                # /
 ├── login.tsx                # /login
 ├── power-calculator.tsx     # /power-calculator (public)
+├── privacy.tsx              # /privacy (the public site's privacy notice)
+├── account/
+│   └── password.tsx         # /account/password (a local user changes their own password)
 ├── docs/
 │   └── index.tsx            # /docs — a hub of links to the documentation
 ├── experiments/
@@ -58,6 +62,8 @@ frontend/src/pages/
 │   ├── new.tsx              # /experiments/new (guided setup; ?advanced = one page)
 │   └── [id].tsx             # /experiments/:id
 ├── feature-flags/
+│   ├── index.tsx · new.tsx · [id].tsx
+├── segments/
 │   ├── index.tsx · new.tsx · [id].tsx
 ├── results/
 │   ├── index.tsx · [id].tsx
@@ -114,7 +120,7 @@ hydrates — hence the `if (!id)` loading branch, which every dynamic page has.
 #### Module routes: the `@modules/*` seam
 
 Some pages belong to optional **modules** — workspaces, the data warehouse, SSO sign-in,
-custom roles. Experimently ships as one codebase with two build profiles: **core** (the
+custom roles. Controlvar ships as one codebase with two build profiles: **core** (the
 dashboard under `frontend/` alone) and **full** (adds the modules' dashboard code under
 `modules/frontend/src/`, beside `frontend/`, not inside it). A core checkout has no `modules/`
 directory at all, yet the route files above must still compile. So a module route is a
@@ -168,7 +174,7 @@ hub of links. Every link is built by one function:
 
 ```tsx
 // 📁 frontend/src/pages/docs/index.tsx
-import { docsUrl } from '@/services/docs';
+import { DOCS_BRANCH, DOCS_REPO, docsUrl } from '@/services/docs';
 ...
       { label: 'Quick Start', href: docsUrl('getting-started/quick-start'), desc: 'Run the stack and create your first experiment' },
 ```
@@ -181,9 +187,12 @@ export const DOCS_SITE = (process.env.NEXT_PUBLIC_DOCS_URL || '').replace(/\/+$/
 
 `docsUrl('getting-started/quick-start')` names a file under the app repository's `docs/`
 (without `.md`). By default it becomes a GitHub URL for that markdown file, which cannot be
-missing for whatever version you run. Set `NEXT_PUBLIC_DOCS_URL` at build time to the origin
-of a built MkDocs site and the links take that site's directory-style URLs instead (the
-marketing build sets it to the published docs site). A Jest guard, `docs-links.test.ts`,
+missing for whatever version you run: the published site at docs.controlvar.com is built from
+release tags only, and the file's own header comment records why the default is the repository
+(it once was the site, before the site had ever been deployed, and every link answered 404).
+Set `NEXT_PUBLIC_DOCS_URL` at build time to the origin of a built MkDocs site and the links
+take that site's directory-style URLs instead (the marketing build sets it to the published
+docs site). A Jest guard, `docs-links.test.ts`,
 fails if any `docsUrl('...')` literal names a page that does not exist under `docs/` (Hour 23).
 
 Client-side navigation and programmatic routing:
@@ -272,8 +281,9 @@ export), and a comment that says where security headers live instead. Then the s
 > Next.js would try to treat as a page. And a file under `src/pages/` that isn't a page
 > (a helper) becomes a broken route — put helpers under `components/`, `utils/` or `hooks/`.
 
-> **Did You Know?** `next dev -p 3100` — the dashboard's dev script uses 3100 so it can run
-> beside the compose stack's `:3000`. Both origins are in the API's CORS defaults. The
+> **Did You Know?** `next dev -p 3100 -H 127.0.0.1` — the dashboard's dev script uses 3100 so
+> it can run beside the compose stack's `:3000`, and binds to the loopback address so the dev
+> server is not offered to your whole network. Both origins are in the API's CORS defaults. The
 > demo apps take 3200 and 3300 for the same reason.
 
 ### Try It Yourself
@@ -309,7 +319,7 @@ in a full checkout to see the real page.
 - Client-rendered app + `output: 'export'`; `/docs` is a link hub built with `docsUrl()`.
 - Module routes are one-line re-exports of `@modules/pages/...`; the alias resolves to
   `modules/frontend/src/` (full) or `src/modules-stub/` (core), in Turbopack and webpack alike.
-- `<Link>` and `router.push` for navigation; `next dev -p 3100`.
+- `<Link>` and `router.push` for navigation; `next dev -p 3100 -H 127.0.0.1`.
 
 ---
 
@@ -327,7 +337,7 @@ Three kinds, decided by a pure function of the route pattern:
 | Kind        | Shell (`AppShell`) | Auth gate (`RequireAuth`) | Routes                                                  |
 | ----------- | ------------------ | ------------------------- | ------------------------------------------------------- |
 | `bare`      | no                 | no                        | `/login`, `/`, `/sso/complete`                          |
-| `open`      | yes                | no                        | `/docs/*`, `/power-calculator`, `/404`, `/500`, `/_error` |
+| `open`      | yes                | no                        | `/docs/*`, `/power-calculator`, `/privacy`, `/404`, `/500`, `/_error` |
 | `protected` | yes                | yes                       | everything else                                         |
 
 #### Why a classifier and not per-page wrappers
@@ -346,16 +356,16 @@ The classifier:
 /**
  * Routes rendered without the application shell. `/sso/complete` is one so
  * that it is never `protected`: RequireAuth would bounce an anonymous visitor
- * to `/login?next=`, carrying the SSO hand-off fragment along (C2b).
+ * to `/login?next=`, carrying the SSO hand-off fragment along.
  */
 const BARE_ROUTES = new Set<string>(['/login', '/', '/sso/complete']);
 
 /**
  * Routes inside the shell that do not require a session. The API is still the
  * enforcement point; these pages are either static or call public endpoints
- * (the power calculator).
+ * (the power calculator). `/privacy` is the public site's privacy notice.
  */
-const OPEN_ROUTE_PREFIXES = ['/docs', '/power-calculator', '/404', '/500', '/_error'];
+const OPEN_ROUTE_PREFIXES = ['/docs', '/power-calculator', '/privacy', '/404', '/500', '/_error'];
 
 export type RouteKind = 'bare' | 'open' | 'protected';
 
@@ -409,7 +419,7 @@ export default function App({ Component, pageProps, router }: AppProps) {
       <Head>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-        <title>Experimently</title>
+        <title>Controlvar</title>
       </Head>
       <ModulesProvider>
         <AuthProvider>
@@ -437,6 +447,10 @@ The shell — nav items with access gating, and the active-link rule:
 export const NAV_ITEMS: NavItem[] = [
   { label: 'Experiments', href: '/experiments', testId: 'nav-experiments' },
   { label: 'Feature Flags', href: '/feature-flags', testId: 'nav-feature-flags' },
+  { label: 'Segments', href: '/segments', testId: 'nav-segments' },
+  // Every role: the audit API answers each one, narrowed to their own entries
+  // for DEVELOPER and VIEWER. `roles` also keeps it off anonymous renders.
+  { label: 'Audit Log', href: '/admin/audit', testId: 'nav-audit-log', roles: AUDIT_LOG_ROLES },
   { label: 'Admin', href: '/admin', testId: 'nav-admin', superuser: true },
   { label: 'Docs', href: '/docs', testId: 'nav-docs' },
 ];
@@ -445,6 +459,7 @@ export function isNavActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 ...
+  const marketing = isMarketingSite();
   const visibleNav = NAV_ITEMS.filter((item) => {
     if (marketing) return item.href === '/docs';
     if (item.superuser) return user !== null && user.is_superuser === true;
@@ -486,12 +501,20 @@ export const MODULE_NAV_ITEMS: (NavItem & { module: string })[] = [
 
 These links appear under a "More" disclosure only when `useModules()` (Hour 9's
 `ModulesProvider`) reports the module installed; in the core profile "More" carries a
-"Modules" link to the guide instead. The primary nav is core chrome and never hard-links a
+"Modules" link to the guide instead (not while the probe is still in flight, and not after a
+failed one, because the dashboard has no grounds to claim "this is the core profile" when all it
+knows is that the API did not answer). For a local-sign-in user "More" also holds "Change
+password" (`/account/password`), kept out of the header row because the extra item pushed the
+header past its row width and wrapped the other items. The primary nav is core chrome and never hard-links a
 route the core profile does not serve.
 
 Nav gating is a convenience, not a control; the endpoints return 403 regardless.
-`isNavActive` is exported for its test, and it's the same prefix logic as `routeKind`. The
-shell also renders a skip link (`href="#main-content"`) and `aria-current="page"` on the
+`isNavActive` is exported for its test, and it's the same prefix logic as `routeKind`; because
+`/admin/audit` matches both "Audit Log" and "Admin" by prefix, `activeNavHref` picks the longest
+matching href, so only the more specific item is marked current there. "Audit Log" is a second
+example of a nav rule copied from the API rather than invented: it carries `roles: AUDIT_LOG_ROLES`
+(all four roles) because the audit API answers every signed-in user, narrowed to their own entries
+for DEVELOPER and VIEWER. The shell also renders a skip link (`href="#main-content"`) and `aria-current="page"` on the
 active item — accessibility that the Playwright a11y suite checks.
 
 `<PageTitle>` — the per-page title, because `<Head>` in `_app` sets only the default:
@@ -579,7 +602,7 @@ export interface RequireAuthProps {
   /**
    * When true, the user must be a superuser -- the same flag the admin API
    * enforces. `role` and `is_superuser` are independent columns, so a role
-   * check cannot stand in for it ...
+   * check cannot stand in for it (#84).
    */
   superuser?: boolean;
   /** Where the "Go back" link on the 403 view points. Default `/experiments`. */
@@ -619,7 +642,12 @@ export function RequireAuth({ children, roles, superuser, fallbackPath = '/exper
     return (
       <>
         {loading ?? (
-          <div data-testid="require-auth-loading" className="flex items-center justify-center min-h-[40vh]" role="status" aria-live="polite">
+          <div
+            data-testid="require-auth-loading"
+            className="flex items-center justify-center min-h-[40vh]"
+            role="status"
+            aria-live="polite"
+          >
             <div className="inline-block w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
             <span className="sr-only">Loading…</span>
           </div>
@@ -851,7 +879,8 @@ shell for `/api/...` when the proxy isn't wired:
 
 ```typescript
 // 📁 frontend/src/services/api.ts
-  const contentType = headers && typeof headers.get === 'function' ? headers.get('content-type') : null;
+  const contentType =
+    headers && typeof headers.get === 'function' ? headers.get('content-type') : null;
   if (contentType && !/json/i.test(contentType)) {
     // A non-JSON 2xx usually means a proxy served the SPA shell instead of the API.
     const text = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
@@ -893,8 +922,9 @@ The image, whose header is the deployment contract:
 #
 # The build context is the REPOSITORY ROOT (like backend/Dockerfile): the
 # modules' dashboard code lives in modules/frontend/, next to frontend/, not
-# inside it. (The documentation is no longer rendered in-app -- the dashboard
-# links to the MkDocs site, so docs/ is not copied.)
+# inside it. (The documentation is no longer rendered in-app, so docs/ is not
+# copied. The dashboard's docs links go to the Markdown under docs/ on GitHub,
+# unless NEXT_PUBLIC_DOCS_URL below names a built MkDocs site.)
 #
 # EXPERIMENTLY_PROFILE selects what goes in:
 #   core (default)  never reads modules/frontend/ — a core checkout, which has
@@ -915,8 +945,10 @@ The image, whose header is the deployment contract:
 # absolute URL only when the dashboard is served from a different origin.
 ARG NEXT_PUBLIC_API_URL=""
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-# The documentation site the dashboard links to (frontend/src/services/docs.ts).
-# Empty means the published site; set it for a deployment that hosts its own.
+# Where the dashboard's docs links go (frontend/src/services/docs.ts). Empty,
+# the default here, means the Markdown under docs/ on GitHub's main branch. Set
+# it to the origin of a built MkDocs site (the published one, or one this
+# deployment hosts) to link there instead; only `npm run build:marketing` sets it.
 ARG NEXT_PUBLIC_DOCS_URL=""
 ENV NEXT_PUBLIC_DOCS_URL=${NEXT_PUBLIC_DOCS_URL}
 
@@ -927,9 +959,12 @@ RUN npm run build \
     ...
 ```
 
-(The Dockerfile's comment on `NEXT_PUBLIC_DOCS_URL` says "the published site", but
-`docs.ts`, which decides, falls back to the GitHub repository when it is empty; trust the
-code, Hour 10.) The profile is a build argument with `core` as the default, so a plain
+(The Dockerfile's comment and `docs.ts` now agree: empty means the GitHub repository, and only
+the marketing build points at a built site. Two old-name leftovers are worth recognising when you
+read it: the local tags in the header comment, `experimently-web:core`, are just examples of
+`-t`, since the published images are `ghcr.io/controlvar/controlvar-web` and
+`ghcr.io/controlvar/controlvar`; and the build argument is still `EXPERIMENTLY_PROFILE`, because
+the rename left identifiers like that alone.) The profile is a build argument with `core` as the default, so a plain
 `docker build` works on a checkout with no `modules/` at all. Hour 23 covers the stages that
 pick the modules tree and the check that the bundle matches the profile.
 
@@ -971,8 +1006,11 @@ The compose service wires the two pieces: an empty build arg, and the upstream f
       # connect-src of the CSP; add the API origin when NEXT_PUBLIC_API_URL is absolute.
       CSP_CONNECT_SRC: "${CSP_CONNECT_SRC:-'self' ws: wss:}"
     ports:
-      - "${FRONTEND_HOST_PORT:-3000}:8080"
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:8080"
 ```
+
+(The port is published on `127.0.0.1` only: the development stack is for your laptop, not your
+network.)
 
 > **Watch Out!** `NEXT_PUBLIC_*` is baked in at build time. Setting it as a _runtime_
 > environment variable on the container does nothing; the bundle already has its value. To
@@ -1040,7 +1078,7 @@ the first static render?**
 is why every dynamic page has a loading branch.
 
 **Q2. Which routes are `open`, which are `bare`, and what does each mean?**
-`open`: `/docs/*`, `/power-calculator`, `/404`, `/500`, `/_error` — rendered inside the shell
+`open`: `/docs/*`, `/power-calculator`, `/privacy`, `/404`, `/500`, `/_error` — rendered inside the shell
 but without `RequireAuth`. `bare`: `/login`, `/` and `/sso/complete` — no shell and no gate
 (`/sso/complete` must never be gated, or the SSO hand-off is lost on the way to `/login`). New
 routes are `protected` by default.
@@ -1095,7 +1133,7 @@ image, a Vercel-hosted dashboard with the API at `api.example.com` — state `ap
 value, `wsBase()`'s value, and whether `CORS_ORIGINS` needs the dashboard's origin.
 
 **E3.5 — Debug it.** `curl localhost:3000/api/v1/experiments/` returns HTML with `<title>
-Experimently</title>` and status 200. What's happening, how does `apiFetch` surface it, and
+Controlvar</title>` and status 200. What's happening, how does `apiFetch` surface it, and
 what's the fix?
 
 ---

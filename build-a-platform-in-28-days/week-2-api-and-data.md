@@ -4,16 +4,21 @@
 
 [← Week 1](./week-1-core-loop.md) · [Contents](./README.md) · [Week 3 →](./week-3-hard-parts.md)
 
-Week 2 follows requests through the backend. It covers middleware, configuration, authentication,
-authorization, database models and migrations. The final exercise adds a column and exposes it
-through the API and dashboard.
+Week 1 was _what_ the platform does. This week is the machinery every request passes through
+on the way to doing it: the FastAPI application and its middleware onion, the settings object
+that decides which environment you're in and refuses to start when it's unsafe, the ways a
+caller proves who they are, the role table that decides what they may do, the SQLAlchemy models
+and the PostgreSQL schema they live in, and the migration story. By Day 14 you'll add a column
+and watch it light up from the database to the dashboard.
 
-> A request passes through eight middleware layers, with CORS outermost. Dependencies authenticate
-> the caller; role, resource and action determine authorization. Endpoints delegate to services
-> using a request-scoped SQLAlchemy session. The shared `Settings` object configures these layers
-> and applies additional validation in staging and production.
+> **The one sentence to carry through Week 2.** _A request enters through nine middleware
+> layers (CORS outermost), is authenticated by one of the `deps` functions (bearer JWT, Cognito
+> token, or API key), authorised by a role → resource → action table in which ownership plays
+> no part, handled by a thin endpoint that delegates to a service, which reads and writes
+> SQLAlchemy models inside one `Session` per request — and every one of those layers is
+> configured by a single `Settings` object that fails closed in staging and production._
 
-| Day | Topic                               | Focus                                     |
+| Day | Topic                               | The one thing it's really about                                     |
 | --- | ----------------------------------- | ------------------------------------------------------------------- |
 | 8   | The FastAPI application             | The onion of middleware, the router tree and the modules seam      |
 | 9   | Configuration                       | One `Settings` class, four environments, validators that refuse     |
@@ -35,15 +40,15 @@ dependencies), and the framework does the parsing, validation, OpenAPI generatio
 serialisation. **Starlette** underneath provides the ASGI plumbing — middleware, routing,
 WebSockets. **uvicorn** runs it.
 
-Experimently uses four FastAPI features heavily, and today is about how they're arranged:
+Controlvar uses four FastAPI features heavily, and today is about how they're arranged:
 
 1. **Routers.** Each resource is an `APIRouter` in its own module; `api/api.py` mounts them
    all under `/api/v1` with a prefix and a tag. The tag becomes the section heading in the
    OpenAPI docs; the prefix becomes the URL.
-2. **Middleware.** Cross-cutting behaviour is a stack of eight ASGI middleware wrapped around
+2. **Middleware.** Cross-cutting behaviour is a stack of nine ASGI middleware wrapped around
    the router: CORS, request IDs, Prometheus metrics, security headers, a trusted-host check,
-   rate limiting, a trailing-slash redirect that keeps the client's origin, and an
-   unhandled-error layer that turns a crash into a readable 500. The order they're registered
+   rate limiting, a trailing-slash redirect that keeps the client's origin, a request-body size
+   limit, and an unhandled-error layer that turns a crash into a readable 500. The order they're registered
    in is the opposite of the order they run, and the file says so.
 3. **Lifespan.** Startup and shutdown are one async context manager. It first refuses to serve
    when `ENVIRONMENT` was never set, then starts and stops the five background schedulers.
@@ -71,8 +76,13 @@ reason about, and the codebase learned each of them the hard way:
 - **The unhandled-error layer is registered first, so it is innermost.** Its 500 travels back
   out through every other layer and picks up CORS, the request id and the security headers on
   the way.
+- **The body-limit layer is registered right after it**, so it is inside every other layer and
+  its 413 picks up the same headers. It also has to stay inside each `BaseHTTPMiddleware` layer:
+  registered outside one, the route reading the body is handed an `ExceptionGroup` instead of the
+  `HTTPException`, and FastAPI answers a chunked body over the limit with 400 (the file says it
+  measured this).
 
-### How Experimently does it
+### How Controlvar does it
 
 The app module reads top to bottom as configure → construct → wrap → mount. The lifespan:
 
@@ -149,6 +159,11 @@ for _level, _message in cors_start_up_messages(settings):
 # An unhandled route exception becomes a 500 the browser can read (#72).
 app.add_middleware(UnhandledErrorMiddleware)
 
+# A request body larger than MAX_REQUEST_BODY_SIZE is answered 413, on every
+# route: at once when its Content-Length says so, otherwise when the bytes read
+# pass the limit.
+app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BODY_SIZE)
+
 # Trailing-slash redirects keep the client's own origin (#86).
 app.add_middleware(RelativeSlashRedirectMiddleware)
 
@@ -182,6 +197,9 @@ app.add_middleware(
         "X-RateLimit-Limit",
         "X-RateLimit-Remaining",
         "X-RateLimit-Window",
+        # The audit log export's entry count, which the dashboard compares
+        # with the rows it received before it saves the file.
+        "X-Total-Count",
     ],
 )
 
@@ -193,7 +211,8 @@ app.include_router(health_router)
 ```
 
 So a request passes, outermost first: **CORS → RequestID → Prometheus → SecurityHeaders →
-TrustedHost → RateLimit → RelativeSlashRedirect → UnhandledError → router** (Starlette slips
+TrustedHost → RateLimit → RelativeSlashRedirect → RequestBodyLimit → UnhandledError → router**
+(Starlette slips
 its own `ExceptionMiddleware` in just before the router), and the response walks back out the
 same way.
 
@@ -279,7 +298,7 @@ descriptions plus whatever the modules registered.
 
 #### The modules seam
 
-Experimently is one codebase with two build profiles. **Core** is `backend/` alone; **full**
+Controlvar is one codebase with two build profiles. **Core** is `backend/` alone; **full**
 adds the optional modules under `modules/` (workspaces, HIPAA, compliance reports, SSO, custom
 roles, the warehouse connectors, integrations, real-time counters, ETL and split-URL
 routing). `modules-manifest.txt` is the authority on what is a module. The profile is decided
@@ -295,8 +314,9 @@ outside development and test the process refuses to start. The unauthenticated
 `GET /api/v1/modules` reports `{"profile": "core"|"full", "modules": [...], "version": ...}`;
 the dashboard reads it to decide which navigation to render.
 
-The core must work with `modules/` deleted. `scripts/core_build.sh` builds and tests that reduced
-tree, and an import-linter contract rejects imports from core code into a module.
+The rule that keeps the seam honest: **everything under `backend/` must work with `modules/`
+deleted.** `scripts/core_build.sh` builds exactly that tree and runs the suite in it, and an
+import-linter contract refuses a core import of a module.
 
 #### A path operation, anatomised
 
@@ -329,7 +349,17 @@ async def start_experiment(
 
         experiment_service = ExperimentService(db)                                 # ⑧ the service
         ...
-        started_experiment = experiment_service.start_experiment(experiment)
+        before_audit = audit_snapshot(EntityType.EXPERIMENT, experiment)
+        try:
+            started_experiment = experiment_service.start_experiment(experiment)
+        except EndDatePassedError as err:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=END_DATE_PASSED
+            ) from err
+
+        record_experiment_change(                                                  # ⑪ the audit entry
+            db, current_user, ActionType.EXPERIMENT_START, experiment_id, before_audit
+        )
         ...
         return ExperimentResponse.model_validate(started_experiment)               # ⑨ ORM/dict → schema
     except HTTPException:
@@ -361,6 +391,16 @@ contract: the `RequestValidationError` handler answers a 422 with each error's `
 `msg` and `ctx` but not the submitted value, and `UnhandledErrorMiddleware` turns anything that
 escapes a route into a 500 that still carries CORS and the request id.
 
+⑪ is the audit trail. Before the change the endpoint takes `audit_snapshot` of the fields an entry
+records for an experiment (key, name, status, the dates, `correction_method`,
+`confidence_level`); after the change commits, `record_experiment_change` reads the row back and
+writes one entry holding only what changed. The write is best-effort by design: "the change is
+committed: reading it back must not turn it into a 500", so a failed audit write is logged,
+counted in `audit_write_failures_total`, and does not undo the experiment change. Note the other
+new branch: `start_experiment` raises `EndDatePassedError` (answered 400) when an experiment with
+no start date has an end date that has already passed, so it is refused *before* anything is
+written.
+
 > **Watch Out!** FastAPI ≥ 0.141 changed how `app.routes` exposes included routers: entries
 > can be lazy `_IncludedRouter` objects with no `.path`. Anything that enumerates routes —
 > the wiring smoke test, a script listing endpoints — must go through
@@ -382,7 +422,8 @@ ENVIRONMENT=development python -c "
 from backend.app.main import app
 print(' -> '.join(m.cls.__name__ for m in app.user_middleware))" 2>/dev/null
 # CORSMiddleware -> RequestIDMiddleware -> PrometheusMetricsMiddleware -> SecurityHeadersMiddleware
-#   -> TrustedHostMiddleware -> RateLimitMiddleware -> RelativeSlashRedirectMiddleware -> UnhandledErrorMiddleware
+#   -> TrustedHostMiddleware -> RateLimitMiddleware -> RelativeSlashRedirectMiddleware
+#   -> RequestBodyLimitMiddleware -> UnhandledErrorMiddleware
 ```
 
 Then watch the order from the outside. With the stack running (`make dev`, or the compose
@@ -427,9 +468,9 @@ curl -s http://localhost:8000/api/v1/modules   # which profile is this?
 
 - One `FastAPI` app; core routers mounted by `register_core_routers()` under `/api/v1`, module
   routers added by the seam; tags are the doc sections.
-- Eight middleware layers. A request runs CORS → RequestID → Prometheus → SecurityHeaders →
-  TrustedHost → RateLimit → RelativeSlashRedirect → UnhandledError → handler; registration
-  order is the reverse, and the file says why.
+- Nine middleware layers. A request runs CORS → RequestID → Prometheus → SecurityHeaders →
+  TrustedHost → RateLimit → RelativeSlashRedirect → RequestBodyLimit → UnhandledError →
+  handler; registration order is the reverse, and the file says why.
 - The lifespan refuses to serve without an explicit `ENVIRONMENT`, then starts and stops the
   five schedulers (none under `test`).
 - An endpoint declares its inputs, authenticates via `deps`, authorises by role, delegates to a
@@ -476,10 +517,11 @@ ten-per-minute login budget on requests the user never made.
 
 ### What & why
 
-Configuration selects the database, authentication provider, environment, secrets and public
-hostname for a process. Experimently uses `pydantic-settings` to read these values from environment
-variables and optional `.env.dev`, `.env.test` or `.env.prod` files. The settings classes convert
-values to their declared types and validate combinations before startup.
+Configuration is where a platform decides what it _is_ in this process: which database, which
+auth provider, which environment, which secrets, which hostname. Controlvar uses
+**pydantic-settings**: a `Settings` class whose fields are read from environment variables
+(and an optional `.env.dev` / `.env.test` / `.env.prod` file), type-coerced, and validated —
+with the validation doing real safety work.
 
 Four ideas organise the module:
 
@@ -516,7 +558,7 @@ one environment variable between a production deployment and its demo secrets. T
 `TESTING` relaxes nothing: combined with staging or production it is refused outright, before
 any field is validated.
 
-### How Experimently does it
+### How Controlvar does it
 
 The environment resolution and the base class (an excerpt; the class has many more fields):
 
@@ -557,7 +599,7 @@ def resolve_environment_from_process_env() -> str:
 class Settings(BaseSettings):
     """Base settings class."""
 
-    PROJECT_NAME: str = "Experimently"
+    PROJECT_NAME: str = "Controlvar"
     VERSION: str = Field(
         default_factory=get_version, validation_alias="EXPERIMENTLY_VERSION"
     )
@@ -610,7 +652,7 @@ A few fields deserve a sentence each:
   which build scripts and CI steps export for their own purposes and which used to change what
   `/health` and the OpenAPI document reported.
 - **`PUBLIC_BASE_URL`** is the URL people reach the service at, e.g.
-  `https://experimently.example.com`. Every absolute URL the app _emits_ — the OIDC
+  `https://controlvar.example.com`. Every absolute URL the app _emits_ — the OIDC
   `redirect_uri` above all — is built from it rather than from the request's `Host` and scheme,
   which a client controls. It is also where the trusted-host allow-list comes from when
   `ALLOWED_HOSTS` is unset (usually leave it unset).
@@ -811,6 +853,9 @@ RATE_LIMIT_CONFIG: Dict[str, Tuple[int, int]] = {
     "/api/v1/users/me/password": (5, 60),
     "/api/v1/auth/sso/exchange": (10, 60),
     "/api/v1/auth/sso/login": (30, 60),
+    "/api/v1/tracking/assign/batch": (60, 60),
+    "/api/v1/audit-logs/export": (10, 60),
+    "/api/v1/ai/design": (10, 60),
 }
 
 # Default rate limit for all other endpoints
@@ -827,6 +872,9 @@ DEFAULT_SDK_RATE_LIMIT_PER_MINUTE = 6000
 EXPORT_PATH_PREFIX = "/api/v1/export/"
 EXPORT_RATE_LIMIT: Tuple[int, int] = (10, 60)  # 10 req/min, all exports together
 
+AI_INTERPRET_PATH_PREFIX = "/api/v1/ai/interpret/"
+AI_INTERPRET_RATE_LIMIT: Tuple[int, int] = (10, 60)  # 10 req/min, every id together
+
 
 def resolve_rate_limit(
     path: str, sdk_limit_per_minute: int = DEFAULT_SDK_RATE_LIMIT_PER_MINUTE
@@ -835,13 +883,16 @@ def resolve_rate_limit(
     Return ``(max_requests, window_seconds)`` for a request path.
 
     Exact entries in ``RATE_LIMIT_CONFIG`` win, then the export prefix, then
-    SDK path prefixes, then ``DEFAULT_RATE_LIMIT``.
+    the AI interpretation prefix, then SDK path prefixes, then
+    ``DEFAULT_RATE_LIMIT``.
     """
     exact = RATE_LIMIT_CONFIG.get(path)
     if exact is not None:
         return exact
     if path.startswith(EXPORT_PATH_PREFIX):
         return EXPORT_RATE_LIMIT
+    if path.startswith(AI_INTERPRET_PATH_PREFIX):
+        return AI_INTERPRET_RATE_LIMIT
     if any(path.startswith(prefix) for prefix in SDK_PATH_PREFIXES):
         return (int(sdk_limit_per_minute), 60)
     return DEFAULT_RATE_LIMIT
@@ -852,7 +903,15 @@ legitimately sends thousands of assignments a minute from one IP, and `/tracking
 falling under the 300/min default. `/api/v1/sdk/` joined it when server-side SDKs began polling
 the local-evaluation ruleset. The export tier is the opposite case: every export computes
 results for every experiment it covers, so all export routes share **one** counter per client
-(`rate_limit_key` keys them on the prefix, not the path). `SDK_RATE_LIMIT_PER_MINUTE` in
+(`rate_limit_key` keys them on the prefix, not the path). Four newer rows are the same idea, one
+route at a time. `/tracking/assign/batch` gets 60 a minute, **not** the SDK tier's 6,000, because
+one request assigns up to 1,000 users (6,000 requests would be 6 million users a minute from one
+address). The audit-log export streams up to 50,000 entries while holding a database connection,
+so it has a counter of its own. The two AI routes each call a language model and wait for it,
+so `/ai/design` and every `/ai/interpret/<id>` (one shared budget, whatever the id) get 10 a
+minute. A row for a path that is a prefix of other paths would shadow them; that is why the batch
+route is an exact entry, and why the file's comment notes that a trailing slash is answered by
+FastAPI's 307 redirect to the exact path. `SDK_RATE_LIMIT_PER_MINUTE` in
 `Settings` feeds `sdk_limit_per_minute` — a scalar in `Settings`, a table in the module, and a
 pure function joining them that the tests can call without a server.
 
@@ -863,6 +922,18 @@ overrides it), so it has already resolved the real client from `X-Forwarded-For`
 middleware runs. An earlier version read the header itself and took the _leftmost_ entry —
 the one the client wrote — so a client that sent a fresh address on every request got a fresh
 bucket every time, including against the login limit.
+
+Where the counters live matters too. `RedisRateLimiter` counts in Redis (`INCR` + `EXPIRE`), and
+when Redis fails it does not stop serving: it falls back to an in-memory sliding window **per
+process**, so while it lasts a per-IP limit is multiplied by the number of API processes. The
+fallback lasts `REDIS_RETRY_SECONDS` (30 s); inside that window no request touches Redis, and
+the first request after it is the retry. The client is built with `retry=Retry(NoBackoff(), 0)`
+because redis-py's default of ten retries with backoff turns one failure into 15 to 25 seconds
+of blocking on the event loop, which a retry every 30 seconds would repeat. Each switch logs
+once with a `rate_limiter` field (`per_process` or `redis`), and two metrics
+(`rate_limit_redis_fallback_active`, `rate_limit_redis_fallbacks_total`) let an alert see it.
+The fallback map also forgets keys whose window has emptied, so it does not grow for as long as
+the outage lasts.
 
 > **Did You Know?** `extra="ignore"` in `model_config` means an unknown environment variable
 > is silently dropped rather than rejected. The comment says "to catch typos", which is
@@ -892,15 +963,15 @@ env -u TESTING ENVIRONMENT=production SECRET_KEY=$K FIRST_SUPERUSER_PASSWORD=Str
 
 # everything right except the dev bypass
 env -u TESTING ENVIRONMENT=production SECRET_KEY=$K FIRST_SUPERUSER_PASSWORD=Str0ngPassw0rd \
-  PUBLIC_BASE_URL=https://experimently.example.com DEV_AUTH_BYPASS=true \
+  PUBLIC_BASE_URL=https://controlvar.example.com DEV_AUTH_BYPASS=true \
   python -c "import backend.app.core.config" 2>&1 | grep "Value error"
 
 # legacy spelling: accepted, with deprecation warnings, and the allow-list derived from the URL
 env -u TESTING -u ENVIRONMENT APP_ENV=prod SECRET_KEY=$K FIRST_SUPERUSER_PASSWORD=Str0ngPassw0rd \
-  PUBLIC_BASE_URL=https://experimently.example.com \
+  PUBLIC_BASE_URL=https://controlvar.example.com \
   python -W always -c "from backend.app.core.config import settings; print(settings.ENVIRONMENT, settings.is_production, settings.effective_allowed_hosts)"
 # ... DeprecationWarning: ENVIRONMENT='prod' is deprecated; use ENVIRONMENT='production' instead.
-# production True ['experimently.example.com']
+# production True ['controlvar.example.com']
 ```
 
 Then evaluate the rate-limit table as a function, the way its tests do:
@@ -926,8 +997,8 @@ for p in ['/api/v1/auth/login','/api/v1/users/me/password','/api/v1/tracking/bat
 - The rules live in `settings_rules.py`, so the container's preflight lists every problem at
   once (exit 78) with exactly the settings' own rules.
 - CORS origins are normalised, configured or empty in staging/production; rate limits are
-  strict on auth, 300/min default, one shared 10/min budget for exports, and
-  `SDK_RATE_LIMIT_PER_MINUTE` (6000) on SDK paths — resolved by a pure function, charged to the
+  strict on auth, 300/min default, one shared 10/min budget for exports, 60/min for batch
+  assignment, and `SDK_RATE_LIMIT_PER_MINUTE` (6000) on the other SDK paths — resolved by a pure function, charged to the
   client uvicorn resolved.
 
 ### Q&A
@@ -1005,7 +1076,7 @@ minute. SHA-256 is fast and one-way, which is all a random 128-bit key needs (th
 to brute-force). So keys are stored as their SHA-256 hex digest, the plaintext is shown once
 at creation, and lookup is `APIKey.key == sha256(header)`.
 
-### How Experimently does it
+### How Controlvar does it
 
 The three token functions in `core/security.py`:
 
@@ -1055,8 +1126,8 @@ def hash_api_key(api_key: str) -> str:
 ```
 
 Three defensive choices are packed in there. `algorithms=[...]` pins HS256 so a token with
-`alg: none` is rejected. `issuer=` pins `experimently-local` so a JWT from some other
-service that happens to share the secret can't be replayed. `options={"require": [...]}`
+`alg: none` is rejected. `issuer=` pins `experimently-local` (a name the rename to Controlvar left alone) so a JWT
+from some other service that happens to share the secret can't be replayed. `options={"require": [...]}`
 makes `sub`/`exp`/`iat`/`iss` mandatory so a truncated token can't authenticate as nobody.
 
 The dispatcher:
@@ -1177,7 +1248,9 @@ def _issue_local_login(db: Session, email: str, password: str) -> LoginResponse:
 
 The same 401 message is used for an unknown address, a wrong password and an inactive
 account, so the endpoint can't be used to enumerate users; ten failures in fifteen minutes
-answer 423 with `Retry-After`. The tracker is in-process memory (per worker), which is one
+answer 423 with `Retry-After`. A successful sign-in also writes a `user_login` audit entry that
+records the provider and nothing more, and, like every audit write in this codebase, a failure
+to write it is logged and does not fail the sign-in. The tracker is in-process memory (per worker), which is one
 more reason the platform runs one worker per container. A signed-in user changes their own
 password with `POST /api/v1/users/me/password`, which checks the current one, is limited to
 5/min, and counts its failures toward the same lockout.
@@ -1224,6 +1297,9 @@ def get_api_key(
         db.rollback()
         logger.warning(f"Could not record API key use for key {api_key.id}: {exc}")
 
+    # Hold a connection for the rest of the request whether or not the use was recorded.
+    db.connection()
+
     return user
 ```
 
@@ -1239,8 +1315,8 @@ manual step; in every other case the key comes from the dashboard's Admin → AP
 `backend/app/core/api_key_scopes.py`: split on commas, strip, drop empties, then **exact,
 case-sensitive** membership (`"read, sdk:ruleset "` grants `sdk:ruleset`; `"SDK:RULESET"` and
 `"sdk:ruleset-ro"` do not). Exactly one scope name is enforced today, **`sdk:ruleset`**: it
-admits a key to the server-side local-evaluation surface, `GET /api/v1/sdk/ruleset` and
-`POST /api/v1/tracking/evaluations`. Every other scope name is a label.
+admits a key to the server-side surface: `GET /api/v1/sdk/ruleset`,
+`POST /api/v1/tracking/evaluations` and `POST /api/v1/tracking/assign/batch`. Every other scope name is a label.
 
 ```python
 # 📁 backend/app/api/sdk_scope.py
@@ -1251,20 +1327,34 @@ def require_sdk_ruleset_key(
 ) -> APIKey:
     """Return the presented ``APIKey`` row if it carries ``sdk:ruleset``."""
     ...
+    refusal = scope_refusal(db, api_key)
+    if refusal is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
+    return api_key
+```
+
+with the decision itself pulled out into a plain function, so another caller can ask the same
+question without raising:
+
+```python
+# 📁 backend/app/api/sdk_scope.py
+def scope_refusal(db: Session, api_key: APIKey) -> Optional[str]:
+    """Why ``api_key`` may not act as a server-side key, or ``None`` if it may.
+
+    The scope first (:data:`MISSING_SCOPE_DETAIL`), then its owner, read from
+    the database by the key's own ``user_id`` (:data:`OWNER_ROLE_DETAIL`:
+    missing, inactive, or unable to change feature flags).
+    """
     if not has_scope(api_key.scopes, SDK_RULESET_SCOPE):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=MISSING_SCOPE_DETAIL
-        )
+        return MISSING_SCOPE_DETAIL
     owner = db.query(User).filter(User.id == api_key.user_id).first()
     if (
         owner is None
         or not owner.is_active
         or not check_permission(owner, ResourceType.FEATURE_FLAG, Action.UPDATE)
     ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=OWNER_ROLE_DETAIL
-        )
-    return api_key
+        return OWNER_ROLE_DETAIL
+    return None
 ```
 
 It layers on `get_api_key` (401 for a missing or unknown key), then decides on the _presented_
@@ -1272,7 +1362,18 @@ key itself — another key of the same user carrying the scope grants nothing �
 without the scope. The ruleset is every flag's full targeting, so the scope works only while the
 key's owner can change flags (ADMIN, DEVELOPER or a superuser), checked on every request so it
 follows role changes; and `POST /api-keys` refuses to create an `sdk:ruleset` key for anyone
-else.
+else. The same rule fits batch assignment, because ADMIN, DEVELOPER and superusers are exactly
+who can change experiments too (a test pins the two role lists equal), and the 403 texts are
+the same on every route.
+
+The extracted `scope_refusal` has a second caller worth knowing about:
+`presented_key_is_server_key` applies the same rules but refuses nothing, and the error-report
+routes (`POST /tracking/errors` and `/errors/batch`) use it. They accept **any** valid key (neither route answers 403), but the key decides how the report
+is stored and whether it counts: a server-side key (the `sdk:ruleset` scope, owner able to change
+flags) stores `source = "server"` and the report counts toward the flag's error rate and so
+toward automatic rollback (Day 18); any other key, such as the one in a browser or mobile app,
+stores `"client"`, and safety monitoring does not count it. An app whose errors should count
+sends them to its own server, which forwards them with a server-side key.
 
 > **Watch Out!** `core/security.py` also has a `decode_token()` that returns _constant stub
 > claims_ and raises `RuntimeError` unless `TESTING` is set. It exists only so legacy tests can
@@ -1333,8 +1434,9 @@ docker compose exec postgres psql -U postgres -d experimentation -c "select name
   where it doesn't.
 - Login lockout is 10 failures / 15 min → 423 + `Retry-After`; the message never reveals
   which of address/password/status was wrong.
-- One scope is enforced, `sdk:ruleset`, on the local-evaluation routes, and only while the key's
-  owner can change flags. The dev bypass exists only when `DEV_AUTH_BYPASS=true` _and_
+- One scope is enforced, `sdk:ruleset`, on the server-side SDK routes (the ruleset, the local
+  evaluation counts, batch assignment), and only while the key's owner can change flags; it also
+  decides whether an error report counts toward rollback. The dev bypass exists only when `DEV_AUTH_BYPASS=true` _and_
   `ENVIRONMENT ∈ {development, test}`; staging and production refuse to start with it.
 
 ### Q&A
@@ -1348,7 +1450,7 @@ dev bypass (return `dev-admin`) and a 401.
 No. Those endpoints depend on `get_current_active_user` (bearer). SDK routes depend on
 `get_api_key`. A key reaches the tracking, evaluate and error-reporting paths because of _which
 dependency the endpoint declares_, not because of a scope string; the one scope that is
-enforced, `sdk:ruleset`, is an extra gate on top of that for the local-evaluation routes.
+enforced, `sdk:ruleset`, is an extra gate on top of that for the server-side SDK routes.
 
 **Q. How do I log in on the dashboard with Cognito locally?**
 You mostly don't; the local provider is the development default. The Cognito path is tested
@@ -1374,8 +1476,8 @@ mount, so a revoked token can't resurrect a session.
 
 ### What & why
 
-Authorization checks whether the authenticated caller may perform an action. Experimently uses
-a role-based permission table and a superuser override:
+Authentication answered _who_. Authorization answers _may they_. Controlvar's model is one
+table and a trump card:
 
 1. **Role × resource × action.** Four roles (`ADMIN`, `DEVELOPER`, `ANALYST`, `VIEWER`), seven
    resource types (experiment, feature flag, user, role, permission, report, and `API_KEY`,
@@ -1383,8 +1485,8 @@ a role-based permission table and a superuser override:
 2. **Superuser** trumps everything — `check_permission` returns `True` before looking at the
    table.
 
-Access to experiments and feature flags is determined by role. Creating a resource does not
-establish an ownership-based access rule. The implications are:
+What is _not_ in the model is the most important thing about it: **access is by role, not by
+ownership.** For feature flags and for experiments alike:
 
 - **ADMIN and DEVELOPER** read, create, change and delete _any_ flag and _any_ experiment —
   including scheduling, starting, pausing, completing, archiving and deleting one.
@@ -1410,7 +1512,7 @@ the resource exists and leaks which operation was attempted. With all four roles
 on experiments and flags this rarely fires today, but the order is kept because the table can
 change and the message must stay right when it does.
 
-### How Experimently does it
+### How Controlvar does it
 
 The matrix:
 
@@ -1635,9 +1737,9 @@ about this experiment's state.
 
 #### What happened to the delete-experiment exception
 
-Earlier versions of this book had a section on it: delete used to do its checks inline because
-the shared experiment dependency demanded an ACTIVE experiment while delete demanded a DRAFT
-one. That conflict is gone. Delete now goes through the same `get_experiment_change_access` as
+Delete used to be the odd one out: it did its checks inline, because the shared experiment
+dependency demanded an ACTIVE experiment while delete demanded a DRAFT one. That conflict is
+gone. Delete now goes through the same `get_experiment_change_access` as
 every other change, with `Action.DELETE`:
 
 ```python
@@ -1776,7 +1878,7 @@ is the whole story.
 ### What & why
 
 Day 3 introduced the five core tables. Today is about the _mechanics_ that make every one of
-the model classes (38 in the core, more in the modules) behave the same way: the declarative
+the model classes (40 in the core, more in the modules) behave the same way: the declarative
 base with a schema, the mixin that adds ids and timestamps, foreign keys that must name the
 schema explicitly, `JSONB` for the flexible parts, relationships with cascades, the
 index/constraint tuple every model returns from `__table_args__` — and the seam that keeps a
@@ -1800,7 +1902,7 @@ Pydantic layer validates the shape at the API boundary instead (and for flag tar
 unknown keys with a 422). The rule of thumb in this codebase: **relational for anything you
 join or aggregate on, JSONB for configuration.**
 
-### How Experimently does it
+### How Controlvar does it
 
 The base and the mixin:
 
@@ -1894,9 +1996,10 @@ class FeatureFlag(Base, BaseModel):
         back_populates="feature_flag",
         cascade="all, delete-orphan",
     )
-    events = relationship(
-        "Event", back_populates="feature_flag", cascade="all, delete-orphan"
-    )
+    # Deleting a flag keeps its events (#855). The events.feature_flag_id FK
+    # is ON DELETE SET NULL; passive_deletes leaves that to the database, so
+    # the ORM neither deletes the events nor loads them to clear the column.
+    events = relationship("Event", back_populates="feature_flag", passive_deletes=True)
     reports = relationship(
         "Report", back_populates="feature_flag", cascade="all, delete"
     )
@@ -1932,7 +2035,11 @@ Points to notice:
   on one side; `Variant.assignments` once was, and is now declared once.
 - **`ondelete` differs by intent.** `CASCADE` for children that mean nothing without the
   parent (variants, assignments, overrides). `SET NULL` for things that must survive — an
-  event outlives its flag, a flag outlives its owner.
+  event outlives its flag, a flag outlives its owner. For the flag-to-events side that intent
+  was once contradicted by the ORM (`cascade="all, delete-orphan"` deleted a flag's events
+  with it); the relationship is now `passive_deletes=True` with no cascade, so the database's
+  `SET NULL` does the work and the events are kept. A relationship's cascade and a foreign
+  key's `ondelete` are two separate mechanisms, and they have to agree.
 - **`workspace_id` is a bare UUID, not a foreign key.** `workspaces` is the workspaces module's
   table; a `ForeignKey` to it here would be the one thing in the core ORM that reaches across
   the boundary, and importing the core without the module would raise
@@ -2125,7 +2232,7 @@ heads` applies everything the database hasn't seen (tracked in an `alembic_versi
 `alembic revision --autogenerate` diffs the models against the database and writes a script
 for you to review.
 
-Experimently has two twists, and both are deliberate.
+Controlvar has two twists, and both are deliberate.
 
 **Twist one: two heads.** The optional modules own some tables (custom roles, the warehouse
 analysis runs, the workspace foreign keys), and a core build has no `modules/` directory at all.
@@ -2196,7 +2303,7 @@ and after an image-only rollback the _previous_ release's code runs against the 
 a migration adds (a nullable column, a column with a `server_default`, a new table) and never
 drops or renames something the previous release still uses. The drop waits for a later release.
 
-### How Experimently does it
+### How Controlvar does it
 
 `env.py` registers exactly the models the running profile owns, refuses a present-but-broken
 modules package, and hands alembic the metadata as it reads on the resolved schema:
@@ -2291,7 +2398,7 @@ does. `ensure_first_superuser` raises `FirstSuperuserRefused` — one line, not 
 it would create an administrator with a weak password anywhere but an explicitly chosen
 development or test environment.
 
-A recent hand-edited core migration in the house style. Note the docstring that says why, the
+A hand-edited core migration in the house style. Note the docstring that says why, the
 named head it extends, the schema from the environment, the guarded add (a bootstrapped schema
 already has the column, from the model), and the `server_default` that keeps the previous
 release working:
@@ -2402,7 +2509,7 @@ docker compose exec postgres createdb -U postgres scratch
 ALEMBIC="python -m alembic -c backend/app/db/alembic.ini"
 python -m backend.app.db.bootstrap        # fresh → create_all + stamp heads + first admin
 $ALEMBIC heads                            # two lines in a full checkout, e.g.
-                                          #   1ab99332f0ba (head)
+                                          #   4c2c09a2b3e8 (head)
                                           #   modules_0002_warehouse_analysis (modules) (head)
 $ALEMBIC current                          # the same two, as recorded in alembic_version
 $ALEMBIC history | head -5
@@ -2575,6 +2682,17 @@ Every piece is one you have met this week: the 404 before the authorisation, the
 (deliberately), the cache invalidation the other routes do, the ORM object validated into the
 response schema as `start_experiment` does, and the fixed failure sentence.
 
+Two things the platform asks of a new route that this sketch does not do yet, because two
+inventories pin them. Every route that acts on experiments must be **classified**
+(`backend/tests/smoke/test_experiment_routes_classified.py` lists each one with the rule that
+admits a caller: `CHANGE-UPDATE`, `ROLE-ONLY`, and so on, and fails until yours has a line), and
+every mutating route must say whether it is **audited**
+(`backend/tests/smoke/test_audit_inventory.py`: either the audit actions it writes, or a reason
+it writes none). A real pull request would add the line to both and, since changing an
+experiment's notes is a change a person made, would write the audit entry as the lifecycle
+routes do, with `record_experiment_change(db, current_user, ActionType.EXPERIMENT_UPDATE,
+experiment_id, before_audit, reason="decision_notes")`.
+
 **6. The OpenAPI snapshot.** Your change alters the public API in two ways: a new route, and a
 new field on `ExperimentResponse`, which stable operations return.
 `backend/tests/smoke/test_openapi_snapshot.py` fails on any difference to a stable operation
@@ -2597,8 +2715,9 @@ new route, e.g. `updateDecisionNotes(id: string, notes: string | null)`.
 **9. Dashboard page.** On `frontend/src/pages/experiments/[id].tsx`, render the notes and a
 textarea that saves through the new method; hide the editor for roles that cannot change
 experiments (the API refuses them anyway). Add a Jest test in
-`frontend/src/tests/pages/experiment-detail.test.tsx` that mocks `global.fetch` and asserts the
-URL and body — the existing tests there show the pattern.
+`frontend/src/tests/pages/experiment-detail.test.tsx` that routes `apiFetch` with `routedApi`
+and asserts the URL and body with `calledWith` — the existing tests there show the pattern
+(Hour 21 of the React book).
 
 **10. Verify end-to-end.** Run the API and the dashboard, complete an experiment, edit its notes,
 then `select decision_notes from experimentation.experiments where id = ...`.
@@ -2642,8 +2761,8 @@ team's migrations are expand-only.
 **1. In what order does a request pass through the middleware, and which layer is registered
 first?**
 CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost → RateLimit →
-RelativeSlashRedirect → UnhandledError → router. `UnhandledErrorMiddleware` is registered first
-(innermost); `CORSMiddleware` last (outermost).
+RelativeSlashRedirect → RequestBodyLimit → UnhandledError → router. `UnhandledErrorMiddleware` is
+registered first (innermost); `CORSMiddleware` last (outermost).
 
 **2. `ENVIRONMENT=prod` and `APP_ENV=dev` are both set. What environment does the app run in,
 and what happens?**
@@ -2687,7 +2806,7 @@ No. The core chain and the `modules` branch are separate on purpose, so that a c
 
 ### Exercises
 
-**E2.1 — Order the onion.** Without looking, write the eight `add_middleware` calls in
+**E2.1 — Order the onion.** Without looking, write the nine `add_middleware` calls in
 registration order, then the order a request traverses them. Explain why the rate limiter is
 inside the security headers and the request id but outside the router, and why CORS must be the
 outermost layer.
@@ -2712,11 +2831,11 @@ committing.
 
 ### Solutions
 
-**S2.1** — Registration: `UnhandledErrorMiddleware`, `RelativeSlashRedirectMiddleware`,
-`RateLimitMiddleware`, `TrustedHostMiddleware`, `SecurityHeadersMiddleware`,
+**S2.1** — Registration: `UnhandledErrorMiddleware`, `RequestBodyLimitMiddleware`,
+`RelativeSlashRedirectMiddleware`, `RateLimitMiddleware`, `TrustedHostMiddleware`, `SecurityHeadersMiddleware`,
 `PrometheusMetricsMiddleware`, `RequestIDMiddleware`, `CORSMiddleware`. Traversal is the
 reverse: CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost → RateLimit →
-RelativeSlashRedirect → UnhandledError → handler. The rate limiter returns its 429 without
+RelativeSlashRedirect → RequestBodyLimit → UnhandledError → handler. The rate limiter returns its 429 without
 calling the next layer, so everything that must decorate a 429 — the request id, the security
 headers, CORS — has to be _outside_ it; and it is outside the router so a rejected request never
 reaches a handler (or a database session). CORS is outermost because a browser will not let the
@@ -2764,7 +2883,8 @@ ADMIN and DEVELOPER pass on any flag, and so does any superuser; ANALYST and VIE
 with 403, on their own flags too. `owner_id` comes from the stored row, never from a response
 dict. The test that fails is `backend/tests/smoke/test_flag_change_routes_guarded.py`
 (`test_the_inventory_is_exact`): every mutating route under `/feature-flags` must be classified,
-so add `("POST", "/api/v1/feature-flags/{flag_id}/lock"): FLAG_RULE` to its `INVENTORY`.
+so add `("POST", "/api/v1/feature-flags/{flag_id}/lock"): FLAG_RULE` to its `INVENTORY`. (A
+second smoke test, `test_audit_inventory.py`, will want the route classified too, as audited or not.)
 
 **S2.4**
 

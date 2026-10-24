@@ -4,10 +4,13 @@
 
 [← Part III](./part-3-nextjs.md) · [Contents](./README.md) · [Part V →](./part-5-ui.md)
 
-This Part follows data between the API and the dashboard. Hour 14 covers the typed service layer.
-Hour 15 examines the new-experiment form, including its reducer, validation and error handling.
-Hour 16 covers filtered lists, pagination and lifecycle actions while requests are pending.
-Hour 17 covers the WebSocket hook, its authentication subprotocol and reconnect behavior.
+Data in, data out. This Part is the services layer — one typed object per API resource,
+mirroring the backend's routes (Hour 14); the new-experiment form — one reducer behind a
+guided wizard and a single-page view, validation that mirrors the server, and failures mapped
+by status (Hour 15); lists with filters, offset pagination and lifecycle actions that keep
+the UI honest while a request is in flight and never offer what the user's role cannot do
+(Hour 16); and a WebSocket hook with reconnect, terminal close codes and a
+subprotocol token (Hour 17).
 
 ---
 
@@ -111,8 +114,16 @@ Note the query mapping — the client-side name `status` becomes the server's `s
 and `undefined` values are dropped by `buildQuery`, so an unset filter sends no parameter at
 all. Two methods carry a decision from the API into the client: `create` accepts options so
 one caller can opt out of the 401 redirect, and `delete` sends the `experiment_key` the route
-requires as a confirmation (the dashboard offers no delete button today; the method mirrors
-the route).
+requires as a confirmation. Three more methods you did not see in the excerpt are worth a look in
+the file: `estimateSampleSize` (advice for the wizard's Estimate step, also with
+`redirectOn401: false`), `updateDetails` (a `PUT` whose body type, `ExperimentDetailsUpdate`, has
+room for the name, description and hypothesis only, because the update route replaces variants and
+metrics wholesale when a request carries them, so the type refuses to carry them), and `clone`
+(`POST .../clone` with no body). Those last two, with `delete`, are driven by one component,
+`ExperimentManageSection` on the detail page: Clone for a role that may create, and Edit details
+and Delete draft for a role that may change experiments. It is the same shape as Hour 15's
+create form in small: every failure is mapped by status to a fixed sentence in the page's own
+words (`ERROR_COPY`), and nothing the server wrote in an error body is shown.
 
 A service that also owns the **normalisation** of two backend shapes for one resource — the
 comment explains a real inconsistency and the helpers hide it from pages:
@@ -165,19 +176,23 @@ they're omitted:
 export class ResultsService {
   static async getResults(
     experimentId: string,
-    params?: { breakdown?: string }
+    params?: ResultsQuery
   ): Promise<ExperimentResultsResponse> {
     return apiFetch<ExperimentResultsResponse>(`/api/v1/results/${experimentId}`, {
       query: {
         breakdown: params?.breakdown || undefined,
+        correction_method: params?.correction_method,
+        confidence_level: params?.confidence_level,
       },
     });
   }
   ...
   /**
    * The planned sample size. Send only what the user changed: anything left
-   * out is decided by the server (the observed control rate, a 5% relative
-   * MDE, 80% power, 95% confidence, no correction).
+   * out is decided by the server (the observed control rate, the effect saved
+   * with the experiment as its primary metric's `expected_effect`, or a 5%
+   * relative MDE when none is saved, 80% power, and the experiment's own
+   * confidence level and correction).
    */
   static async getSampleSize(
     experimentId: string,
@@ -197,8 +212,12 @@ export class ResultsService {
 }
 ```
 
-`getSampleSize` takes a typed `SampleSizeOverrides` object and sends only the fields the user
-changed; anything left `undefined` is dropped, and the server fills in its defaults. The
+`getResults` takes a typed `ResultsQuery`: `correction_method` and `confidence_level` are optional,
+and a setting left out is the experiment's own stored one (the results dashboard reads them from the
+experiment and sends them explicitly, and falls back to sending none, letting the server use the stored
+settings, if the experiment cannot be read). `getSampleSize` takes a typed
+`SampleSizeOverrides` object and sends only the fields the user changed; anything left `undefined`
+is dropped, and the server fills in its defaults. The
 results dashboard's sample-size panel lets the user change these (Hour 20).
 
 (Two styles — an object literal and a class with statics — coexist; both are "a namespace of
@@ -281,7 +300,7 @@ Both views read the same state and dispatch to the same reducer (Hour 6's sideba
 same validators and send the same request. A link at the top of each switches to the other,
 and the answers carry over because there is only one copy of them.
 
-The forms follow four validation and state-management rules:
+Four rules keep forms honest:
 
 1. **Keep the form in a pure module.** State shape, reducer, validators and payload builder
    live in `src/components/experiments/new/formState.ts`, which imports no React. Views
@@ -350,6 +369,11 @@ export function checkVariants(variants: VariantFormData[]): string | null {
   if (!variants.some((v) => v.is_control)) return 'One variant must be marked as control.';
   const total = allocationTotalOf(variants);
   if (total !== 100) return `Variant allocations must add up to 100% (currently ${total}%).`;
+  const problems = configurationProblems(variants);
+  const first = problems.findIndex((p) => p !== null);
+  if (first >= 0) {
+    return `The configuration of “${variants[first].name.trim()}” needs fixing: ${problems[first]}`;
+  }
   return null;
 }
 
@@ -409,7 +433,7 @@ export function validateStep(step: FormStep, state: ExperimentFormState): string
     case 'variants':
       return checkVariants(state.variants);
     case 'estimate':
-      return null;
+      return plannedEffectProblem(state.plannedEffectPct);
     case 'review':
       return validateForm(state.name, state.variants, state.metrics);
   }
@@ -424,12 +448,16 @@ export function maxReachableStep(state: ExperimentFormState): number {
 }
 ```
 
-`as const` preserves `FORM_STEPS` as a tuple of literal values. `(typeof FORM_STEPS)[number]`
-derives the step union from that tuple. The `switch` has no `default`; under `strict`, adding a
-step requires updating the cases. `maxReachableStep` prevents navigation past an invalid step.
-The page displays the current problem through `data-testid="step-error"` and moves an invalid
-`?step=review` URL back to the first incomplete step. The Estimate step calls
-`ExperimentsService.estimateSampleSize` for advice and does not persist the estimate.
+`as const` makes `FORM_STEPS` a tuple of literals, and `(typeof FORM_STEPS)[number]` derives
+the union `'type' | 'details' | 'variants' | 'estimate' | 'review'` from it — one list, one
+type, no drift. The `switch` has no `default`: under `strict`, adding a step to the tuple makes
+the function fail to compile until the new case is handled. `maxReachableStep` is how the
+wizard keeps the URL honest: Next is refused while the current step has a problem (shown in
+`data-testid="step-error"`), and a hand-edited `?step=review` on an incomplete form is moved
+back to the first step that still needs an answer. The Estimate step calls
+`ExperimentsService.estimateSampleSize` for advice; the one thing it can save is the minimum
+detectable effect, and `validateStep('estimate', ...)` fails only when that is typed but cannot be
+saved (blank is fine).
 
 The payload builder is a pure function of the state:
 
@@ -444,29 +472,58 @@ export function buildCreatePayload(state: ExperimentFormState): CreateExperiment
     hypothesis: hypothesis.trim() || undefined,
     experiment_type: type,
     targeting_rules: rules.groups.length > 0 ? (rules as unknown as Record<string, unknown>) : null,
-    variants: variants.map((v) => ({
-      name: v.name.trim(),
-      description: v.description.trim() || undefined,
-      is_control: v.is_control,
-      traffic_allocation: Number(v.traffic_allocation) || 0,
-    })),
-    metrics: metrics.map((m) => ({
-      name: m.name.trim(),
-      event_name: m.event_name.trim(),
-      metric_type: m.metric_type,
-      is_primary: m.is_primary,
-    })),
+    variants: variants.map((v) => {
+      const variant: CreateExperimentRequest['variants'][number] = {
+        name: v.name.trim(),
+        description: v.description.trim() || undefined,
+        is_control: v.is_control,
+        traffic_allocation: Number(v.traffic_allocation) || 0,
+      };
+      // Validation refuses a bad configuration before this is called; blank is none.
+      const configuration = parseConfiguration(v.configuration_text);
+      if (configuration.ok && configuration.value !== undefined) {
+        variant.configuration = configuration.value;
+      }
+      return variant;
+    }),
+    metrics: metrics.map((m) => {
+      const metric: CreateExperimentRequest['metrics'][number] = {
+        name: m.name.trim(),
+        event_name: m.event_name.trim(),
+        metric_type: m.metric_type,
+        is_primary: m.is_primary,
+      };
+      if (m.is_primary && plannedEffect !== undefined) metric.expected_effect = plannedEffect;
+      return metric;
+    }),
+    confidence_level: state.confidenceLevel,
+    correction_method: state.correctionMethod,
   };
+  if (state.bayesianEnabled) payload.bayesian_enabled = true;
   return payload;
 }
 ```
 
+`const plannedEffect = plannedEffectFraction(state.plannedEffectPct);` (a line the excerpt leaves
+out) turns what the user typed on the Estimate step into a fraction, or `undefined`.
 `const payload: CreateExperimentRequest = {...}` — annotating the payload makes the compiler
 check it against the mirror of `ExperimentCreate`, so a missing required field is a build
 error. `rules as unknown as Record<string, unknown>` is a double assertion: the rule builder's
 typed shape is a `Record<string, unknown>` for the API's purposes, and TypeScript needs the
 detour through `unknown` because the two types don't overlap structurally. The Review step
 renders this same payload, so what the user checks is exactly what is sent.
+
+Two things the payload builder does are worth noticing because they are about **omission**. A
+variant's `configuration` is typed as JSON text (`configuration_text`), parsed by
+`parseConfiguration`, and added to the request only when it is a non-blank JSON object within
+16,384 UTF-8 bytes (the dashboard's own limit, counted by `utf8ByteLength` because `.length` counts
+UTF-16 units: "é" would count as one byte instead of two); a blank box leaves the key out, and an
+array, a string or `null` is refused on the client because the API refuses it too. And the planned
+effect goes on the primary metric only, as `expected_effect`; with none, no metric carries the key
+at all. The state also holds the results settings the user chose on the same step: `confidenceLevel`
+and `correctionMethod` are always sent, `bayesian_enabled` only when switched on. The pattern
+is the one this Hour started with: a client-side check in the API's own terms, and a payload that
+says nothing the user was not asked.
 
 The submit — one function for both views:
 
@@ -539,7 +596,8 @@ export function describeCreateError(err: unknown, sentKey: string | undefined, v
       if (split) return { message: TARGETING_REFUSED, ...split };
     }
   }
-  return { message: err instanceof Error ? err.message : 'Failed to create experiment' };
+  if (err instanceof ApiError) return { message: err.message };
+  return { message: CREATE_FAILED };
 }
 ```
 
@@ -552,8 +610,12 @@ export function describeCreateError(err: unknown, sentKey: string | undefined, v
 - **422 naming `targeting_rules`**: each problem rewritten in the builder's numbering
   ("Group 1, Condition 2: unknown operator") and shown at the rules; any other item in the
   same 422 is kept and shown at the foot.
-- **anything else**: the message `apiFetch` built — for a server error, it carries the request
-  ID (Hour 3).
+- **any other `ApiError`**: the message `apiFetch` built — for a server error, it carries the
+  request ID (Hour 3).
+- **an exception that is not an API answer**: `CREATE_FAILED`, “Something went wrong while
+  creating the experiment. Check the experiments list before trying again.” The exception's own
+  text is never shown, and the sentence says what the page genuinely does not know: whether the
+  experiment was saved.
 
 That refines the Creed's rule 5. "Show the server's message when they disagree" is still the
 default, but where the **status alone** says what happened and what to do, the page says it
@@ -625,11 +687,14 @@ List pages combine three things: a **fetch driven by filters** (status, search),
 pagination** (`skip`/`limit`, `total` from the server), and **row actions** that change state
 on the server and then in the UI. The dashboard's pattern is `useApi` with the filter in the
 dependency list — change the filter, the hook refetches — and per-row actions that either
-refetch or update the local copy (`setData`) after the API confirms.
+refetch or update the local copy after the API confirms. (`useApi` returns a `setData` for that
+purpose, but at this release no page calls it: the flag list, below, keeps its own state, because it
+needs to guard against overlapping requests and revert a single row.)
 
-While a lifecycle action is pending, its button displays a pending label and the page disables
-other actions. Destructive operations require confirmation. On success, the updated resource
-returned by the API replaces local state, so subsequent actions reflect the server's response.
+For a detail page's **lifecycle actions**, the page must stay honest during the request: the
+clicked button shows its pending label, all actions are disabled, a destructive action asks
+for confirmation first, and the response — the updated resource — replaces local state so the
+next allowed actions come from the server's truth, not from what the client assumed.
 
 ### In the wild
 
@@ -662,7 +727,7 @@ new truth:
     setPendingAction(action);
     try {
       const updated = await ExperimentsService[action](experiment.id);
-      setExperiment(updated);
+      onSaved(updated);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : `Failed to ${action} experiment`);
     } finally {
@@ -681,16 +746,34 @@ new truth:
 ```
 
 `ExperimentsService[action](experiment.id)` — indexing the service by the action name is
-type-safe because `LifecycleAction` is exactly the four method names. `setExperiment(updated)`
-means the buttons for the _next_ state come from `ACTIONS_BY_STATUS[updated.status]` — the
-server said "active", so "Pause" and "Complete" appear. The confirm step is inline state
+type-safe because `LifecycleAction` is exactly the four method names. `onSaved(updated)`
+puts the server's answer into state, so the buttons for the _next_ state come from
+`ACTIONS_BY_STATUS[updated.status]` — the server said "active", so "Pause" and "Complete" appear.
+`onSaved` is one line, `setExperiment((previous) => keepOwnerName(previous, updated))`, and it
+exists because of a trap in "the response replaces local state": only `GET /experiments/{id}`
+carries `owner_name`; the lifecycle routes and the saves answer without it. Setting state straight
+from their answer would turn the owner's name on the page back into a short id after the first
+click. `keepOwnerName` keeps the name from the earlier read when the owner is unchanged and the new
+answer says nothing. When a response is a partial view of the resource, merge it; do not replace
+with it. The confirm step is inline state
 (`confirming`), not `window.confirm`, so it's testable and styleable:
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
-const ACTION_META: Record<LifecycleAction, { label: string; pending: string; className: string; confirm?: string }> = {
-  start: { label: 'Start', pending: 'Starting…', className: 'bg-green-600 text-white hover:bg-green-700' },
-  pause: { label: 'Pause', pending: 'Pausing…', className: 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50' },
+const ACTION_META: Record<
+  LifecycleAction,
+  { label: string; pending: string; className: string; confirm?: string }
+> = {
+  start: {
+    label: 'Start',
+    pending: 'Starting…',
+    className: 'bg-green-600 text-white hover:bg-green-700',
+  },
+  pause: {
+    label: 'Pause',
+    pending: 'Pausing…',
+    className: 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50',
+  },
   complete: {
     label: 'Complete',
     pending: 'Completing…',
@@ -742,7 +825,10 @@ explains why instead of leaving an unexplained gap:
   // Offer only what the API would accept: a role without EXPERIMENT UPDATE is
   // refused every lifecycle change, including on an experiment it owns.
   const actions = mayChange ? statusActions : [];
-  const isOwner = user !== null && user.id === experiment.owner_id;
+  // A null owner (the creator's account was removed) is nobody, so it is
+  // never you.
+  const isOwner =
+    user !== null && experiment.owner_id !== null && user.id === experiment.owner_id;
   const resultsAvailable = status !== 'draft';
   const showRoleNote = !mayChange && statusActions.length > 0;
 ```
@@ -756,14 +842,11 @@ reason on screen**, or the user thinks the page is broken. (A user with a custom
 direct grant is offered only what their built-in role allows — under-offering is the safe
 direction.)
 
-A derived flag from the auth context, and a "copy" affordance with a transient state:
+A "copy" affordance with a transient state — `copied` flips on for 1.5 seconds, and the
+clipboard being unavailable is swallowed rather than surfaced:
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
-  const isOwner = user !== null && user.id === experiment.owner_id;
-  const resultsAvailable = status !== 'draft';
-  const primaryMetric = experiment.metrics.find((m) => m.is_primary) ?? experiment.metrics[0];
-  ...
   const copyKey = async () => {
     if (!experiment?.key) return;
     try {
@@ -776,17 +859,57 @@ A derived flag from the auth context, and a "copy" affordance with a transient s
   };
 ```
 
-Optimistic-style local update after an API confirmation — the flag list toggles a row
-without refetching the whole page, using `useApi`'s `setData`:
+The detail page loads its single resource with its own `load` callback rather than `useApi`,
+because it needs to replace the resource after every action. The **flag list** goes further,
+and it is the best example in the dashboard of keeping a list honest while requests are in
+flight. It does not use `useApi` either; it hand-rolls the load so it can guard against
+overlapping requests, and it toggles optimistically:
 
 ```tsx
-// (shape used by the flags list)
-const { data, setData } = useApi(() => FeatureFlagsService.list(), []);
-const toggle = async (flag: FeatureFlag, next: boolean) => {
-  const updated = next ? await FeatureFlagsService.activate(flag.id) : await FeatureFlagsService.deactivate(flag.id);
-  setData((prev) => prev && { ...prev, items: prev.items.map((f) => (f.id === flag.id ? { ...f, ...updated } : f)) });
-};
+// 📁 frontend/src/pages/feature-flags/index.tsx
+  /**
+   * Sequence number of the most recent list request. Switching filters quickly
+   * leaves the earlier request in flight; without this guard a slow "On"
+   * response can land after a fast "Off" one and paint the wrong rows (which a
+   * subsequent toggle would then act on).
+   */
+  const requestSeq = useRef(0);
+  ...
+  /**
+   * Optimistic on/off: flip locally, call enable/disable, and on failure revert
+   * only this row — a whole-list snapshot would also undo any other toggle that
+   * succeeded while this request was in flight.
+   */
+  const handleToggle = async (flag: FeatureFlag) => {
+    const next = !isFlagOn(flag);
+    const previousStatus = flag.status;
+    const previousIsActive = flag.is_active;
+    ...
+    setFlags((current) =>
+      current.map((f) =>
+        f.id === flag.id ? { ...f, status: next ? 'active' : 'inactive', is_active: next } : f,
+      ),
+    );
+    try {
+      const res = await FeatureFlagsService.setEnabled(flag.id, next);
+      ...
+    } catch (err) {
+      setFlags((current) =>
+        current.map((f) =>
+          f.id === flag.id ? { ...f, status: previousStatus, is_active: previousIsActive } : f,
+        ),
+      );
+      ...
+    }
+  };
 ```
+
+Two ideas to take from it. The **sequence number** is the list's version of Hour 7's `cancelled`
+flag: every request takes a number, and only the latest may write state. And the revert restores
+**one row** (`previousStatus`, `previousIsActive`) through the functional `setFlags((current) => ...)`
+form, never a snapshot of the whole list, because a snapshot would also undo a different toggle that
+succeeded while this one was in flight. Toggle errors are keyed by flag id (`toggleErrors`) for the
+same reason: two can fail at once, and both messages matter.
 
 The page test that pins the lifecycle — a routed mock whose state transitions, then
 assertions on which buttons appear:
@@ -804,8 +927,9 @@ function install(current: Experiment) {
       { path: '/api/v1/experiments/exp-1', handler: () => state },
       { method: 'POST', path: '/api/v1/experiments/exp-1/start', handler: transition('active') },
       { method: 'POST', path: '/api/v1/experiments/exp-1/pause', handler: transition('paused') },
-      ...
-    ]),
+      { method: 'POST', path: '/api/v1/experiments/exp-1/complete', handler: transition('completed') },
+      { method: 'POST', path: '/api/v1/experiments/exp-1/archive', handler: transition('archived') },
+    ]) as unknown as typeof apiFetch,
   );
 }
 ```
@@ -833,7 +957,7 @@ watch the buttons change to "Archive" only after the response arrives.
 - **Filters outside the hook's deps** — the list doesn't refetch.
 - **Local status updates instead of the server's response.**
 - **`window.confirm`** — untestable, unstyled; use inline state.
-- **Refetching the whole list for one row change** when `setData` will do.
+- **Refetching the whole list for one row change** when updating that one row in state will do.
 - **Gating on ownership** (`isOwner`) instead of role, or **hiding a control without saying
   why**.
 
@@ -865,8 +989,10 @@ Two design decisions to know:
 
 - **The token rides as a subprotocol**, not a query parameter. Browsers can't set headers on
   the WebSocket handshake, but they can offer `Sec-WebSocket-Protocol` entries; the hook
-  offers `['experimently.bearer', token]` and the backend echoes the first. URLs end up in
-  access logs; subprotocols don't.
+  offers `['experimently.bearer', token]` and the backend echoes the first. (That string is the
+  product's former name, kept on purpose: it is a wire contract between a deployed dashboard
+  and a deployed API, and renaming it would break a dashboard and an API of different
+  versions talking to each other.) URLs end up in access logs; subprotocols don't.
 - **Refs for the socket and counters, state for what renders.** `wsRef`, `reconnectCount`,
   `reconnectTimerRef`, `intentionalDisconnect` are `useRef`s — mutable, no re-render;
   `snapshot`, `status`, `error` are state.
@@ -1011,16 +1137,21 @@ Disconnect, and the actions the results panel calls:
 The effect that ties connect/disconnect to the id and to unmount:
 
 ```typescript
-// 📁 frontend/src/hooks/useExperimentStream.ts (shape)
+// 📁 frontend/src/hooks/useExperimentStream.ts
   useEffect(() => {
-    if (autoConnect && experimentId) connect();
+    if (!experimentId || autoConnect === false) return;
+    connect();
     return () => {
       disconnect();
     };
-  }, [experimentId, autoConnect, connect, disconnect]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [experimentId]);
 ```
 
-Change the experiment id → cleanup closes the old socket (marked intentional, so no
+The dependency list is `[experimentId]` alone, on purpose, with the lint rule switched off for that
+line: `connect` and `disconnect` are re-created whenever the reconnect settings change, and an
+effect that listed them would tear the socket down and reopen it for a change that is not a new
+experiment. Change the experiment id → cleanup closes the old socket (marked intentional, so no
 reconnect) → the effect opens a new one. Unmount → closed. And the defensive parser from
 Hour 1 turns each message into typed state.
 
@@ -1129,9 +1260,9 @@ the payload construction with `|| undefined` for optional strings.
 **E4.3 — A pager.** Write the state, `useApi` call and two handlers for offset pagination on
 the flags list, disabling "next" when `skip + limit >= total`.
 
-**E4.4 — Optimistic toggle.** Using `useApi`'s `setData`, write `toggleFlag(flag, next)` that
-updates the row after `activate`/`deactivate` resolves, and reverts nothing on failure but
-shows a toast.
+**E4.4 — A confirmed toggle.** Using `useApi`'s `setData`, write `toggleFlag(flag, next)` that
+updates the row after `FeatureFlagsService.setEnabled` resolves, and on failure changes nothing
+but shows a toast.
 
 **E4.5 — Close codes.** The stream hook already treats `4401`, `4403` and `1008` as terminal,
 with a special message only for `4401`. Give `4403` ("forbidden for this experiment") its own
@@ -1194,20 +1325,28 @@ const prev = () => setSkip(Math.max(0, skip - limit));
 **S4.4**
 
 ```tsx
-const { addToast } = useNotification();
+const { addToast } = useNotifications();
 const toggleFlag = async (flag: FeatureFlag, next: boolean) => {
   try {
-    const updated = next ? await FeatureFlagsService.activate(flag.id) : await FeatureFlagsService.deactivate(flag.id);
-    setData((prev) => prev && { ...prev, items: prev.items.map((f) => (f.id === flag.id ? { ...f, ...updated } : f)) });
+    const res = await FeatureFlagsService.setEnabled(flag.id, next);
+    if (data) {
+      setData({
+        ...data,
+        items: data.items.map((f) =>
+          f.id === flag.id ? { ...f, status: res.status, is_active: res.status === 'active' } : f,
+        ),
+      });
+    }
   } catch (err) {
     addToast(err instanceof Error ? err.message : 'Could not update the flag', 'error');
   }
 };
 ```
 
-(Not optimistic in the strict sense — the row changes only after the server confirms — so
-there's nothing to revert; a truly optimistic version would set first and revert in
-`catch`.)
+(`setData` takes a value, not an updater function, so the new list is built from the current
+`data`. This is not optimistic in the strict sense — the row changes only after the server
+confirms — so there is nothing to revert. The real flag list is optimistic: it sets first and
+reverts that one row in `catch`, as in Hour 16.)
 
 **S4.5**
 

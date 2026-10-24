@@ -4,22 +4,30 @@
 
 [← Week 2](./week-2-api-and-data.md) · [Contents](./README.md) · [Week 4 →](./week-4-production.md)
 
-Week 3 covers feature flags, targeting, scheduled work, safety monitoring, statistical methods and
-SDK integration. These features use the request and storage patterns introduced in the first two
-weeks. The final exercise follows a crash report through the safety monitor to a flag rollback.
+Weeks 1 and 2 were the request/response spine. This week is everything that makes Controlvar
+more than a CRUD app over five tables: flags that turn on for 5% of users and then 25%, targeting
+rules with twenty operators and three storage shapes, five background loops that must not race
+across replicas, a safety net that rolls a flag back when the crash rate spikes, a statistics
+engine that lets you peek at results without lying to yourself, and sixteen SDKs that all speak
+one contract. By Day 21 you'll narrate a crash spike turning into an automatic rollback.
 
-> **Which code this chapter reads.** Every quoted file was checked against
-> getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased changes, including three
-> breaking ones: #747, #769, #770). Two of those touch this week: flag targeting rules now
-> refuse unknown keys at every level (#747, Day 16), and the edge bootstrap and OpenFeature flag
-> listings are removed (#770, Day 20).
+> **Which code this chapter reads.** Every quoted file was checked against Controlvar v0.36.4
+> (`79f8ed18`). Three things in it are newer than the first edition of this chapter and are
+> covered where they belong: flag and experiment targeting rules refuse unknown keys at every
+> level and can name **segments** (Day 16), a ruleset that cannot be evaluated is abandoned
+> rather than guessed at (Days 15 and 16), and error reports count toward automatic rollback only
+> when a server-side key sent them (Day 18). The edge bootstrap and OpenFeature flag listings
+> are gone (Day 20).
 
-> Each subsystem has inputs and persisted state that affect its behavior. Flag rollout uses a
-> user/key hash and percentage; targeting uses normalized context; schedulers select due work
-> under an advisory lock. Safety monitoring reads a trailing error window, while bandit updates
-> use conversion counts and seeded sampling. Check those inputs when investigating a result.
+> **The one sentence to carry through Week 3.** _Everything "clever" in the platform is a
+> deterministic function over the same two tables plus a small amount of persisted state — a
+> flag decision is `md5(user_id:flag.key) % 100 < percentage`, a rule match is a pure function
+> of a normalised context, a scheduler tick is `SELECT … WHERE due` under an advisory lock, a
+> rollback is a threshold over the last 15 minutes of error logs, a bandit weight is a seeded
+> Monte Carlo over conversion counts — and the cleverness is in getting the inputs right, not
+> in the arithmetic._
 
-| Day | Topic                              | Focus                                     |
+| Day | Topic                              | The one thing it's really about                                     |
 | --- | ---------------------------------- | ------------------------------------------------------------------- |
 | 15  | Feature flags                      | `enabled` + `reason`, and a hash on `flag.key` instead of an id     |
 | 16  | The rules engine & adapter         | Three storage shapes, one engine, and `expand_context`'s aliases    |
@@ -35,9 +43,11 @@ weeks. The final exercise follows a crash report through the safety monitor to a
 
 ### What & why
 
-A feature-flag evaluation returns whether the flag is enabled for a user and the reason for that
-decision. The `reason` field distinguishes `targeting_rule`, `rollout`, `inactive` and `error`.
-SDKs expose it so an operator can investigate why a particular user received an experience.
+An experiment asks "which arm?"; a **feature flag** asks "on or off for this user?" — and the
+answer has to be explainable, because the person debugging "why don't I see the new player?"
+needs to know whether it was the kill switch, a targeting rule, or the rollout dice. So the
+flag service returns not just `enabled` but a **`reason`** — `targeting_rule`, `rollout`,
+`inactive` or `error` — and the SDKs surface it.
 
 Three properties shape the design:
 
@@ -55,7 +65,7 @@ Three properties shape the design:
    unknown key is a 404. The client should treat a killed feature as off, never as an error to
    log.
 
-### How Experimently does it
+### How Controlvar does it
 
 The endpoint is the same shape as `/tracking/assign` — API key, key lookup, service call —
 with a GET and a POST variant (the POST exists for contexts too large for a query string):
@@ -89,7 +99,13 @@ decision:
 
 ```python
 # 📁 backend/app/services/feature_flag_service.py
-    def evaluate_flag_detailed(self, flag: FeatureFlag, user_id: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def evaluate_flag_detailed(
+        self,
+        flag: FeatureFlag,
+        user_id: str,
+        context: Optional[Dict[str, Any]] = None,
+        memberships: Optional[SegmentMemberships] = None,
+    ) -> Dict[str, Any]:
         """
         Evaluate a feature flag for a user and explain the outcome.
         ...
@@ -109,7 +125,9 @@ decision:
                 result = False
                 reason = REASON_INACTIVE
             else:
-                matched = self._match_targeting_rule(flag, user_id, context or {})
+                matched = self._match_targeting_rule(
+                    flag, user_id, context or {}, memberships
+                )
                 if matched is not None:
                     targeting_rule_id, rule_percentage = matched
                     reason = REASON_TARGETING_RULE
@@ -123,6 +141,25 @@ decision:
             # Abandon the whole ruleset: falling through to the global rollout
             # would serve the flag to users a rule was written to leave out.
             report_unevaluable(exc, f"flag:{flag.key}")
+            targeting_rule_id = None
+            result = False
+            reason = REASON_ERROR
+
+        except TimeWindowUnreadable:
+            # The same for a time_window the engine cannot read (#1145),
+            # already reported by the rules engine. No error-log row: the
+            # rule, not the flag's behaviour, is at fault.
+            targeting_rule_id = None
+            result = False
+            reason = REASON_ERROR
+
+        except SegmentMembershipUnavailable as exc:
+            # The same: membership of a referenced segment is unknown, so the
+            # ruleset is abandoned. No error-log row: the safety monitor
+            # counts those, and a segment archived or a database blip is not
+            # the flag misbehaving.
+            if memberships is None:
+                log_unavailable(f"flag:{flag.key}", exc.segment_ids)
             targeting_rule_id = None
             result = False
             reason = REASON_ERROR
@@ -198,14 +235,25 @@ errors through `POST /tracking/errors`, and a server-side SDK that evaluates fla
 (Day 20, beta) reports its evaluation counts through `POST /tracking/evaluations`, so the
 denominator still counts evaluations the API never saw.
 
-The two `except` branches differ on purpose. A **pattern condition that cannot be evaluated**
-(`PatternUnevaluable`: RE2 refuses the pattern, or the value is longer than 256 characters or
-not valid UTF-8) abandons the whole ruleset: the flag is off with `reason: "error"`, neither the
-global rollout nor a `default_rule` is consulted, and **no `ErrorLog` row is written**, so the
-safety monitor does not count it. Falling through to the global rollout would serve the flag to
-users a rule was written to exclude. Any other exception is the generic branch: off, `reason:
-"error"`, and an `ErrorLog` row (the log line names only the exception type, because the text
-can repeat a user's value).
+The `except` branches differ on purpose, and the first three are one idea in three costumes. A
+condition the engine **cannot evaluate** abandons the whole ruleset, and the flag is off with
+`reason: "error"`: neither the global rollout nor a `default_rule` is consulted, and **no
+`ErrorLog` row is written**, so the safety monitor does not count it, because it is the rule and
+not the flag's behaviour that is at fault. Falling through to the global rollout would serve the
+flag to users a rule was written to exclude. The three kinds are:
+
+- `PatternUnevaluable`: RE2 refuses the pattern, the value is longer than 256 characters or not
+  valid UTF-8, or (since the class grew an `OUT_OF_RANGE` reason) a number is too large to
+  compare or a timestamp too large for any date;
+- `TimeWindowUnreadable`: a `time_window` value with none of the keys that say when it is open
+  (an old window written with `start` and `end` was silently open at every moment), with an
+  unknown timezone, `days` outside 0-6, or a `start_time` without its `end_time`;
+- `SegmentMembershipUnavailable`: a rule references a segment whose membership cannot be decided
+  (Day 16). Answering "not a member" would make `not_in_segment`, or a `NOT` group, match
+  everyone, so the ruleset is refused instead.
+
+Any other exception is the generic branch: off, `reason: "error"`, and an `ErrorLog` row (the log
+line names only the exception type, because the text can repeat a user's value).
 
 > **Watch Out!** The `finally` writes to the database on every evaluation. At SDK volumes that
 > is a real write load — `RawMetric` is the platform's highest-cardinality table — and it's the
@@ -374,7 +422,7 @@ A migration to one shape would have to rewrite production JSONB and every test f
 adapter is cheaper and — importantly — makes the _behaviour_ identical: a dashboard rule and
 a native rule with the same conditions match the same users.
 
-### How Experimently does it
+### How Controlvar does it
 
 The canonical shape, in Pydantic:
 
@@ -409,6 +457,12 @@ class OperatorType(str, Enum):
     PERCENTAGE_BUCKET = "percentage_bucket"  # User falls within percentage bucket
     JSON_PATH = "json_path"  # Extract and compare JSON path value
     ARRAY_LENGTH = "array_length"  # Compare array length
+    # Segment membership (#440). The condition's attribute is ``segment`` and
+    # its value a segment id; membership is decided by the server before the
+    # rules are evaluated (``rules_engine.segment_condition_holds``), never by
+    # an attribute in the context.
+    IN_SEGMENT = "in_segment"
+    NOT_IN_SEGMENT = "not_in_segment"
 
 
 class Condition(BaseModel):
@@ -438,8 +492,9 @@ rule the evaluator would not apply as written answers **422 with a fixed message
 place and the reason**, never the submitted value:
 `groups[0].conditions[0].operator: unknown operator`, `rules[0].rule: unknown key`,
 `targeting rules: a list of rules is not supported; use the groups shape`. It refuses an
-unknown key at every level (#747), native groups nested more than 10 levels deep, a native value
-with more than 1,000 rules, groups and conditions, list operators with more than 1,000 items, and
+unknown key at every level, native groups nested more than 10 levels deep, a native value
+with more than 1,000 rules, groups and conditions (and dashboard-shape flag rules with more than
+1,000 groups and conditions in all), list operators with more than 1,000 items, and
 a rule `rollout_percentage` that is not an integer from 0 to 100. Experiments get the same
 checks through `validate_experiment_targeting`. One consequence for clients: a GET body whose
 stored rules a save would now refuse cannot be PUT back unchanged.
@@ -578,6 +633,37 @@ def match_targeting_rule(rules: Optional[TargetingRules], context: Dict[str, Any
     """
 ```
 
+#### Segments: a condition whose answer is not in the context
+
+Everything above decides from attributes the SDK sent. A **segment** is the other kind of
+audience: a named, reusable group you maintain once (`/api/v1/segments`, the dashboard's
+Segments pages) and reference from many flags and experiments. A segment is either a set of
+**rules** (users whose attributes match them) or an **id list** (users whose `user_id` is stored
+in `segment_members`; the kind is fixed at creation). A condition names it as
+`{"attribute": "segment", "operator": "in_segment" | "not_in_segment", "value": "<segment id>"}`.
+
+The design rule is stated in the schema's own comment: membership is "decided by the server
+before the rules are evaluated, never by an attribute in the context". `segment_membership.py`
+resolves, for one user, membership of every segment a ruleset references, in at most two queries
+(one for the segments, one for the id lists among them), and `with_memberships` puts the answer
+into the evaluation context under the key `$segments`, **after removing whatever the request sent
+under that name**. A `$` cannot appear in a rule attribute, so no rule can read the key directly,
+and a client cannot forge its own membership by sending a context value. The engine answers a
+segment condition with `segment_condition_holds`, before and instead of any attribute lookup.
+
+The failure mode decides the design. If a referenced segment is unknown, not active, has stored
+rules that are no longer valid, or the database failed, its membership is *unavailable*. The
+engine raises `SegmentMembershipUnavailable` and the whole ruleset is abandoned (Day 15): the flag
+answers `reason: error`, an experiment treats the user as ineligible. Answering "not a member"
+instead would make `not_in_segment` (or a `NOT` group) match exactly the users whose membership
+nobody knows. Write time is stricter than evaluation time, so this should be rare: the routes
+that save rules check that every referenced segment exists and is active
+(`segment_reference_problem`), and the adapter refuses a segment condition whose attribute is not
+`segment`, whose value is not the canonical text of a UUID, that sits in a native `default_rule`
+(which is returned without evaluating its conditions, so the condition would mean "every user"),
+or a ruleset naming more than ten distinct segments. A segment's own rules cannot refer to
+another segment.
+
 Experiments use the same machinery from `AssignmentService._evaluate_experiment_targeting`,
 which parses native _or_ dashboard shapes (never the legacy list — "list-shaped experiment
 targeting rules are not supported") and runs them through `RulesEvaluationService`, the
@@ -662,8 +748,9 @@ More places than it used to be, because three things now check the operator list
 
 1. `OperatorType` in `schemas/targeting_rule.py` (plus the compatibility validator if it needs
    a collection or an `additional_value`) and the dispatch in `rules_engine.apply_operator`.
-2. If the dashboard should offer it: `_SIMPLE_OPERATOR_MAP` in the adapter, which also feeds
-   `DASHBOARD_OPERATORS`, the list the write-time validator accepts (anything else is
+2. If the dashboard should offer it: `_SIMPLE_OPERATOR_MAP` in the adapter (with
+   `_SEMVER_OPERATOR_MAP` and `_SEGMENT_OPERATOR_MAP`, which together feed
+   `DASHBOARD_OPERATORS`), the list the write-time validator accepts (anything else is
    `unknown operator`); and the frontend's `OPERATORS_BY_TYPE` in
    `frontend/src/types/targeting.ts` (the flag pages read it through `FLAG_OPERATOR_OPTIONS` in
    `frontend/src/utils/targeting.ts`).
@@ -699,7 +786,7 @@ exception).
 
 Some work isn't triggered by a request: an experiment scheduled to start at midnight, a
 rollout stage due at 09:00, raw metrics to aggregate, safety thresholds to check, bandit
-weights to refresh. Experimently runs **five schedulers** as `asyncio` tasks inside the API
+weights to refresh. Controlvar runs **five schedulers** as `asyncio` tasks inside the API
 process, started by the lifespan on Day 8:
 
 | Scheduler    | Module                       | Cadence (default)                 | Tick does                                             |
@@ -723,7 +810,7 @@ The fix is a **PostgreSQL advisory lock**, taken per scheduler name, non-blockin
 that doesn't get the lock _skips_ the tick rather than queueing. No Redis, no leader election,
 no shared registry — the database every replica already talks to is the coordinator.
 
-### How Experimently does it
+### How Controlvar does it
 
 All five loops share one runner:
 
@@ -896,7 +983,7 @@ below 1 is refused at start-up, because 0 would spin the loop without sleeping).
 
 #### What a tick does, and what it must not undo
 
-Three rules have been added to the ticks since the skeleton was written, each after a bug:
+Four rules have been added to the ticks since the skeleton was written; the first three each came after a bug:
 
 - **One item's failure is that item's failure.** The experiment tick flushes each activation
   and completion inside its own savepoint (`db.begin_nested()`), and the rollout tick processes
@@ -918,6 +1005,18 @@ Three rules have been added to the ticks since the skeleton was written, each af
   scheduler ticks once at start-up, so a deploy undid every pause.) `PUT
   /experiments/{id}/schedule` on a PAUSED experiment stores its `start_date` as `resume_at`
   (null cancels the resume), and any change of status clears `resume_at`.
+
+- **A transition a person did not make still leaves a record.** The experiment tick writes an
+  audit entry for every scheduled start, resume and completion, and the rollout tick for every
+  stage it starts (a `feature_flag_update` whose reason reads "rollout schedule stage started"),
+  each with a system actor instead of a user. The two are deliberately different about failure.
+  The experiment tick writes its entry in a savepoint of its own inside the row's savepoint, so a
+  failed audit write costs only the entry: one ERROR names the exception type, and the
+  transition still commits. The rollout tick writes its entry in the *same* transaction as the
+  change to the flag, so if the entry cannot be written, the stage start fails with it and
+  neither is kept: the flag's rollout does not widen unrecorded, and the next tick tries again.
+  Which way to fail is a decision about which record you would rather lose, and the code states
+  its answer in each place.
 
 And one thing a tick deliberately does not do: an experiment's Bayesian decision is a
 **recommendation only**. Nothing in the experiment tick stops an experiment on it.
@@ -1075,19 +1174,26 @@ tracker, the in-memory rate-limit fallback) isn't shared.
 
 ### What & why
 
-Safety monitoring checks active flags against configured error-rate and latency thresholds over
-a trailing window. When a threshold is breached and automatic rollback is enabled globally, the
-service changes the flag, records the rollback, sends Slack/email notifications and pauses the
-rollout schedule. Pausing prevents the schedule from increasing exposure again.
+A gradual rollout is a bet that the new code is fine; safety monitoring is the stop-loss. The
+platform watches every **active** flag's error rate (and latency) over a trailing window,
+compares it to per-flag thresholds, and — if the global setting allows — rolls the flag back
+automatically, records why, notifies Slack/email, and **pauses** the flag's rollout schedule so
+nothing raises it again behind your back.
 
 The design decisions:
 
-1. **Errors come from both sides.** Server-side evaluation failures are logged by
-   `evaluate_flag_detailed`'s `finally` (Day 15). Client-side errors — a crash in the redesigned
-   screen, a failed request behind the flag — arrive through `POST /api/v1/tracking/errors`
-   (and `/batch`, up to 100 reports) with the API key, and become `ErrorLog` rows attached to
-   the flag. Safety treats them identically. One kind of failure is deliberately _not_ counted:
-   an unevaluable pattern condition (Day 15) writes no `ErrorLog` row.
+1. **Errors come from both sides, but only a trusted key's reports count.** Server-side
+   evaluation failures are logged by `evaluate_flag_detailed`'s `finally` (Day 15). Client-side
+   errors — a crash in the redesigned screen, a failed request behind the flag — arrive through
+   `POST /api/v1/tracking/errors` (and `/batch`, up to 100 reports) with an API key, and become
+   `ErrorLog` rows attached to the flag. Whether a report *counts* depends on the key that sent
+   it (Day 10): a **server-side key** (the `sdk:ruleset` scope, owner able to change flags)
+   stores the report with `source: "server"` and it counts like a failed evaluation; any other
+   key, such as the one shipped in a browser or mobile app, stores it as `"client"`: it is kept
+   and shown, but safety monitoring does not count it (`uncounted_error_count`). An app whose
+   errors should be able to trigger a rollback sends them to its own server, which forwards them
+   with a server-side key. One more kind of failure is deliberately _not_ counted: an
+   unevaluable ruleset (Day 15) writes no `ErrorLog` row.
 2. **Rate, not count.** `error_rate = errors / evaluations` over the last 15 minutes. A flag at
    5% with three crashes and 3,000 evaluations is fine; the same three crashes over 30
    evaluations is a 10% rate. Dividing by evaluations (from `raw_metrics`) is what makes the
@@ -1111,7 +1217,7 @@ The design decisions:
 6. **Check every active flag.** The scheduler checks every ACTIVE flag whatever its global
    percentage, because a flag at 0% may still serve the users its rules match.
 
-### How Experimently does it
+### How Controlvar does it
 
 Three tables: `safety_settings` (global — `enable_automatic_rollbacks`, default metric
 thresholds), `feature_flag_safety_configs` (per flag — `enabled`, a `metrics` JSONB of
@@ -1135,8 +1241,18 @@ a default with `id = DEFAULT_CONFIG_ID` (the nil UUID), never a 404.
             ErrorLog.feature_flag_id == feature_flag_id,
             ErrorLog.timestamp.between(start_time, end_time),
         )
-        error_count = int(db.query(func.count(ErrorLog.id)).filter(*in_window).scalar() or 0)
-        ...   # error_types: COUNT ... GROUP BY error_type, the 100 most frequent
+        counted = counted_error_filter()
+        uncounted = uncounted_error_filter()
+        error_count, uncounted_error_count = (
+            int(n or 0)
+            for n in db.query(
+                func.count(ErrorLog.id).filter(counted),
+                func.count(ErrorLog.id).filter(uncounted),
+            )
+            .filter(*in_window)
+            .one()
+        )
+        ...   # error_types: COUNT ... GROUP BY error_type, the 100 most frequent counted ones
 
         total_evaluations = (
             db.query(func.coalesce(func.sum(RawMetric.count), 0))
@@ -1153,7 +1269,10 @@ a default with `id = DEFAULT_CONFIG_ID` (the nil UUID), never a 404.
 ```
 
 (`datetime.utcnow()` — naive — because `ErrorLog.timestamp` and `RawMetric.timestamp` are naive
-columns; this is the convention Day 17's `_as_utc` exists to reconcile.) Two consequences are
+columns; this is the convention Day 17's `_as_utc` exists to reconcile.) `counted_error_filter()` is
+written as `IS DISTINCT FROM 'client'`, which matters: rows with no `source` at all (a flag
+evaluation that failed on the server, or an old row with no `request_data`) must count, and a
+plain `!=` would drop every row where the value is NULL. Two consequences are
 worth knowing. A flag with errors but no recorded evaluations has an `error_rate` of 0.0, so the
 check's `details` also carry `error_count` and `total_evaluations`, and the dashboard shows that
 state. And the client cannot place an error in the window: `POST /tracking/errors` times each
@@ -1228,10 +1347,15 @@ promise):
                     if settings.enable_automatic_rollbacks and not safety_check.is_healthy:
                         # Find what metric triggered the rollback
                         trigger_reason = "Automatic rollback due to safety issues"
-                        for metric in safety_check.metrics:
-                            if not metric.is_healthy:
-                                trigger_reason = f"Automatic rollback due to {metric.name} exceeding threshold ({metric.current_value} > {metric.threshold})"
-                                break
+                        failing = next(
+                            (m for m in safety_check.metrics if not m.is_healthy),
+                            None,
+                        )
+                        if failing is not None:
+                            trigger_reason = (
+                                f"Automatic rollback due to {failing.name} "
+                                f"{describe_breach(failing)}"
+                            )
 
                         # Roll back to the percentage configured for this flag
                         # (e.g. back to the internal 5% stage), not always to 0.
@@ -1245,13 +1369,22 @@ promise):
                             continue
 
                         # Execute rollback
-                        rollback_result = await safety_service.async_rollback_feature_flag(
-                            feature_flag_id=feature_flag.id,
-                            percentage=target_percentage,
-                            reason=trigger_reason,
-                            trigger_type=RollbackTriggerType.AUTOMATIC,
+                        rollback_result = (
+                            await safety_service.async_rollback_feature_flag(
+                                feature_flag_id=feature_flag.id,
+                                percentage=target_percentage,
+                                reason=trigger_reason,
+                                trigger_type=RollbackTriggerType.AUTOMATIC,
+                            )
                         )
 ```
+
+The reason is worded by `describe_breach`, in the metric's own unit and by the threshold's
+comparison: one error in fourteen evaluations against `0.05` reads "above threshold (7.143% >
+5%)", forty `total_evaluations` against a `less_than` floor of a hundred reads "below
+threshold (40 < 100)". The same words go into the Slack and email alert (with the measured value
+and threshold as separate fields), so the alert, the rollback record and the manual
+`should_rollback` path cannot describe one breach three ways.
 
 It runs over `FeatureFlag.status == ACTIVE`, with no filter on the percentage.
 `_rollback_target_percentage` reads `rollback_percentage` from the config; a value stored before
@@ -1300,6 +1433,24 @@ non-numeric rolls back to 0.
             paused_schedules = [str(schedule.id) for schedule in schedules]
             ...
             db.add(record)
+            # The audit entry rides in a savepoint: if it fails, only it is
+            # lost and the rollback below still commits (#221).
+            AuditService.record_in_savepoint(
+                db,
+                actor=audit_actor,
+                action=ActionType.SAFETY_ROLLBACK,
+                entity_type=EntityType.FEATURE_FLAG,
+                entity_id=feature_flag_id,
+                entity_name=feature_flag.name or feature_flag.key,
+                after={
+                    "trigger_type": trigger_name,
+                    "previous_percentage": previous_percentage,
+                    "new_percentage": target_percentage,
+                    "deactivated": deactivated,
+                    "paused_schedules": paused_schedules,
+                },
+                reason=reason,
+            )
             db.commit()
 ```
 
@@ -1308,6 +1459,15 @@ them in (Day 17), so the two can never deadlock, and a tick that was waiting for
 re-reads the schedule, finds it PAUSED and skips it. The paused schedule ids come back in
 `details.paused_schedules`, next to `details.deactivated`. Nothing commits until the record is
 written, and a failure rolls everything back and answers `success: false`; it never raises.
+Two newer details. The rollback **reads** the flag's safety configuration and never creates one:
+it used to add a default configuration just to have an id to put on the record, which quietly
+turned a flag that was on the global defaults into one with a configuration of its own. Now a
+flag without one stays on the defaults, and `safety_rollback_records.safety_config_id` is NULL
+for it (the column is nullable, and deleting a configuration keeps its records, setting the
+column to NULL). And the rollback writes an audit entry (`safety_rollback` on the flag, naming
+the calling user for a manual rollback and the safety monitor for an automatic one) in a
+savepoint of the same transaction, so a failed entry costs only the entry: the rollback is the
+promise, and the audit trail is not allowed to block it.
 
 **The routes** mirror the automatic path. There are exactly six:
 
@@ -1349,8 +1509,12 @@ FLAG_KEY=streampulse_player_v2
 FID=<flag uuid>
 # evaluations in the window (the simulator does this; or loop the evaluate call)
 for i in $(seq 1 50); do curl -s "$API/feature-flags/evaluate/$FLAG_KEY?user_id=u$i" -H "X-API-Key: $KEY" >/dev/null; done
-# client errors — a crash on Android 12
-for i in $(seq 1 10); do curl -s -X POST $API/tracking/errors -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+# crash reports must come from a SERVER-SIDE key to count (Day 10): the seed writes one for the
+# demo, scope sdk:ruleset, to the .api_key_server file beside the app. With the ordinary app key
+# they are stored as "client" reports and the check shows them only as uncounted_error_count.
+SP=demo/streampulse
+SERVER_KEY=$(cat $SP/.api_key_server)
+for i in $(seq 1 10); do curl -s -X POST $API/tracking/errors -H "X-API-Key: $SERVER_KEY" -H 'Content-Type: application/json' \
   -d "{\"feature_flag_key\":\"$FLAG_KEY\",\"user_id\":\"u$i\",\"error_type\":\"crash\",\"message\":\"NullPointerException in PlayerV2\",\"metadata\":{\"os\":\"android\",\"os_version\":\"12\"}}" >/dev/null; done
 
 # the check is a GET (POST answers 405) and never changes anything
@@ -1403,10 +1567,13 @@ caught within a couple of scheduler ticks. It's a parameter of `get_error_metric
 uses the default. It is also why StreamPulse waits 16 minutes before widening again (Day 21).
 
 **Q. What stops one bad client from rolling back a flag for everyone?**
-Nothing in the platform — deliberately. A crash that affects 20% of evaluations _is_ a reason to
-roll back. The mitigations are the threshold (set it relative to your baseline error rate), a
-non-zero `rollback_percentage` (which lowers the rollout instead of turning the flag off), and
-the SDK rate limit that error reports share.
+Two things. Reports sent with an ordinary (browser or mobile) key are stored but not counted
+(`uncounted_error_count`), so only a server-side key, or the platform's own evaluation failures,
+can move the error rate. And what does count is a rate over a window, so one client's noise is
+diluted by everyone else's evaluations. A crash that affects 20% of evaluations _is_ a reason to
+roll back. The remaining mitigations are the threshold (set it relative to your baseline error
+rate), a non-zero `rollback_percentage` (which lowers the rollout instead of turning the flag
+off), and the SDK rate limit that error reports share.
 
 **Q. How do I resume after a rollback?**
 Two separate decisions. If the rollback was to 0%, the flag is INACTIVE: turn it on and set its
@@ -1439,19 +1606,22 @@ result**, configured per experiment and computed by its own service:
 | Wish                              | Method                       | Service                                  | Enabled by                                   | Status |
 | --------------------------------- | ---------------------------- | ---------------------------------------- | -------------------------------------------- | ------ |
 | Look every day without inflating α | Sequential testing (mSPRT)  | `services/sequential_testing_service.py` | `sequential_testing_enabled` + config        | beta   |
-| Sharper estimate from noisy data  | CUPED variance reduction     | `services/cuped_service.py`              | `variance_reduction_config`                  | beta   |
+| Sharper estimate from noisy data  | CUPED variance reduction     | `sufficient_stats_analysis.py` (`cuped_metric_result`) | `variance_reduction_config`      | numbers GA, route beta |
 | "P(B > A)" and expected loss      | Bayesian (Beta-Binomial)     | `services/bayesian_service.py`           | `bayesian_enabled` + `bayesian_config`       |        |
 | Shift traffic to the winner       | Multi-armed bandit           | `services/bandit_service.py` + scheduler | `optimization_type != "fixed"`               |        |
 
 "Beta" here is about the _numbers_, not the route: the response carries
-`analysis_status: "beta"` and an `analysis_notice` saying which part is not computed yet, both
-read from one table, `backend/app/core/analysis_status.py`. Read the notice before you read the
-number.
+`analysis_status` (`ga` or `beta`) and, when it is beta, an `analysis_notice` saying which part is
+not computed yet, both read from one table, `backend/app/core/analysis_status.py`. The table is
+about the *numbers*, not the route's shape (a route's `x-stability: beta` is a separate label
+about whether its request and response may change). Today sequential, interactions and the
+holdout comparison are `beta`; CUPED and the warehouse proportion and mean results are `ga`.
+Read the notice before you read the number.
 
 The [statistics book](../experimentation-statistics/README.md) derives each; today is the
 _shape_ of each in the codebase and how it plugs into the loop.
 
-### How Experimently does it
+### How Controlvar does it
 
 **The primary result first**, because every block sits beside it. `GET /results/{id}` counts,
 per variant, the distinct users assigned and the **users who converted** (a user with ten
@@ -1459,8 +1629,9 @@ purchase events is one conversion; `count_converting_users` in
 `backend/app/services/event_matching.py`), and analyses **every metric as a proportion** with
 **Fisher's exact test** on the 2×2 table of converting and non-converting users
 (`binomial_metric_result` in `backend/app/services/sufficient_stats_analysis.py`;
-`statistical_test_used: "fisher_exact"`). The `confidence_level` query parameter (0.80 to 0.99,
-default 0.95) sets both the significance threshold and the interval width. Welch's t-test for
+`statistical_test_used: "fisher_exact"`). The confidence level (0.80 to 0.99; a request's
+`confidence_level` if it sends one, otherwise the experiment's stored value, 0.95 unless set
+otherwise) sets both the significance threshold and the interval width. Welch's t-test for
 means exists only in the optional warehouse module (below); it is not what `/results` runs.
 
 **Sequential testing (beta).** The peeking problem: if you test at α = 0.05 every day, the
@@ -1478,24 +1649,46 @@ likelihood ratio Λ that you may inspect at any time; you stop when Λ ≥ 1/α,
         p_t = treatment_successes / treatment_total
         delta = p_t - p_c
 
-        # Pooled variance of the difference in proportions
-        V_n = p_c * (1 - p_c) / control_total + p_t * (1 - p_t) / treatment_total
-        ...
+        # Agresti-Caffo variance of the difference (#854): positive for any
+        # counts with n > 0, and the same V the confidence sequence uses.
+        V_n = self.difference_variance(
+            control_successes, control_total, treatment_successes, treatment_total
+        )
+
         Z_n = delta / math.sqrt(V_n)
 
         # mSPRT lambda: mixture likelihood ratio with Gaussian(0, tau^2) prior
         # Lambda_n = sqrt(V_n / (V_n + tau^2)) * exp(tau^2 * Z_n^2 / (2*(V_n + tau^2)))
+        #
+        # Computed in log space and capped at the largest finite double before
+        # exp: an overwhelming difference (|Z| above about 38 once V is much
+        # smaller than tau^2) would otherwise not fit in a float. The cap cuts
+        # nothing that was finite before, and the capped value is still above
+        # 1/alpha for any usable alpha, so it can stop.
         ratio = V_n / (V_n + tau_squared)
-        lambda_ratio = math.sqrt(ratio) * math.exp(tau_squared * Z_n ** 2 / (2.0 * (V_n + tau_squared)))
+        log_lambda = 0.5 * math.log(ratio) + tau_squared * Z_n**2 / (
+            2.0 * (V_n + tau_squared)
+        )
+        lambda_ratio = math.exp(min(log_lambda, _LOG_FLOAT_MAX))
 
         can_stop = lambda_ratio >= boundary
         always_valid_p = min(1.0, 1.0 / lambda_ratio)
         ...
 ```
 
+Two details of that function are lessons in numerical honesty. The variance is the
+**Agresti-Caffo** one (add one success and one failure to each arm before computing it):
+the plug-in `p(1−p)/n` is zero for an arm with no conversions yet, which made the early
+interval too narrow and stopped A/A experiments far more often than α at unequal splits; the
+adjusted version is positive for any counts, and the confidence sequence uses the same V, so
+zero lies outside the interval exactly when `can_stop` is true. And Λ is computed in **log
+space** and capped at the largest finite double: with an overwhelming difference the exponential
+would not fit in a float, and a response with `Infinity` in it is not JSON.
+
 `GET /results/{id}/sequential` returns Λ, the always-valid p, the confidence sequence, the
-evidence trajectory and a recommendation (`stop_for_effect` or `continue`). Three facts about it
-at the reference commit:
+evidence trajectory and a recommendation (`stop_for_effect` or `continue`). The same analysis is
+now also embedded in the main results response (as its `sequential_testing` block) whenever the
+experiment has it enabled, so the dashboard does not need a second call. Three facts about it:
 
 - **α is honoured.** The significance level is the `alpha` query parameter (above 0, at most
   0.2), else the experiment's `sequential_testing_config.alpha`, else 0.05, and the boundary is
@@ -1511,40 +1704,64 @@ The successes and totals it is fed are the same converting users and assigned us
 primary result. And nothing acts on `can_stop` by itself: the dashboard's Sequential tab plots
 the trajectory against the boundary, and stopping is a person's decision.
 
-**CUPED (beta).** The idea: variance reduction using a pre-experiment covariate X (last month's
-spend, say), `Y_cuped = Y − θ(X − E[X])` with `θ = Cov(Y, X)/Var(X)` estimated on control and
-`E[X]` from both groups pooled. Same mean, smaller variance, tighter intervals.
+**CUPED.** The idea: variance reduction using a pre-experiment covariate X, here "did this user
+already do the thing before the experiment?". The outcome Y is whether the user converted (the
+same converters `/results` counts); the adjusted estimate is `Y − θ(X − E[X])` for a slope θ, with
+the same mean and a smaller variance, so a tighter interval. Since #217 both inputs are real:
+
+- **X is the user's own history.** For each assigned user, did they send the covariate event
+  (the event of `covariate_metric_id`, or each metric's own event when none is named) in the
+  `covariate_lookback_days` (1 to 90, default 7) *before their assignment*? Two guards keep that
+  honest. The window is per user, ending at that user's own assignment time, and an event at the
+  moment of assignment is not history. And the event must also have been **received by the server
+  before the user was assigned** (`events.updated_at < assigned_at`): an event with an old
+  `timestamp` that was uploaded afterwards is history sent after the user was assigned, and it
+  is not read for that user. That is why `Event.updated_at` in Day 3 is "received at" and has no
+  `onupdate`.
+- **The estimate comes from sums.** For each metric, `cuped_metric_result` fits
+  `y ~ C(arm) + x` by ordinary least squares from per-arm sums alone (`n`, `Σy`, `Σx`, `Σy²`,
+  `Σx²`, `Σxy`), so a caller with those sums from somewhere else, such as a warehouse, gets the
+  same numbers:
 
 ```python
-# 📁 backend/app/services/cuped_service.py
-    @staticmethod
-    def compute_theta(control_Y: np.ndarray, control_X: np.ndarray) -> float:
-        """Compute the OLS coefficient for CUPED adjustment.
+# 📁 backend/app/services/sufficient_stats_analysis.py
+def cuped_metric_result(
+    arms: Sequence[CupedSums],
+    confidence_level: float,
+    correction_method: str,
+    *,
+    metric: Any,
+    adjust: bool = True,
+) -> List[Dict[str, Any]]:
+    """One metric's CUPED comparisons, every treatment against the control.
 
-        θ = Cov(Y, X) / Var(X)
+    The estimate is the regression ``y ~ C(arm) + x`` fitted by ordinary least
+    squares, computed from sums alone, so a caller with the sums from
+    somewhere else (a warehouse) gets the same numbers:
 
-        When X has zero variance (constant covariate) θ is set to 0.0
-        to indicate that no adjustment should be applied.
-        """
-        X = np.asarray(control_X, dtype=float)
-        Y = np.asarray(control_Y, dtype=float)
-
-        var_x = np.var(X, ddof=1) if len(X) > 1 else 0.0
-        if var_x == 0.0:
-            return 0.0
-
-        cov_matrix = np.cov(Y, X, ddof=1)
-        cov_yx = cov_matrix[0, 1]
-        return float(cov_yx / var_x)
+    * ``theta`` is the pooled within-arm slope ``sum_k Sxy_k / sum_k Sxx_k``
+      over **every** arm, the ``x`` coefficient of that regression; 0 when
+      ``adjust`` is false or when ``x`` does not vary within any arm (for a
+      0/1 covariate, coverage of exactly 0 or 100%);
+    * each arm's adjusted mean is ``ybar_k - theta * (xbar_k - xbar)``, centred
+      on the grand mean ``xbar`` so it stays on the outcome's scale;
+    ...
 ```
 
-The arithmetic is right; the input is not there yet. **The covariate the endpoint uses today is
-each user's position in the order of assignment, not a pre-experiment metric**, so it removes
-almost no variance: `variance_reduction_pct` is close to 0 and the adjusted estimate is close to
-the unadjusted one. `GET /results/{id}/cuped` says exactly this in `analysis_status: "beta"`
-and its `analysis_notice`. `variance_reduction_config` only selects the method: `none` (θ exactly
-0), `cuped`, `cuped_plus` (a delta-method ratio adjustment) or `winsorization` (clip the tails,
-no CUPED). Teach the formula; do not quote a variance saving.
+Read what that says about θ: it is the *pooled within-arm* slope over every arm (not "estimated
+on control"), and each arm is re-centred on the grand mean of X. The docstring also says two
+things worth believing: `variance_reduction_pct` **can be negative** (an arm whose own slope
+differs can end up with a larger variance than without adjustment), and adding an arm changes the
+other arms' adjusted effects, because they share θ. A comparison that cannot be computed is listed
+with an `unavailable_reason` instead of numbers (`fewer_than_2_units`, `no_variation`,
+`no_residual_variation`, `not_a_proportion_metric`, `no_control_variant`, and so on).
+`variance_reduction_config.method` selects: `none` (θ exactly 0, the unadjusted effect),
+`cuped`, `cuped_plus` (computed as `cuped`; each row says what was computed), or `winsorization`
+(clipping, for mean metrics). The numbers are labelled `ga` in `analysis_status`; the route
+`GET /results/{id}/cuped` itself is still marked `x-stability: beta`, because its response may
+still change shape (mean metrics, #439). A covariate that is the same for everyone in every arm
+(nobody did the event, or everybody did) gives θ = 0 and an honest "no adjustment" rather than a
+manufactured saving.
 
 **Bayesian.** Each arm's conversion rate gets a `Beta(α, β)` posterior — conjugate to the
 binomial, so the update is addition — and the questions "P(this arm is best)" and "expected
@@ -1710,12 +1927,13 @@ each variant's `alpha − 1` is its converting **users**, not its conversion eve
 - The primary result: converting users ÷ assigned users per variant, Fisher's exact test for
   every metric, at the requested `confidence_level`.
 - Four advanced methods, four services, each a block beside the primary result, each
-  configured on the experiment row; sequential and CUPED are beta and say why in
+  configured on the experiment row; a `beta` analysis (sequential) says why in
   `analysis_notice`.
 - mSPRT: monitor Λ, stop at 1/α with α as requested; `min(1, 1/Λ)` is an always-valid p-value;
   the confidence sequence agrees with the decision; no alpha-spending table.
-- CUPED: `θ = Cov(Y,X)/Var(X)` on control; the covariate is not yet a pre-experiment metric, so
-  today it reduces almost nothing.
+- CUPED: Y is the user's conversion, X is whether they did the event in their own window before
+  assignment (and the server had received it by then); θ is the pooled within-arm OLS slope, from
+  per-arm sums; the saving can be negative, and a covariate that does not vary gives θ = 0.
 - Bayesian: Beta-Binomial posteriors, Monte Carlo PtBB and expected loss, seeded per
   `(experiment, day, n)`; `STOP_WINNER` needs P(best) ≥ 0.975 and a small expected loss.
 - Bandits: PostgreSQL converting users unless DynamoDB counters are at least as complete, then
@@ -1728,8 +1946,9 @@ each variant's `alpha − 1` is its converting **users**, not its conversion eve
 **Q. Which should I enable by default?**
 Sequential testing, if you'll look at results before the planned end (everyone does). Bayesian
 if your stakeholders think in probabilities. Bandits only when the goal is to _exploit_ during
-the run, not to _learn_ a clean effect. Leave CUPED off until its covariate is a real
-pre-experiment metric; today it changes almost nothing.
+the run, not to _learn_ a clean effect. Turn CUPED on when users usually have history before they
+are assigned (a repeat-purchase metric); with a brand-new audience the covariate is zero for
+almost everyone, θ is 0, and it changes nothing.
 
 **Q. Does enabling sequential testing change the primary result?**
 No. The primary block is still the fixed-horizon Fisher test at the requested confidence level;
@@ -1757,9 +1976,10 @@ from a warehouse in the beta warehouse module, and no warehouse connector is ena
 
 ### What & why
 
-Experimently maintains a shared HTTP contract across sixteen SDKs; thirteen run against a live
-backend in CI. The clients keep most decision logic on the server and implement transport, caching
-and failure behavior locally. `docs/sdk-guide.md` summarizes the contract:
+Sixteen SDKs is a lot of code to keep honest (13 of the 16 run against a live backend in CI).
+The way Controlvar does it is to make the SDK _small_ — a thin HTTP client with a cache — and
+to make the **contract** the thing that's specified, tested and shared. `docs/sdk-guide.md`
+states it in one table:
 
 | Purpose                                 | Method and path                                                                      | Response                                                                          |
 | --------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
@@ -1791,12 +2011,12 @@ added a **live contract harness** that runs each SDK's `contract_smoke` against 
 in CI. The consistent-hash utility survived as an _export_, pinned across languages by golden
 vectors, but no SDK uses it to decide anything.
 
-### How Experimently does it
+### How Controlvar does it
 
 The reference client is the Python one. Its request core is small enough to read whole:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
+# 📁 sdk/python/controlvar/client.py
     def _request(self, method: str, path: str, *, body=None, query=None) -> Any:
         """Perform one API call and return the decoded JSON body (``None`` if empty).
 
@@ -1812,6 +2032,7 @@ The reference client is the Python one. Its request core is small enough to read
         response = self._send(method, url, data)
         if response.status == 429:
             wait = _retry_after_seconds(response)
+            logger.debug("429 from %s %s; retrying once after %.1fs", method, path, wait)
             self._sleep(wait)
             response = self._send(method, url, data)
 
@@ -1853,7 +2074,7 @@ first-four-bytes little-endian function the server assigns experiment variants w
 exports it; none uses it to decide anything:
 
 ```python
-# 📁 sdk/python/experimentation/hashing.py
+# 📁 sdk/python/controlvar/hashing.py
 def consistent_hash(user_id: str, flag_key: str) -> float:
     """Return the bucket for ``(user_id, flag_key)`` as a float in ``[0.0, 1.0)``."""
     (value,) = struct.unpack("<I", _digest(user_id, flag_key)[:4])
@@ -1955,8 +2176,8 @@ one keyed event, one key-less event that fanned out. Last, for the SDKs with a l
 runs `local_eval_smoke` and reads the database to confirm the safety denominator grew by exactly
 the evaluations made locally. Toolchains missing on the runner are `SKIP` unless `--strict`.
 The status table in `docs/sdk-guide.md` records which SDKs have actually _run_ against a
-backend — three (Android, Flutter, Elixir) were rewired by inspection and never executed; the
-docs say so.
+backend: three (iOS, Flutter, Elixir) are marked "not yet" there, with only their unit tests
+running nightly; the guide says so rather than rounding up.
 
 #### When the SDK decides: local evaluation (beta)
 
@@ -1975,7 +2196,7 @@ Day 15 function), with no request per evaluation. Four rules keep it honest:
   local list, the legacy rule shape, a number or string outside the local domain — it makes the
   same request it makes in server mode, and the result says `source: server`.
 - **The promise is tested, not asserted.** `tests/sdk-contract/ruleset-vectors.json` is
-  generated by running the server's own evaluator (2,172 cases); each SDK must answer the 1,294
+  generated by running the server's own evaluator (2,191 cases); each SDK must answer the 1,294
   marked `must_local` locally with exactly the server's answer and send every other case to the
   server.
 - **Safety keeps its denominator.** The SDK reports how many evaluations it made, per flag, to
@@ -2015,7 +2236,7 @@ local-evaluation smoke and the denominator it read back).
 
 Then write the smallest possible client yourself, in a language the repo doesn't have (or in
 `bash` with `curl`): assign, evaluate, track keyed, track key-less-with-fan-out. Compare your
-fan-out list to what `sdk/python/experimentation/client.py::track` does.
+fan-out list to what `sdk/python/controlvar/client.py::track` does.
 
 ### Key takeaways
 
@@ -2034,7 +2255,8 @@ fan-out list to what `sdk/python/experimentation/client.py::track` does.
   status table is honest about which have run.
 - No stack deploys the `backend/lambda/` handlers, and the assignment Lambda is gone; the
   FastAPI app is the one server-side implementation.
-- The SDKs are 0.1.0 and beta, and not yet published to npm or PyPI: install from a clone.
+- The SDKs are versioned on their own and called beta (0.1.x); the JavaScript, Python and Go
+  SDKs install from a registry, the rest from a clone of the repository.
 
 ### Q&A
 
@@ -2045,10 +2267,12 @@ Sixteen small hand-written ports of one reference design, checked by one harness
 judged cheaper to maintain than sixteen generated ones plus wrappers.
 
 **Q. Can I `pip install` or `npm install` them?**
-Not yet. The JavaScript SDK (`@getexperimently/js-sdk`) and the Python SDK (`experimently`)
-are version 0.1.0 and beta, like the OpenFeature providers that wrap them, and none is
-published to a registry yet. Install from a clone of the repository:
-`pip install -e ./sdk/python`, or build `sdk/js` with `npm ci && npm run build`.
+Three of them, yes: `npm install @controlvar/js-sdk`, `pip install controlvar` and
+`go get github.com/controlvar/controlvar/sdk/go`, at 0.1.x and called beta, like the OpenFeature
+providers that wrap them. (The Python package is `controlvar`; it was `experimently` before the
+rename, and the SDK README says to uninstall the old name first.) Every other SDK installs from a
+clone of the repository, and `docs/sdk-guide.md` says how. To work on one, `pip install -e
+./sdk/python`, or build `sdk/js` with `npm ci && npm run build`.
 
 **Q. What does the SDK cache, and for how long?**
 Successful assignments and flag evaluations, keyed by `(user_id, key)`, for
@@ -2085,7 +2309,8 @@ this week.
 # 📁 demo/streampulse/simulator/rollout_story.py
   1  Internal + 5%      show the flag at 5% with the ``employee equals true`` rule
   2  25%                advance the rollout schedule to stage 2 → flag at 25%
-  3  Incident           run traffic.py --incident android12 for 90 s, then the safety check
+  3  Incident           run traffic.py --incident android12 for 90 s, then the safety check;
+                        while the check is still healthy, run it again (at most 5 rounds)
   4  Rollback           wait for the safety scheduler to roll back to 5% (or roll back by hand
                         when automatic rollbacks are off); the rollback pauses the schedule
   5  Fix shipped        add ``app_version semver_gte 3.2.1 → 100%`` next to the employee rule
@@ -2118,9 +2343,14 @@ safe, Day 17). `_activate_stage` sets `rollout_percentage = 25`. Buckets 5–24 
 buckets 0–4 keep it (monotone rollout).
 
 **Step 3 — Incident.** `traffic.py --incident android12` makes Android-12 devices in the
-rollout report crashes: `POST /tracking/errors/batch` with the API key,
+rollout report crashes: `POST /tracking/errors/batch` with the **StreamPulse server key**
+(the `.api_key_server` file the seed writes beside the app, scope `sdk:ruleset`, the way a StreamPulse server would
+forward its devices' crash reports; Day 10 and Day 18 say why only such a key counts),
 `feature_flag_key: streampulse_player_v2`, `error_type: "crash"`. Each becomes an `ErrorLog`
-row on the flag. Meanwhile evaluations continue, so `raw_metrics` keeps counting.
+row on the flag, stored with `source: "server"`. Meanwhile evaluations continue, so
+`raw_metrics` keeps counting. The steady traffic that `setup-local.sh` runs beside the incident
+dilutes the crash share, so the story's step 3 runs the incident again, up to five rounds,
+until the check turns critical.
 
 **Step 4 — Rollback.** The safety scheduler ticks (every minute in the demo). Under the
 `safety` advisory lock (Day 17): for every ACTIVE flag, load the config (enabled),
@@ -2131,7 +2361,7 @@ and divides by Σ `raw_metrics.count` → say 0.12 > 0.05 critical → `is_healt
 flag is at 25 > 5. So `execute_rollback` locks the flag, sets `rollout_percentage = 5` (the flag
 stays ACTIVE, and the employee rule keeps its 100%), locks and **pauses** the rollout schedule,
 writes a `SafetyRollbackRecord` (`trigger_type` `automatic`, reason "Automatic rollback due to
-error_rate exceeding threshold (0.12 > 0.05)"), and commits once; then `notify_safety_rollback`
+error_rate above threshold (12% > 5%)"), and commits once; then `notify_safety_rollback`
 posts to Slack/email. The run record says `success` with `metadata.rollbacks = 1`. Next tick:
 the window is still hot, but `rollback_change(flag at 5, 5)` is `None` → no record, no
 notification. And the rollout scheduler, which would otherwise move the flag on to the next
@@ -2318,7 +2548,11 @@ track(user, eventName, opts = {}):
 ```
 
 The reference implementation additionally honours one 429 retry and reports
-`{success_count, failure_count}` from batch responses to the caller's logger.
+`{success_count, failure_count}` from batch responses to the caller's logger. (The "nothing to
+attach" branch is the client's choice, not the server's requirement: `/tracking/track` now stores
+a key-less event as history, tagged with no experiment or flag, so it counts in no results. The
+reference client sends nothing rather than fill the event log with events that can never be
+analysed.)
 
 ---
 
