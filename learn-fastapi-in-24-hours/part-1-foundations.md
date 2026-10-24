@@ -4,12 +4,12 @@
 
 [← Back to Contents](./README.md)
 
-A FastAPI endpoint declares the inputs it accepts and the response it returns. This Part follows
-that request lifecycle. Hours 1 and 2 cover validation, application setup, routers and generated API
-documentation. Hours 3 and 4 examine input declarations, response models and HTTP status codes.
-
-Run the API with `make dev` and use a second terminal to send the example requests. Compare valid
-responses with the validation errors returned for invalid input.
+This Part lays the bedrock the other twenty hours build on: _why_ a Python team reaches for a
+framework that validates before it runs (Hour 1), how an application is assembled from routers
+and documented for free (Hour 2), how inputs are _declared_ rather than parsed (Hour 3), and how
+responses are shaped, coded and refused (Hour 4). Have the API running (`make dev`) and a
+second terminal open — FastAPI is a framework you learn by watching the 422s, and those only
+appear when you send requests.
 
 ---
 
@@ -17,10 +17,11 @@ responses with the validation errors returned for invalid input.
 
 ### What & why
 
-FastAPI uses Python parameter declarations and type annotations to parse requests, validate
-inputs and generate OpenAPI documentation. A path operation describes the data it expects, and
-the framework checks those declarations before calling it. Business rules and checks not expressed
-in the declarations still belong in application code.
+FastAPI is a Python web framework built on three ideas: **type hints are the API contract**,
+**validation happens before your code runs**, and **the documentation is generated from the
+same declarations**. You write a function whose parameters say what the request must contain;
+the framework parses, validates, converts, documents and serialises. The value proposition is
+one sentence: **a request that reaches your function is already well-formed.**
 
 The phrase "already well-formed" is load-bearing. In a framework that hands you a raw request,
 every handler begins with defensive code — is the id a UUID? is `limit` an integer, and is it
@@ -73,7 +74,7 @@ Send a 60/30 split and you get, before any database is touched:
 
 Each error carries `type`, `loc`, `msg` and (when there is one) `ctx`. FastAPI's default
 handler would also echo `input` — the rejected value, and for a missing field the whole body —
-so Experimently installs its own handler for `RequestValidationError` that leaves `input` out:
+so Controlvar installs its own handler for `RequestValidationError` that leaves `input` out:
 
 ```python
 # 📁 backend/app/main.py
@@ -91,7 +92,7 @@ is unchanged: `input` is optional in OpenAPI's `ValidationError` schema.
 The dashboard shows that message verbatim; the experiment is never created; the SRM warning
 never happens. That is the whole framework in one example: the invariant is _declared once_
 on the schema, enforced for every caller (dashboard, script, SDK, test), and documented in the
-OpenAPI schema automatically. The lesson the Experimently team drew, and the thesis of this
+OpenAPI schema automatically. The lesson the Controlvar team drew, and the thesis of this
 book:
 
 > **Validation is architecture.** Every invariant you can state on a request model is a bug
@@ -148,7 +149,7 @@ makes those decisions once, in the schema, and the error shape is the same for t
 ### Try It Yourself
 
 With the API running and a token (`make dev`; login as in the
-[usage guide](../guides/usage.md#1-signing-in-and-roles)):
+[quick start](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/getting-started/quick-start.md)):
 
 ```bash
 API=http://localhost:8000/api/v1
@@ -204,7 +205,7 @@ Three structural facts about the app object:
 #### Why one mount file
 
 You could mount each router from its own module (`from .experiments import router;
-app.include_router(router)` scattered around). Experimently mounts every core router — 37 of
+app.include_router(router)` scattered around). Controlvar mounts every core router — 37 of
 them — in one function in `api/api.py`, `register_core_routers`, in one list, many with a
 comment naming the issue or epic that added it. The payoff: a new engineer reads one function
 and knows every core feature; a reviewer sees a new endpoint's prefix and tag in the diff; and
@@ -253,8 +254,9 @@ def register_core_routers(router: APIRouter) -> APIRouter:
     router.include_router(users.router, prefix="/users", tags=["Users"])
     ...
     router.include_router(tracking.router, prefix="/tracking", tags=["Tracking"])
-    # Client-side error reports (POST /tracking/errors, /tracking/errors/batch) feed
-    # feature flag safety monitoring; same prefix and API-key auth as event tracking.
+    # Error reports (POST /tracking/errors, /tracking/errors/batch) feed feature flag
+    # safety monitoring; same prefix and API-key auth as event tracking. Only reports
+    # sent with an sdk:ruleset key count toward automatic rollback.
     router.include_router(client_errors.router, prefix="/tracking", tags=["Tracking"])
     # Locally evaluated flag counts (POST /tracking/evaluations, beta): the safety
     # denominator for SDKs that evaluate flags in-process; needs sdk:ruleset.
@@ -419,7 +421,7 @@ app.include_router(v1, prefix="/api/v1")
 # → GET http://localhost:8010/api/v1/experiments/  and  /docs
 ```
 
-The scratch app starts with a bare `uvicorn`; the real one does not. Experimently's lifespan
+The scratch app starts with a bare `uvicorn`; the real one does not. Controlvar's lifespan
 (Hour 19) refuses to serve when `ENVIRONMENT` was never set — the settings would otherwise
 default to development's relaxed rules without anyone choosing them — so
 `uvicorn backend.app.main:app` on its own stops with "ENVIRONMENT is not set". `make dev` sets
@@ -792,8 +794,9 @@ async def delete_experiment(...) -> None:
         )
 ```
 
-The results endpoint constructs a typed response from the service's dictionary. If calculation
-or response validation fails, the endpoint returns a 500 response rather than partial result JSON:
+The results endpoint shows a response model doing real work: the service returns a dict, the
+endpoint builds a typed response — and a failure anywhere in that is a clean 500, never a
+half-rendered JSON:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py

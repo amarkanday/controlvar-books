@@ -4,12 +4,12 @@
 
 [← Part I](./part-1-foundations.md) · [Contents](./README.md) · [Part III →](./part-3-dependencies-and-auth.md)
 
-Pydantic models describe data and validate it at application boundaries. Hour 5 covers fields and
-constraints; Hour 6 covers field and model validators. Hour 7 follows data between ORM objects,
-Pydantic models and JSON. Hour 8 applies the same validation approach to environment settings.
-
-Use a Python shell to construct `ExperimentCreate` instances with both valid and invalid values.
-The resulting errors show which guarantees the schema provides before a service runs.
+Pydantic is the half of FastAPI that decides what a request _means_. This Part is the model
+layer from the ground up: fields and their constraints (Hour 5), the two kinds of validator
+and where each belongs (Hour 6), the config knobs and the round trip between ORM objects,
+models and JSON (Hour 7), and `pydantic-settings`, which turns the same machinery on the
+process environment and refuses to start a misconfigured production (Hour 8). Keep a Python
+shell open — `from backend.app.schemas.experiment import ExperimentCreate` and try things.
 
 > **Version note.** This codebase is **Pydantic v2** (2.13) throughout: `field_validator` /
 > `model_validator` / `ConfigDict` / `model_dump` / `model_validate`. The v1 names
@@ -61,13 +61,34 @@ class MetricBase(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=100, description="Metric name")
     description: Optional[str] = Field(None, description="Metric description")
-    event_name: str = Field(..., min_length=1, max_length=100, description="Event name to track")
+    event_name: str = Field(
+        ..., min_length=1, max_length=100, description="Event name to track"
+    )
     metric_type: MetricType = Field(MetricType.CONVERSION, description="Type of metric")
     is_primary: bool = Field(False, description="Whether this is the primary metric")
-    aggregation_method: str = Field("average", description="How to aggregate the metric")
-    minimum_sample_size: int = Field(100, ge=10, description="Minimum sample size for statistical significance")
-    expected_effect: Optional[float] = Field(None, description="Expected effect size for power calculations")
-    event_value_path: Optional[str] = Field(None, description="JSON path to extract value from event payload")
+    aggregation_method: str = Field(
+        "average", max_length=50, description="How to aggregate the metric"
+    )
+    minimum_sample_size: int = Field(
+        100,
+        ge=10,
+        le=INT32_MAX,
+        description="Minimum sample size for statistical significance",
+    )
+    expected_effect: Optional[float] = Field(
+        None,
+        description=(
+            "The minimum detectable effect the results page plans the sample "
+            "for, when this is the primary metric: a relative change as a "
+            "fraction (0.10 means 5% -> 5.5%). Used only when above 0 and "
+            "below 1; otherwise the plan uses 0.05."
+        ),
+    )
+    event_value_path: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="JSON path to extract value from event payload",
+    )
     lower_is_better: bool = Field(False, description="Whether lower values are better")
 
     model_config = ConfigDict(
@@ -86,7 +107,12 @@ class MetricBase(BaseModel):
 Read the signals: `...` marks required; `Optional[str] = Field(None, ...)` marks nullable
 and optional; `metric_type: MetricType` means the field accepts only the enum's values
 (`"conversion"`, `"revenue"`, …) and a typo is a 422 listing the allowed values;
-`ge=10` refuses a sample size that would make the statistics meaningless. The
+`ge=10` refuses a sample size that would make the statistics meaningless, and
+`le=INT32_MAX` (2³¹ − 1, a module constant) refuses one the database column could not hold:
+without an upper bound, a huge integer passes validation and fails at the `INSERT` as a 500
+instead of a 422 naming the field. `max_length` on a string does the same job for a
+`VARCHAR`. A schema's constraints should mirror the column's limits, not just the business
+rules. The
 `json_schema_extra` example is what the docs page shows in the request body box.
 
 The flag request models share a private base, `_FeatureFlagRequest`, and nothing else:
@@ -307,7 +333,7 @@ A field validator that **normalises** (accept a JSON string where an object is e
 
 ```python
 # 📁 backend/app/schemas/tracking.py
-class EventBase(BaseModel):
+class EventFields(BaseModel):
     ...
     properties: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -328,6 +354,10 @@ class EventBase(BaseModel):
                 raise ValueError(f"must be a JSON object: {exc}") from exc
         return v
 
+
+class EventBase(EventFields):
+    """Base model for event data."""
+
     @model_validator(mode="after")
     def validate_experiment_or_feature_flag(self) -> "EventBase":
         """Validate that either experiment_id or feature_flag_id is provided."""
@@ -339,7 +369,10 @@ class EventBase(BaseModel):
 Three details to copy: one validator can guard **several fields** (`"properties",
 "metadata"`); `mode="before"` runs on the raw input so a string can be turned into a dict
 _before_ the `Dict[str, Any]` type check; and `raise ... from exc` keeps the JSON error as the
-cause. The model validator returns `self` — mandatory in `mode="after"`.
+cause. The model validator returns `self` — mandatory in `mode="after"`. Note the split: the
+field-level parsing lives on `EventFields` and the "names an experiment or a flag" rule on
+its subclass `EventBase`, because one caller (`UntaggedEventCreate`, an event that names
+neither) needs the fields without the rule. Put a rule on the narrowest class that needs it.
 
 A field validator that **enforces a format** with a better message than `pattern` gives, and
 one that **refuses an explicit null** — both on the flag requests' shared base, which declares
@@ -400,15 +433,30 @@ A model validator with **three cross-field rules** and clear messages for each:
 
         # Check that max stage percentage doesn't exceed the schedule max
         if max(stage_percentages) > self.max_percentage:
-            raise ValueError(f"Stage percentages cannot exceed the maximum of {self.max_percentage}%")
+            raise ValueError(
+                f"Stage percentages cannot exceed the maximum of {self.max_percentage}%"
+            )
 
-        # Check that stage orders are correct
-        stage_orders = [stage.stage_order for stage in self.stages]
-        if sorted(stage_orders) != list(range(min(stage_orders), max(stage_orders) + 1)):
+        # Check that stage orders are sequential without gaps: n distinct
+        # orders whose highest is n - 1 above their lowest.
+        stage_orders = sorted(stage.stage_order for stage in self.stages)
+        if (
+            len(set(stage_orders)) != len(stage_orders)
+            or stage_orders[-1] - stage_orders[0] != len(stage_orders) - 1
+        ):
             raise ValueError("Stage orders must be sequential without gaps")
 
         return self
 ```
+
+The last rule counts rather than builds: `n` orders are consecutive exactly when they are all
+different and the highest is `n - 1` above the lowest. (An earlier version compared
+`sorted(orders)` with `list(range(lo, hi + 1))`, which allocates a list as long as the span
+between the smallest and largest order. The replacement answers the same way and costs
+nothing.) The field itself is capped too: `stage_order` is `le=MAX_STAGE_ORDER` (1000), so a
+request carrying an order of a few billion is a 422 naming the field, not a 500 from the
+database. Same lesson as `le=INT32_MAX` above: validate the shape of the column, not only the
+business rule.
 
 And a validator that reaches for the **clock** — with a tolerance, because clients' clocks
 drift:
@@ -490,14 +538,15 @@ the full story.
 from backend.app.schemas.tracking import EventCreate, EventRequest
 EventCreate(event_name="purchase", user_id="u", experiment_id="e", metadata='{"sku": "a"}').metadata   # {'sku': 'a'}: parsed
 EventCreate(event_name="purchase", user_id="u", experiment_id="e", metadata='{not json')             # ValidationError: "must be a JSON object: ..."
-EventRequest(event_type="purchase", user_id="u")                                                    # ValidationError: either experiment_key or feature_flag_key
+EventRequest(event_type="purchase", user_id="u")                                                    # valid: neither key is required (the endpoint stores it as history)
+EventCreate(event_name="purchase", user_id="u")                                                      # ValidationError: Either experiment_id or feature_flag_id must be provided
 EventRequest(event_type="purchase", user_id="u", experiment_key="k", metadata='{"sku": "a"}')        # ValidationError: dict_type
 
 from backend.app.schemas.rollout_schedule import RolloutScheduleCreate
 # build a schedule with stages 10 → 50 → 25 and read the message; then fix the order and gap the stage_order
 ```
 
-`EventCreate` inherits `parse_json_string` from `EventBase`; the public tracking API's
+`EventCreate` inherits `parse_json_string` from `EventFields` (through `EventBase`); the public tracking API's
 `EventRequest` is a separate model (on `StorableTextModel`, Hour 3) without it, so it takes
 `metadata` only as a JSON object — the last line is a 422 over HTTP. Same field name,
 different contract: always check which model a route actually uses.
@@ -581,9 +630,20 @@ class ExperimentResponse(BaseModel):
     status: str
     targeting_rules: Optional[Dict[str, Any]] = None
     tags: Optional[List[str]] = None
-    owner_id: UUID4
+    # Null once the creator's account has been removed (the column is
+    # ON DELETE SET NULL): such an experiment still reads and lists, with
+    # `owner_id: null`.
+    owner_id: Optional[UUID4] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
+    resume_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "When a PAUSED experiment is scheduled to resume, set by PUT "
+            "/experiments/{id}/schedule on a paused experiment. Null when no "
+            "resume is scheduled; any change of status clears it."
+        ),
+    )
     created_at: datetime
     updated_at: datetime
     variants: List[VariantResponse]
@@ -598,13 +658,18 @@ column-ready data — so an omitted optional field doesn't overwrite a database 
 
 ```python
 # 📁 backend/app/services/experiment_service.py
-    def create_experiment(self, obj_in: Union[ExperimentCreate, Dict[str, Any]], user_id: UUID) -> Dict[str, Any]:
+    def create_experiment(
+        self,
+        obj_in: Union[ExperimentCreate, Dict[str, Any]],
+        user_id: UUID,
+    ) -> Dict[str, Any]:
+        ...
         # Extract data from the schema, excluding unset values
         obj_data = jsonable_encoder(obj_in, exclude_unset=True)
 
         # Extract nested objects
         variants_data = obj_data.pop("variants", [])
-        metrics_data = obj_data.pop("metrics", [])
+        metrics_data = _with_stored_metric_types(obj_data.pop("metrics", None) or [])
         ...
         experiment = Experiment(**obj_data)
 ```
@@ -615,16 +680,18 @@ services called from endpoints (models) and scripts (dicts):
 ```python
 # 📁 backend/app/services/event_service.py
     @staticmethod
-    def _as_dict(event_data: Union[EventCreate, Mapping[str, Any]]) -> Dict[str, Any]:
+    def _as_dict(
+        event_data: Union[EventCreate, UntaggedEventCreate, Mapping[str, Any]],
+    ) -> Dict[str, Any]:
         """Accept either a Pydantic model or a plain mapping."""
         if hasattr(event_data, "model_dump"):
             return event_data.model_dump()
         return dict(event_data)
 ```
 
-A cached response is serialized to JSON and validated through the response model when read.
-If the stored data no longer matches the schema, validation fails rather than returning an
-incompatible response:
+Caching a response is a JSON round trip through the model, which is what keeps the cache
+honest — a cached blob that no longer matches the schema fails validation rather than
+returning stale shapes:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
@@ -705,12 +772,13 @@ ExperimentResponse.model_validate_json(resp.model_dump_json()) == resp        # 
 
 ### What & why
 
-`pydantic-settings` loads configuration into a `BaseSettings` subclass. Fields come from
-environment variables and an optional `.env` file, with declared types, defaults and validators.
-The application imports the resulting `settings` object to select its database, authentication
-provider and environment. Invalid configurations can be rejected during startup.
+`pydantic-settings` applies the same machinery to configuration: a `BaseSettings` subclass
+whose fields are populated from environment variables (and an optional `.env` file), typed,
+defaulted and — crucially — **validated**. The result is one object, `settings`, imported
+everywhere, that answers "which database, which auth provider, which environment" and
+refuses to exist when the answers are dangerous.
 
-Three ideas in Experimently's `core/config.py` that go beyond "read an env var":
+Three ideas in Controlvar's `core/config.py` that go beyond "read an env var":
 
 1. **A canonical environment name** with legacy aliases accepted and warned about.
 2. **Subclasses per environment** (`DevSettings`, `TestSettings`, `ProdSettings`) differing
@@ -729,7 +797,7 @@ The base class and the two settings that trip newcomers — `NoDecode` and `extr
 class Settings(BaseSettings):
     """Base settings class."""
 
-    PROJECT_NAME: str = "Experimently"
+    PROJECT_NAME: str = "Controlvar"
     ...
     # The alias is the point.  As a plain field this read the bare ``VERSION``
     # environment variable -- about the most generic name there is, exported by
@@ -767,7 +835,8 @@ class Settings(BaseSettings):
 
 Two fields here carry a lesson each. `VERSION` is read from the repository's `VERSION` file by
 a `default_factory`, and its environment variable is `EXPERIMENTLY_VERSION` via
-`validation_alias`: a field named `VERSION` would otherwise be overridden by any process that
+`validation_alias` (the variable keeps the product's old name; Controlvar was called
+Experimently before 0.35.0): a field named `VERSION` would otherwise be overridden by any process that
 happens to export the most generic variable name there is, and the API would report the wrong
 version. And `BACKEND_CORS_ORIGINS` used to be `List[AnyHttpUrl]`, which renders every entry
 with a trailing slash — `http://localhost:3000/` — that no browser `Origin` header carries, so

@@ -4,10 +4,12 @@
 
 [← Part IV](./part-4-sqlalchemy.md) · [Contents](./README.md) · [Part VI →](./part-6-testing-and-operating.md)
 
-Several backend operations have lifetimes that differ from an HTTP request. Hour 19 covers
-scheduled work. Hour 20 covers WebSocket connections and server-to-client updates. Hour 21 examines
-Redis as a shared store, including the application's behavior when it is unavailable. These
-examples show where blocking calls, cancellation and resource cleanup need explicit handling.
+Not everything is a request that gets a response. This Part covers the three things the
+backend does that don't fit that shape: work on a timer with no request at all (Hour 19), long
+-lived connections that push data to clients (Hour 20), and a fast shared store that survives
+across requests and processes — and the discipline of degrading gracefully when it isn't
+there (Hour 21). Each is where the `async` half of "async web framework" stops being a
+formality.
 
 ---
 
@@ -208,7 +210,7 @@ metrics — while letting cancellation through untouched:
             # Shutdown: release the lock (context manager) and propagate
             # without recording a bogus "failed" run.
             raise
-        except Exception as exc:  # noqa: BLE001 - recorded then re-raised
+        except Exception as exc:
             status = STATUS_FAILED
             error = str(exc) or exc.__class__.__name__
             exc_to_raise = exc
@@ -276,7 +278,7 @@ connections, exactly the two-replica situation the lock exists for).
 Two ways to push data to a client over HTTP:
 
 - **WebSocket** — a bidirectional, long-lived connection upgraded from HTTP. The results
-  dashboard opens one per experiment and receives a fresh snapshot every 30 seconds without
+  dashboard opens one per experiment and receives a fresh snapshot every 30 seconds (the default) without
   polling; it can also send `{"action": "refresh"}` to ask for one now.
 - **Server-Sent Events (SSE)** — a one-way stream of `data: ...\n\n` chunks over a normal
   HTTP response with `text/event-stream`. Simpler than a WebSocket when the client only
@@ -304,13 +306,13 @@ loop that doubles as a periodic timer:
 # 📁 backend/app/api/v1/endpoints/websocket_results.py
 WS_CLOSE_UNAUTHORIZED = 4401
 WS_AUTH_SUBPROTOCOL = "experimently.bearer"
-RESULTS_STREAM_INTERVAL_SECONDS = int(os.getenv("RESULTS_STREAM_INTERVAL_SECONDS", "30"))
 
 # Module-level singleton so all requests share the same ConnectionManager state.
 manager = ConnectionManager()
 
 
 def _extract_ws_token(websocket: WebSocket, token: Optional[str]) -> Optional[str]:
+    """Subprotocol first, then ``Authorization: Bearer``, then ``?token=``."""
     from_subprotocol = _token_from_subprotocol(websocket)
     if from_subprotocol:
         return from_subprotocol
@@ -318,7 +320,9 @@ def _extract_ws_token(websocket: WebSocket, token: Optional[str]) -> Optional[st
     scheme, _, value = authorization.partition(" ")
     if scheme.lower() == "bearer" and value.strip():
         return value.strip()
-    ...
+    if token:
+        return token
+    return None
 
 
 @router.websocket("/ws/experiments/{experiment_id}/results")
@@ -345,37 +349,54 @@ async def stream_results(
 
     await manager.connect(websocket, experiment_id, subprotocol=subprotocol)
     streaming_service = ResultsStreamingService(SessionLocal)
+    # The one outstanding read of the next client message, if any.
+    receive_task: Optional["asyncio.Future[str]"] = None
 
     try:
         # Send initial snapshot immediately on connection
         snapshot = await streaming_service.get_live_snapshot(experiment_id)
         await websocket.send_text(json.dumps(snapshot))
 
-        # Main loop: wait for client messages, send periodic updates on timeout
+        # Main loop: wait for a client message, but only until the next
+        # snapshot is due. The deadline moves only when a periodic snapshot
+        # is sent, so a client message (a ping, say) never postpones one
+        # (#1193). A read that is still waiting when a snapshot is due is
+        # kept, not cancelled, and waited on again: cancelling a read can
+        # drop a message that arrives in the same moment.
+        interval = float(settings.RESULTS_STREAM_INTERVAL_SECONDS)
+        loop = asyncio.get_running_loop()
+        next_snapshot_at = loop.time() + interval
         while True:
-            try:
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=float(RESULTS_STREAM_INTERVAL_SECONDS))
-                try:
-                    msg = json.loads(data)
-                except json.JSONDecodeError:
-                    msg = {}
-
-                action = msg.get("action")
-                if action == "ping":
-                    await websocket.send_text(json.dumps({"event": "pong"}))
-                elif action == "refresh":
-                    snapshot = await streaming_service.get_live_snapshot(experiment_id)
-                    await websocket.send_text(json.dumps(snapshot))
-                ...
-            except asyncio.TimeoutError:
-                # No client message within the interval: push a periodic snapshot
-                ...
+            remaining = next_snapshot_at - loop.time()
+            if remaining <= 0:
+                snapshot = await streaming_service.get_live_snapshot(experiment_id)
+                await websocket.send_text(json.dumps(snapshot))
+                next_snapshot_at = loop.time() + interval
+                continue
+            if receive_task is None:
+                receive_task = asyncio.ensure_future(websocket.receive_text())
+            done, _ = await asyncio.wait({receive_task}, timeout=remaining)
+            if not done:
+                # The next snapshot is due: the top of the loop sends it.
+                continue
+            finished, receive_task = receive_task, None
+            data = finished.result()  # raises WebSocketDisconnect on close
+            ...
 ```
 
-The `asyncio.wait_for(receive_text(), timeout=30)` trick is worth stealing: one loop handles
-both "the client said something" and "30 seconds passed, push an update," without a second
-task. `run_in_threadpool` for the synchronous auth chain keeps the loop free during the
-database lookup — the same reason `def` handlers are offloaded.
+The loop is one task doing two jobs: answer what the client says (`ping`, `refresh`) and push
+a snapshot every `RESULTS_STREAM_INTERVAL_SECONDS` (a setting, 30 by default, `gt=0`). The
+obvious way to write that is `await asyncio.wait_for(websocket.receive_text(), timeout=30)`
+and treat `TimeoutError` as "time to push". It is what an earlier version of this loop did,
+and it has two bugs. `wait_for` restarts its clock on every call, so a client that pings every
+20 seconds is never "quiet for 30 seconds" and never receives a snapshot. And on timeout it
+_cancels_ the pending read, which can drop a message that arrives in the same moment. The
+current loop keeps a **deadline** (`next_snapshot_at`) that moves only when a snapshot is sent,
+keeps **one** outstanding read task across iterations, and uses `asyncio.wait({task},
+timeout=remaining)`, which on timeout leaves the task running instead of cancelling it. The
+`finally` block that cancels or drains the leftover task is the other half of that bargain: a
+task you create, you finish. `run_in_threadpool` for the synchronous auth chain keeps the
+loop free during the database lookup, the same reason `def` handlers are offloaded.
 
 `ResultsStreamingService(SessionLocal)` receives the _factory_, not a session: it opens a
 short-lived session per snapshot, which is the correct ownership for a connection that lives
@@ -529,7 +550,7 @@ curl -sN "$API/audit-logs/stream?limit=3" -H "Authorization: Bearer $TOKEN" | he
 ### Key takeaways
 
 - WebSocket: `@router.websocket`, token via the subprotocol (browsers) or a bearer header, accept-then-close
-  with `4401` on failure, release the auth session, `wait_for(receive, timeout)` as a timer.
+  with `4401` on failure, release the auth session, a deadline plus `asyncio.wait({read_task}, timeout=...)` as the timer (a bare `wait_for(receive, timeout)` restarts its clock on every message).
 - `ConnectionManager` groups sockets per experiment behind an `asyncio.Lock` and prunes dead
   ones on broadcast.
 - SSE: an async generator → `StreamingResponse(media_type="text/event-stream")`, `data:
@@ -565,46 +586,56 @@ The Redis limiter with lazy connection and fallback on _any_ error:
 
 ```python
 # 📁 backend/app/middleware/rate_limiter.py
+#: How long the limiter counts per process after a Redis error before it tries
+#: Redis again. A constant, not a setting.
+REDIS_RETRY_SECONDS = 30.0
+
+
 class RedisRateLimiter:
     """
     Fixed-window rate limiter backed by Redis ``INCR`` + ``EXPIRE``.
 
-    On any Redis error the limiter transparently falls back to the
-    in-memory :class:`SlidingWindowRateLimiter` so that the application
-    keeps serving traffic even when Redis is temporarily unreachable.
+    On any Redis error the limiter falls back to the in-memory
+    :class:`SlidingWindowRateLimiter` so that the application keeps serving
+    traffic when Redis is unreachable. While it does, the count is per process,
+    so a per-IP limit is multiplied by the number of API processes.
+    ...
     """
 
-    def __init__(self) -> None:
-        # The connection parameters (REDIS_HOST/PORT/PASSWORD/DB/SSL) are read
-        # from the settings by create_redis_client on first use.
-        self._redis_client: Optional[object] = None
-        self._redis_available: bool = True
-        self._fallback = SlidingWindowRateLimiter()
-
     def _get_redis(self):
-        """Lazy-connect to Redis on first call."""
-        if self._redis_client is None and self._redis_available:
+        """The Redis client, connecting (and pinging) if there is none yet.
+
+        Returns None when the connect fails; the failure starts the fallback.
+        """
+        if self._redis_client is None:
             try:
+                from redis.backoff import NoBackoff
+                from redis.retry import Retry
+
                 from backend.app.core.redis_client import create_redis_client
 
-                self._redis_client = create_redis_client(
+                client = create_redis_client(
                     socket_connect_timeout=2,
                     socket_timeout=1,
                     decode_responses=True,
+                    # No client retries: see the class docstring.
+                    retry=Retry(NoBackoff(), 0),
                 )
                 # Test connectivity
-                self._redis_client.ping()
-                self._redis_available = True
-                logger.info("Rate limiter connected to Redis")
+                client.ping()
             except Exception as exc:
-                logger.warning("Rate limiter Redis unavailable, using in-memory fallback: %s", exc)
-                self._redis_client = None
-                self._redis_available = False
+                self._enter_fallback(exc)
+                return None
+            self._redis_client = client
+            logger.info("Rate limiter connected to Redis")
         return self._redis_client
 
     def is_allowed(self, key: str, limit: int, window_seconds: int) -> Tuple[bool, int]:
+        if not self._redis_available and self._clock() < self._retry_at:
+            return self._fallback.is_allowed(key, limit, window_seconds)
+
         client = self._get_redis()
-        if client is None or not self._redis_available:
+        if client is None:
             return self._fallback.is_allowed(key, limit, window_seconds)
 
         redis_key = f"ratelimit:{key}"
@@ -620,17 +651,18 @@ class RedisRateLimiter:
             # First request in this window — set expiry
             if ttl == -1:
                 client.expire(redis_key, window_seconds)
-
-            if current_count > limit:
-                return False, 0
-
-            remaining = limit - current_count
-            return True, remaining
-
         except Exception as exc:
-            logger.warning("Redis rate-limit error, falling back to in-memory: %s", exc)
-            self._redis_available = False
+            self._enter_fallback(exc)
             return self._fallback.is_allowed(key, limit, window_seconds)
+
+        if not self._redis_available:
+            self._leave_fallback()
+
+        if current_count > limit:
+            return False, 0
+
+        remaining = limit - current_count
+        return True, remaining
 ```
 
 Note what the limiter passes and what it doesn't. It passes only **client options**, the
@@ -644,6 +676,17 @@ the password, another TLS); a test now scans the tree and fails on a Redis const
 anywhere else. The pipeline makes
 `INCR` + `TTL` one round trip; `ttl == -1` means "no expiry yet" and marks the first hit of a
 window.
+
+Three details are about **recovering**, not failing. First, `retry=Retry(NoBackoff(), 0)`
+turns off redis-py's own retries: its default of ten retries with backoff would turn one
+failure into 15-25 seconds of a blocked event loop, and this limiter runs on the event loop
+for every request. Second, after an error the limiter does not touch Redis for
+`REDIS_RETRY_SECONDS` (30), then lets the next request be the retry; an earlier version never
+went back, so one Redis blip left a process counting in memory until it restarted. Third, the
+transitions are logged once, with a `rate_limiter` field (`per_process` or `redis`), so an
+outage is one warning per process however long it lasts, and the recovery is one line too.
+The honest cost is in the docstring: while in the fallback, a per-IP limit is multiplied by
+the number of API processes.
 
 The in-memory fallback, exact and thread-safe:
 
@@ -692,13 +735,19 @@ def _get_cache_service() -> CacheService:
     try:
         from backend.app.core.redis_client import create_redis_client
 
-        r = create_redis_client()
+        r = create_redis_client(**_cache_client_options())
         # Quick ping to verify the connection is alive.
         r.ping()
         return CacheService(redis_client=r)
     except Exception:
         return CacheService(redis_client=None)
 ```
+
+`_cache_client_options()` is the part that makes "best-effort" true: one connect attempt, 1-second
+timeouts and no client retries. Its docstring records why. With redis-py's defaults (ten retries
+with backoff, no socket timeouts) an uncached read, which makes two cache calls, took 7-9 seconds
+with Redis refusing connections and about two minutes with Redis unreachable, measured on a laptop.
+A cache that is supposed to be optional must fail fast, or the outage lives in your latency.
 
 ```python
 # 📁 backend/app/services/cache.py
@@ -719,7 +768,13 @@ class CacheService:
             logger.error(f"Error getting value from cache: {e}")
             return None
 
-    def set(self, key: str, value, expire: Optional[int] = None) -> bool:
+    def set(
+        self,
+        key: str,
+        value: Union[str, bytes, int, float],
+        expire: Optional[int] = None,
+    ) -> bool:
+        """Set a value in the cache with optional expiration."""
         if not self.enabled:
             return False
         try:
@@ -866,10 +921,13 @@ request's result to a different request, and a key without the engine version wo
 numbers from the previous statistics engine after an upgrade. The key must include every
 input that affects the output, including the code that computes it.
 
-**Quiz.** `asyncio.wait_for(websocket.receive_text(), timeout=30)` — what are the two
-outcomes and what does each mean for the loop?
-→ It returns a message (handle `ping`/`refresh`) or raises `asyncio.TimeoutError` (30 s
-passed with no client message → push a periodic snapshot). One loop, two triggers.
+**Quiz.** A first version of the stream loop was `await asyncio.wait_for(websocket.receive_text(),
+timeout=30)`, pushing a snapshot on `TimeoutError`. A client sends `{"action": "ping"}` every 20
+seconds. How often does it receive a snapshot, and why?
+→ Never on the schedule: every ping returns from `wait_for` and the next call starts a fresh
+30-second clock, so the timeout never fires. (Cancelling the read on timeout could also lose a
+message.) The current loop keeps a deadline that only a sent snapshot moves, and keeps the
+read task alive across timeouts.
 
 ---
 
