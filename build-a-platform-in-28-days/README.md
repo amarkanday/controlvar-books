@@ -187,3 +187,12 @@ After this capstone, three **specialization** books go deeper on the hardest sub
   CDK, Fargate, Kinesis, observability, release engineering.
 
 _Set aside four weeks. Open the repo. Turn to [Week 1](./week-1-core-loop.md). 🏗️_
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Complete experiment walkthrough](../engineering-guides/experiment-lifecycle.md)
+- [Distributed correctness](../engineering-guides/distributed-correctness.md)
+- [Changing Experimently safely](../engineering-guides/changing-experimently.md)

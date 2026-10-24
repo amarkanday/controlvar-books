@@ -133,3 +133,11 @@ path 404s, `git grep` the symbol (e.g. `git grep -n "def get_current_user"`). Th
 outlast the line numbers.
 
 _Now turn to [Part I](./part-1-foundations.md) and start the clock. ⏱️_
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Security engineering](../engineering-guides/security-engineering.md)
+- [Database evolution and performance](../engineering-guides/database-evolution.md)

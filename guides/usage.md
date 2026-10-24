@@ -622,3 +622,12 @@ with the request ID; grep the API log for it.
    Admin → Safety record the rollback to 5% on the next tick.
 
 You've now used every part of the product that a customer would in their first week.
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Measurement and experiment design](../engineering-guides/measurement.md)
+- [Complete experiment walkthrough](../engineering-guides/experiment-lifecycle.md)
+- [Feature-flag lifecycle](../engineering-guides/flag-lifecycle.md)

@@ -30,6 +30,23 @@ TypeScript and 44,000 lines of SDK code (measured at `2fe9da1e`, v0.17.0 plus un
 - **[`guides/troubleshooting.md`](./guides/troubleshooting.md)** — symptom → cause → fix, for
   local setup, tests, the API, the dashboard, SDKs, schedulers and AWS.
 
+## Engineering field guides — solve a concrete problem
+
+The [nine engineering field guides](./engineering-guides/README.md) provide task-based routes for
+experienced engineers and experiment owners. Each includes a worked problem, an exercise with a
+solution, and source links pinned to app commit `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
+(reviewed 2026-10-23). The books below retain their own, older reference commits.
+
+- **Design and decide:** [measurement](./engineering-guides/measurement.md),
+  [complete experiment walkthrough](./engineering-guides/experiment-lifecycle.md),
+  [LLM evaluation](./engineering-guides/llm-evaluation.md).
+- **Build and operate:** [security engineering](./engineering-guides/security-engineering.md),
+  [distributed correctness](./engineering-guides/distributed-correctness.md),
+  [database evolution and performance](./engineering-guides/database-evolution.md).
+- **Maintain the product:** [privacy and data lifecycle](./engineering-guides/privacy-data-lifecycle.md),
+  [feature-flag lifecycle](./engineering-guides/flag-lifecycle.md),
+  [changing Experimently safely](./engineering-guides/changing-experimently.md).
+
 ## Operator guides — for whoever runs the project
 
 - **[`guides/deploying.md`](./guides/deploying.md)** — choosing compose, Helm or AWS; the AWS path

@@ -130,3 +130,10 @@ snippet leaves lines out it says so with `...`. Counts were measured there: line
 `git grep -n "def _hash_user_to_variant"`). The _patterns_ outlast the line numbers.
 
 _Now turn to [Part I](./part-1-getting-started.md) and start the clock. ⏱️_
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Task-based learning routes after the Python foundations](../engineering-guides/README.md)

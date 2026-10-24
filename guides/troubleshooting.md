@@ -765,3 +765,11 @@ text is scrubbed of anything containing "password".
    platform are a shape or a key mismatch at the boundary.
 4. `git grep` the error string; the codebase's error messages are unique and searchable.
 5. Read the PR description of the last change to that area — they're written as design notes.
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Distributed correctness](../engineering-guides/distributed-correctness.md)
+- [Database evolution and performance](../engineering-guides/database-evolution.md)
