@@ -4,10 +4,14 @@
 
 [← Part II](./part-2-building-a-client.md) · [Contents](./README.md) · [Part IV →](./part-4-proving-agreement.md)
 
-Porting an SDK requires equivalent behavior expressed through different language and runtime
-facilities. Hour 7 compares the Go, Java, Swift, Kotlin, Ruby, PHP, .NET, Elixir and Flutter clients.
-Hour 8 covers OpenFeature providers, the edge client and React Native. Hour 9 examines the assignment
-hash mismatch and the changes that brought client and server behavior into agreement.
+The Python and JavaScript SDKs are the references; the other fourteen are ports or adapters.
+This Part is about porting well. Hour 7 walks the nine "native" ports — Go, Java (and its Spring Boot
+starter), Swift, Kotlin, Ruby, PHP, .NET, Elixir, Flutter — and shows that each one is the
+same five decisions expressed in its language's idiom for concurrency, errors and lifetime.
+Hour 8 covers the three that sit on a standard or a special runtime: the OpenFeature
+providers, the edge client, React Native. Hour 9 is a case study with an ending: a _second
+implementation of the server's decision_, the four hash functions that drifted apart, and the
+two changes that closed it.
 
 ---
 
@@ -31,13 +35,13 @@ section names the gaps. The second column is where language taste lives. The fir
 docblock at the top of every client restates it — deliberately, in nearly the same words, so
 a reviewer can diff the _promises_ across ports without reading the code.
 
-### How Experimently does it
+### How Controlvar does it
 
 **Go** — an interface, context-aware calls, errors returned alongside a safe value:
 
 ```go
 // 📁 sdk/go/client.go
-// Client is the main interface for interacting with Experimently.
+// Client is the main interface for interacting with Controlvar.
 // Implementations must be safe for concurrent use by multiple goroutines.
 type Client interface {
 	// EvaluateFlag evaluates a feature flag for the given user via
@@ -78,7 +82,7 @@ and lets them:
 ```go
 // 📁 sdk/go/http.go
 // APIError is returned when the server responds with a non-2xx HTTP status code:
-// 401 bad API key, 404 experiment/flag unknown or not ACTIVE, 422 invalid event,
+// 401 bad API key, 404 an unknown flag key, or an experiment that is unknown or not ACTIVE, 422 invalid event,
 // 429 rate limited (see RetryAfter).
 type APIError struct {
 	StatusCode int
@@ -93,10 +97,10 @@ type APIError struct {
 local mode, where there is a refresh thread to stop. Same contract, different resource model.
 
 **Java** — a builder-configured client and a Spring Boot auto-configuration so a Spring app
-gets an injectable bean from four properties:
+gets an injectable bean from a handful of properties:
 
 ```java
-// 📁 sdk/java/spring-boot-starter/src/main/java/com/getexperimently/sdk/spring/ExperimentationAutoConfiguration.java
+// 📁 sdk/java/spring-boot-starter/src/main/java/com/controlvar/sdk/spring/ExperimentationAutoConfiguration.java
 @AutoConfiguration
 @ConditionalOnClass(ExperimentationClient.class)
 @EnableConfigurationProperties(ExperimentationProperties.class)
@@ -119,14 +123,16 @@ public class ExperimentationAutoConfiguration {
 
 `@ConditionalOnProperty(... name = "api-key")` means the starter does nothing until
 `experimentation.api-key` is set — no bean, no startup failure, no accidental calls to
-`localhost:8000` from a test profile. The comment about milliseconds vs seconds is the kind of
+the placeholder base URL (`https://api.controlvar.example.com`) from a test profile. (The
+Spring property prefix is still `experimentation`, the generic word; only the Java package
+moved to `com.controlvar.sdk`.) The comment about milliseconds vs seconds is the kind of
 unit boundary a port introduces and must document (the deleted Lambda copy had a worse one;
 Hour 9).
 
 **Swift** — `async throws`, `NSCache`, an offline store, and the same in-flight dedupe as JS:
 
 ```swift
-// 📁 sdk/ios/Sources/Experimently/ExperimentationClient.swift
+// 📁 sdk/ios/Sources/Controlvar/ExperimentationClient.swift
 /// ## How it works
 /// - **The server decides.** `evaluateFlag` calls `GET /api/v1/feature-flags/evaluate/{key}`
 ///   and `getAssignment` calls `POST /api/v1/tracking/assign`; no bucketing happens on device.
@@ -147,16 +153,18 @@ Hour 9).
 public class ExperimentationClient: ExperimentationClientProtocol {
 ```
 
-The Swift, Kotlin, Flutter and React Native SDKs persist successful evaluations for offline use,
-using platform stores such as `UserDefaults`, `SharedPreferences` and `AsyncStorage`. Network
-failures may use that stored result. A definitive 404 must not return a stale stored value, because
-that would conceal the server's response that the flag is no longer available.
+The mobile SDKs (Swift, Kotlin, Flutter, React Native) add one thing the server-side ones
+don't: an **offline store**. A phone loses the network; the last successful evaluation is
+persisted (`UserDefaults` / `SharedPreferences` / `AsyncStorage`) and served when the API is
+unreachable. The rule that keeps this honest: **a definitive 404 never falls back to a stale
+persisted value** — "the flag was turned off" must not be masked by "the flag was on last
+week."
 
 **Kotlin** — suspend functions on `Dispatchers.IO`, a `SupervisorJob` scope for
 fire-and-forget:
 
 ```kotlin
-// 📁 sdk/android/sdk/src/main/kotlin/com/getexperimently/android/ExperimentationClient.kt
+// 📁 sdk/android/sdk/src/main/kotlin/com/controlvar/android/ExperimentationClient.kt
  * Successful results are also written to the [OfflineStore] (SharedPreferences in
  * production) and read back when the API cannot be reached. Failures are never cached.
  * There is no local bucketing and no "fetch all flag definitions" path: the former
@@ -183,7 +191,7 @@ no-ops so existing integrations compile, and the docblock says so.
 **Ruby, PHP, .NET, Elixir, Flutter** — the same docblock, five more idioms:
 
 ```ruby
-# 📁 sdk/ruby/lib/experimently/client.rb
+# 📁 sdk/ruby/lib/controlvar/client.rb
   # Flag evaluation and experiment assignment are decided by the server; the
   # SDK never buckets users locally. Successful results are cached per
   # user + key for +cache_ttl+ seconds; failures are never cached.
@@ -209,8 +217,8 @@ exposes `EvaluateFlagAsync` / `GetAssignmentAsync` / `TrackAsync` returning `Tas
 Elixir is the port that most changes shape, because the BEAM's unit of state is a process:
 
 ```elixir
-# 📁 sdk/elixir/lib/experimently/client.ex
-  GenServer client for the Experimently public API.
+# 📁 sdk/elixir/lib/controlvar/client.ex
+  GenServer client for the Controlvar public API.
 
   Flag evaluation and experiment assignment are decided by the server; the
   SDK never buckets users locally. Successful results are cached per
@@ -236,16 +244,17 @@ caller would be _correct_ but would give up the drain-on-stop guarantee that thi
 > `cache_ttl_seconds` is seconds. Each is idiomatic; each is documented at the boundary.
 > A port review checklist item: _every_ duration parameter names its unit in the identifier.
 
-> **Watch Out!** Two contract rows are not yet met by every port, and both are open issues
-> rather than design choices. **Context on flag evaluation:** only the React, JavaScript
-> and Python SDKs send the user's attributes as `context` today; the others evaluate with
-> `user_id` alone, so a flag's attribute targeting never matches through them (Ruby's
-> `evaluate_flag` takes `_attributes` and ignores it). Issue #438 tracks the most visible
-> case, native mobile: React Native, iOS, Android and Flutter. **`assigned` / `reason` (#316):** the
-> JavaScript and Python SDKs pass both through (unknown when an older server omits them),
-> React defaults a missing `assigned` to `true`, and the other ports drop both fields — so
-> their callers cannot tell an ineligible user from an enrolled one. A port review should
-> check these two rows explicitly until the issues close.
+> **Watch Out!** Two contract rows are not yet met by every port, and both are known gaps
+> rather than design choices (the .NET, Flutter and Elixir sources say the evaluate
+> endpoint's `context` is "not sent yet"). **Context on flag evaluation:** only the React,
+> JavaScript and Python SDKs send the user's attributes as `context` today; the others
+> evaluate with `user_id` alone, so a flag's attribute targeting never matches through them
+> (Ruby's `evaluate_flag` takes `_attributes` and ignores it). The most visible case is native
+> mobile: React Native, iOS, Android and Flutter. (Every port does send attributes as `context`
+> on *assignment*.) **`assigned` / `reason`:** the JavaScript and Python SDKs pass both through
+> (unknown when an older server omits them), React defaults a missing `assigned` to `true`, and
+> the other ports drop both fields — so their callers cannot tell an ineligible user from an
+> enrolled one. A port review should check these two rows explicitly until the gaps close.
 
 > **Did You Know?** The Android SDK's Kotlin touches no `android.*` API — deliberately, so
 > `sdk/android/jvm` can compile it for a plain JVM and the contract smoke runs on a Linux CI
@@ -260,8 +269,8 @@ Pick two ports you can run and diff their promises:
 cd sdk/go && go test -race ./... 2>&1 | tail -3
 cd ../ruby && bundle exec rspec 2>&1 | tail -3
 # The docblocks, side by side:
-sed -n '/How it works/,/Thread Safety/p' ../ios/Sources/Experimently/ExperimentationClient.swift
-sed -n '1,40p' ../elixir/lib/experimently/client.ex
+sed -n '/How it works/,/Thread Safety/p' ../ios/Sources/Controlvar/ExperimentationClient.swift
+sed -n '1,40p' ../elixir/lib/controlvar/client.ex
 ```
 
 Then run the same smoke through both: `python tests/sdk-contract/live/run_live_contract.py
@@ -276,8 +285,7 @@ Then run the same smoke through both: `python tests/sdk-contract/live/run_live_c
 - Mobile ports add an offline store with the 404-never-falls-back rule; server ports add
   lifecycle (`Close`, `stop/1`) where the runtime holds resources.
 - Watch the unit boundaries; keep cores platform-free so CI can run them.
-- Known gaps: only React, JS and Python send `context` on flag evaluation (native mobile is
-  #438); most ports drop `assigned`/`reason` (#316).
+- Known gaps: only React, JS and Python send `context` on flag evaluation (native mobile among them); most ports drop `assigned`/`reason`.
 
 ---
 
@@ -288,14 +296,14 @@ Then run the same smoke through both: `python tests/sdk-contract/live/run_live_c
 Three SDKs aren't ports of the client; they're adapters that put the client behind
 something else. **OpenFeature** is the CNCF standard flag API — an application codes against
 `client.getBooleanValue('flag', false, context)` and plugs in a vendor _provider_; shipping
-one means an OpenFeature app can adopt Experimently without changing call sites. The **edge
+one means an OpenFeature app can adopt Controlvar without changing call sites. The **edge
 client** runs in Cloudflare Workers, Vercel Edge and Deno Deploy, where there are no Node
 built-ins, request budgets are hundreds of milliseconds, and a memory cache lives only as
 long as an isolate — so it adds a shared store (KV). **React Native** is the React SDK's
 shape on a device: `fetch` and hooks, but persistent storage is `AsyncStorage` and nothing
 may throw into a UI thread.
 
-### How Experimently does it
+### How Controlvar does it
 
 **OpenFeature (JS)** — the resolution rules map the platform's `{enabled, config}` onto
 OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
@@ -303,24 +311,26 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
 ```ts
 // 📁 sdk/openfeature/src/ExperimentationProvider.ts
 /**
- * OpenFeature Provider for Experimently.
+ * OpenFeature Provider for Controlvar.
  *
  * Implements the @openfeature/server-sdk `Provider` interface on top of
- * `@getexperimently/js-sdk`. Every evaluation is decided by the
+ * `@controlvar/js-sdk`. Every evaluation is decided by the
  * server (`GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…`); the
  * JS SDK caches successful answers per user + flag for `cacheTtlMs` and never
  * caches failures.
  *
  * Resolution rules:
  *   boolean → `enabled`
- *   string  → `config.variant` when it is a string (or `config` itself when it is a string)
- *   number  → `config.value` when it is a number (or `config` itself when it is a number)
- *   object  → `config` when it is a non-null object
- *   anything else → the caller's default with reason DEFAULT; a disabled flag
- *   yields the default with reason DISABLED for non-boolean types.
+ *   string, number, object → the caller's default with reason DEFAULT. The
+ *   evaluate endpoint returns `config: null` for every flag, so there is
+ *   nothing to read. The provider would read `config.variant` (or `config`
+ *   itself, for a string), `config.value` (or `config` itself, for a number)
+ *   and `config` (for an object) if the server ever sent one.
+ *   A disabled flag yields the default with reason DISABLED for non-boolean types.
  *
  * Context mapping: `targetingKey` → `user_id`. Other context attributes are
- * NOT sent — the evaluate endpoint takes only the user id.
+ * NOT sent: the evaluate endpoint takes a `context`, which this provider does
+ * not send yet.
  *
  * Experiments and event tracking are not OpenFeature concepts; use
  * `provider.client` (the underlying JS SDK client) for `getAssignment`,
@@ -334,7 +344,11 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
   private async evaluate(flagKey: string, context: EvaluationContext | undefined): Promise<Lookup> {
     const userId = context?.targetingKey;
     if (typeof userId !== 'string' || userId.length === 0) {
-      return { ok: false, errorCode: ErrorCode.TARGETING_KEY_MISSING, errorMessage: 'targetingKey is required: it is sent to the server as user_id' };
+      return {
+        ok: false,
+        errorCode: ErrorCode.TARGETING_KEY_MISSING,
+        errorMessage: 'targetingKey is required: it is sent to the server as user_id',
+      };
     }
 
     const cached = this.client.getEvaluatedFlags(userId).includes(flagKey);
@@ -349,15 +363,29 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
       const status = (err as { status?: number })?.status;
       ...
       if (status === 404) {
-        return { ok: false, errorCode: ErrorCode.FLAG_NOT_FOUND, ...
+        return {
+          ok: false,
+          errorCode: ErrorCode.FLAG_NOT_FOUND,
+          errorMessage: `Flag "${flagKey}" not found`,
+        };
+      }
+      ...
 ```
 
-The OpenFeature provider delegates to the JavaScript SDK, reusing its caching, request deduplication
-and error handling. OpenFeature does not define experiment assignment or event tracking; those
-remain available through `provider.client`. The provider maps a cache hit to OpenFeature's `CACHED`
-reason. The Python provider uses the corresponding resolution methods and reasons. The JavaScript
-package is `@getexperimently/openfeature-provider`, with `@openfeature/server-sdk` as a peer dependency
-so the application selects the OpenFeature version.
+Two things to notice. The provider _composes_ the JS SDK rather than reimplementing the
+contract — the cache, dedupe and error codes come for free, and the golden vectors already
+cover its hash. And it's honest about the mismatch between the standards: OpenFeature has no
+concept of experiments or events, so those are reached through `provider.client`, and the
+provider reports the SDK's cache hit as OpenFeature's `CACHED` reason. Note also what the
+docblock admits about typed values: the evaluate endpoint returns `config: null` for every
+flag, so a string, number or object resolution returns the caller's default with reason
+`DEFAULT` today; the provider reads `config.variant` / `config.value` / `config` only so that
+it keeps working if the server ever sends a config. The Python provider mirrors it
+(`resolve_boolean_details` etc., `Reason.CACHED` / `TARGETING_MATCH` / `DISABLED` /
+`ERROR`), and the same docblock rules apply. The JS provider is the package
+`@controlvar/openfeature-provider` and takes `@openfeature/server-sdk` as a peer
+dependency, so the application chooses the OpenFeature version; the Python one is
+`controlvar-openfeature` (module `controlvar_openfeature`).
 
 The server once had OpenFeature-shaped routes of its own. The evaluate routes were removed in
 #345 (they never returned a result), and the flag listing under `/api/v1/openfeature/` was
@@ -485,7 +513,7 @@ side: the Cloudflare adapter is a KV-backed `EdgeStore` whose `get` / `put` map 
 ### Key takeaways
 
 - OpenFeature providers compose the JS/Python SDK, map `targetingKey` → `user_id`, resolve
-  boolean from `enabled` and typed values from `config`, report `CACHED` on SDK cache hits;
+  boolean from `enabled` (typed values would come from `config`, which the server leaves null today), report `CACHED` on SDK cache hits;
   experiments and tracking go through the underlying client.
 - Edge: no Node built-ins, 500 ms timeout, 60 s TTL, memory → KV → network, never throws.
   The bootstrap route is removed (#770); the adapters keep no-op shims.
@@ -512,14 +540,14 @@ drift liability, and the cost of drift in an experimentation system is not a cra
 SRM you can't explain.** It also shows the two ways to close drift: make the implementations
 agree by contract, or delete one of them. The project did both.
 
-### How Experimently does it
+### How Controlvar does it
 
 **Act 1 — the hash finding.** Nobody had compared the bucketing functions with each other.
 When someone did, there were four, and they disagreed. The finding is recorded in the message
 of commit `b46e5259`, and the backend's hash module keeps the record in its docstring. (The
-`#81` in the quoted docstrings is a number from the project's tracker before it moved to
-`getexperimently/experimently`; on the current tracker the same number names another item, so
-read the commits instead.)
+`#81`, `#241` and `#737` in the quoted docstrings are numbers from the project's tracker
+before it moved to `Controlvar/controlvar`; on the current tracker the same numbers name other
+items, so read the commits instead.)
 
 ```python
 # 📁 backend/app/core/consistent_hash.py
@@ -637,7 +665,7 @@ Experiment assignment happens only in the API (`POST /api/v1/tracking/assign`), 
 the global holdout, mutual exclusion groups and targeting.
 ```
 
-and `test_nothing_deploys_backend_lambda` in `infrastructure/tests/test_lambda_functions_doc.py`
+and `test_nothing_deploys_backend_lambda` in `infrastructure/tests/test_lambda_functions_deployed.py`
 pins it. Precisely: no stack deploys a handler from `backend/lambda/`; the assignment Lambda
 was removed (#606). The stacks do deploy placeholder or inline functions —
 `DatabaseAccessLambda` in the compute stack in every environment, and in a full checkout
@@ -648,7 +676,7 @@ the Glue jobs). What remains under `backend/lambda/` — `event_processor/`,
 **One decider, many readers.** The pattern that _doesn't_ drift is the one the bandit
 scheduler uses. It can read per-variant counters from DynamoDB, an optional module, before
 PostgreSQL — but only when they are at least as complete as PostgreSQL's for every variant
-(#426); otherwise it counts assignments and converting users in PostgreSQL itself. Those
+(the stats-source order is in `backend/app/core/bandit_scheduler.py`'s module docstring); otherwise it counts assignments and converting users in PostgreSQL itself. Those
 counters were meant to be written by the event-processor Lambda from the Kinesis stream;
 that Lambda is not deployed, and the analytics stack's Kinesis consumer is a placeholder.
 Either way it is a data path, not a decision path: readers count what the one decider
@@ -712,8 +740,7 @@ Exercise E3.5 measures the agreement rate between the two deciders.
 Endpoints/bodies/headers; per-user+key cache with TTL, successes only; the fan-out rule;
 the failure policy (loud detailed call, safe convenience call, `track` never fails); the
 hash and its golden vectors. Two more rows are part of the contract but not yet met by every
-port: sending `context` on flag evaluation (#438) and passing `assigned`/`reason` through
-(#316).
+port: sending `context` on flag evaluation and passing `assigned`/`reason` through.
 
 **Q2. Go returns `(&EvalResult{Enabled:false}, err)` on failure. Which two contract
 behaviours does that single return satisfy?**
@@ -835,7 +862,7 @@ agree = sum(
 print(agree / len(users))                     # ~0.5: independent functions
 ```
 
-Agreement is about 0.5 (0.4996 over 10,000 users at the reference commit) — the two are
+Agreement is about 0.5 (0.4996 over 10,000 users at v0.36.4) — the two are
 independent. Aligning the Lambda would have meant porting the hash _and_ the holdout, mutual
 exclusion and targeting gates, and keeping them aligned for ever, for a function no stack
 deployed. Deleting it left one decider; that is the cheaper invariant.

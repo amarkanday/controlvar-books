@@ -4,11 +4,16 @@
 
 [← Part III](./part-3-sixteen-sdks.md) · [Contents](./README.md)
 
-The SDK test suites check agreement at several levels. Hour 10 covers fake transports, recorded
-requests and the generated corpus for local evaluation. Hour 11 covers the `contract_smoke` entry
-points and the live-backend runner. Hour 12 reviews coverage limits, contract changes and SDK releases.
-Passing an offline test and passing a live integration test provide different evidence; both are
-useful when maintaining clients in several languages.
+Sixteen implementations of one contract are only "one SDK" if you can prove it. This Part is
+the proof machinery. Hour 10 is the unit level: fake transports and recorded requests that
+let every contract rule be asserted offline in milliseconds, and a corpus generated from the
+server that holds local evaluation to the server's answers. Hour 11 is the integration
+level: `contract_smoke`, one entry point per SDK that prints one JSON line, and the runner
+that executes them against a real backend on every pull request. Hour 12 is what to do with
+the proof — what each SDK has actually been run against, how to change a contract sixteen
+clients depend on without breaking any of them, and how an SDK is released. Have the Python
+and JavaScript SDK suites runnable (Python 3.9+ with `pytest`; Node 18 or newer with `npm ci` in
+`sdk/js`) before you start.
 
 ---
 
@@ -24,18 +29,18 @@ design rule that makes it possible is the transport seam from Hour 4: the client
 `send(method, url, headers, body, timeout) → Response`, so anything with that shape can stand
 in.
 
-The pattern pays off in three ways. Tests are fast (the Python SDK's whole suite — 187 tests
-at the reference commit, local mode included — runs in about a second). Tests are _precise_ — "the second call made no request" is an assertion on
+The pattern pays off in three ways. Tests are fast (the Python SDK's whole suite — 210 tests
+at v0.36.4, local mode included — runs in about a second). Tests are _precise_ — "the second call made no request" is an assertion on
 `transport.calls()`, not an inference from timing. And the same fake is exported for
-integrators (`experimentation.testing`), so an application's tests can drive the real SDK
+integrators (`controlvar.testing`), so an application's tests can drive the real SDK
 against scripted responses instead of mocking the SDK's methods and hoping the mock matches.
 
-### How Experimently does it
+### How Controlvar does it
 
 The fake, with its three resolution layers (FIFO queue → route table → 404):
 
 ```python
-# 📁 sdk/python/experimentation/testing.py
+# 📁 sdk/python/controlvar/testing.py
 class FakeTransport:
     """Records requests and serves canned responses (thread-safe).
 
@@ -47,15 +52,32 @@ class FakeTransport:
     3. otherwise a ``404`` with a JSON ``detail``.
     """
     ...
-    def respond(self, status: int = 200, json: Any = None, body=None, headers=None) -> "FakeTransport":
+    def respond(
+        self,
+        status: int = 200,
+        json: Any = None,
+        body: Optional[bytes] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> "FakeTransport":
         """Queue one response for the next request."""
     def fail(self, exc: Exception) -> "FakeTransport":
         """Queue an exception to be raised by the next request."""
-    def route(self, method: str, path: str, status: int = 200, json: Any = None, body=None, headers=None) -> "FakeTransport":
+    def route(
+        self,
+        method: str,
+        path: str,
+        status: int = 200,
+        json: Any = None,
+        body: Optional[bytes] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> "FakeTransport":
         """Serve a persistent response for ``method path``."""
     ...
     @property
-    def last(self) -> RecordedRequest: ...
+    def last(self) -> RecordedRequest:
+        if not self.requests:
+            raise AssertionError("FakeTransport received no requests")
+        return self.requests[-1]
     def calls(self) -> List[str]:
         """``["POST /api/v1/tracking/assign", ...]`` in order."""
 ```
@@ -66,7 +88,7 @@ test instead of silently succeeding. `RecordedRequest` parses the URL so asserti
 naturally:
 
 ```python
-# 📁 sdk/python/experimentation/testing.py
+# 📁 sdk/python/controlvar/testing.py
 @dataclass
 class RecordedRequest:
     """One request seen by :class:`FakeTransport`."""
@@ -133,8 +155,8 @@ Time without sleeping — the cache's clock is a module-level indirection so a t
 it:
 
 ```python
-# 📁 sdk/python/experimentation/cache.py
-# Indirection so tests can patch ``experimentation.cache._now``.
+# 📁 sdk/python/controlvar/cache.py
+# Indirection so tests can patch ``controlvar.cache._now``.
 _now = time.monotonic
 ```
 
@@ -142,7 +164,7 @@ _now = time.monotonic
 # 📁 sdk/python/tests/test_client.py
     def test_cache_expires_after_ttl(self, client, transport):
         flag_route(transport)
-        with mock.patch("experimentation.cache._now") as now:
+        with mock.patch("controlvar.cache._now") as now:
             now.return_value = 1000.0
             client.get_feature_flag("new_search", "user-1")
             now.return_value = 1299.0
@@ -169,8 +191,9 @@ _wait_ rather than experiencing it:
         no_sleep.assert_called_once_with(2.0)
 
     @pytest.mark.parametrize(
-        "header, expected",
+        ("header", "expected"),
         [({"Retry-After": "60"}, 5.0), ({}, 1.0), ({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}, 1.0)],
+        ids=["capped", "missing", "unparseable"],
     )
     def test_retry_after_is_capped_or_defaulted(self, client, transport, no_sleep, header, expected):
 ```
@@ -225,8 +248,8 @@ serves), and for each case it runs the flag service's own
 context. Nothing in the file is written by hand.
 ```
 
-`tests/sdk-contract/ruleset-vectors.json` holds 2,172 cases over 144 flags at the reference
-commit; 1,294 are marked `must_local`. Each SDK's suite asserts both directions — every case
+`tests/sdk-contract/ruleset-vectors.json` holds 2,191 cases over 149 flags at v0.36.4;
+1,294 are marked `must_local`. Each SDK's suite asserts both directions — every case
 is deferred or answered exactly, every `must_local` case is answered locally, and nothing
 else is — so an SDK that "plays safe" by deferring everything fails as surely as one that
 guesses:
@@ -260,8 +283,8 @@ every implementation.
 ### Try It Yourself
 
 ```bash
-cd sdk/python && python -m pytest -q -o addopts="" > /tmp/py-sdk.txt 2>&1; tail -1 /tmp/py-sdk.txt   # 187 passed at the reference commit
-cd ../js && npm ci && npx jest --silent > /tmp/js-sdk.txt 2>&1; grep '^Tests:' /tmp/js-sdk.txt      # 184 passed at the reference commit
+cd sdk/python && python -m pytest -q -o addopts="" > /tmp/py-sdk.txt 2>&1; tail -1 /tmp/py-sdk.txt   # 210 passed at v0.36.4
+cd ../js && npm ci && npx jest --silent > /tmp/js-sdk.txt 2>&1; grep '^Tests:' /tmp/js-sdk.txt      # 205 passed at v0.36.4
 ```
 
 Then write a test for a rule that isn't covered yet — say, "a 2xx with an empty body from
@@ -287,10 +310,11 @@ read `_request`'s `if not response.body: return None` to see why it passes.
 
 ### What & why
 
-The SDK changes followed failures that isolated client tests had missed: requests used nonexistent
-endpoints, and local assignment used a different hash from the backend. Live-backend tests exercise
-the connection between the implementations. They check persisted assignment stickiness, flag
-evaluation, accepted events and fan-out for events without an experiment key.
+The September rewiring was triggered by a discovery that unit tests could never have made:
+SDKs with green suites were calling endpoints that didn't exist, or bucketing locally with a
+hash the server didn't share. The fix wasn't more unit tests; it was a test that runs each
+SDK **against the real backend** and checks the things that matter — assignment is sticky
+_on the server_, the flag comes back enabled, events are accepted, key-less events fan out.
 
 The design has three parts. Every SDK has a **`contract_smoke`** entry point: a small
 program in the SDK's own language that runs the four calls and prints **one JSON line** to
@@ -300,8 +324,8 @@ validates the JSON, and prints a PASS/FAIL/SKIP table. And a **CI job** starts P
 Redis and the backend, seeds fixtures, and runs the runner with `--strict` for every SDK
 whose toolchain is available on Linux — as a required check on every pull request.
 
-The "one JSON line" contract is what makes sixteen SDKs testable by one Python script (378
-lines at the reference commit): the runner never parses Go or Swift output formats, only
+The "one JSON line" contract is what makes sixteen SDKs testable by one Python script (445
+lines at v0.36.4): the runner never parses Go or Swift output formats, only
 JSON. Since local evaluation arrived it does two more things, both on the server's side of
 the contract. **Before** the SDKs it checks `GET /api/v1/sdk/ruleset` once: the plain key
 gets 403, the `sdk:ruleset` key gets 200 with the contract flag marked `local`, and sending
@@ -312,7 +336,7 @@ the server, and the safety denominator must have grown by exactly the number of 
 evaluations. That is why the runner now needs the backend's Python environment and the
 `POSTGRES_*` variables.
 
-### How Experimently does it
+### How Controlvar does it
 
 The smoke for Python, which sets the pattern — note step 1 _clears the cache between two
 assigns_ so the second call really reaches the server, which is the only way to prove
@@ -351,13 +375,22 @@ stickiness is the server's and not the client cache's:
     if not client.track(user_id, "page_view", properties={"page": "/smoke"}):
         fail("track(page_view) without a key was not accepted")
     ...
-    print(json.dumps({
-        "sdk": "python",
-        "assign": {"variant_name": first.variant_name, "is_control": first.is_control, "sticky": sticky},
-        "flag": {"enabled": flag.enabled},
-        "track": {"ok": True},
-        "fanout": {"ok": True},
-    }, separators=(",", ":")))
+    print(
+        json.dumps(
+            {
+                "sdk": "python",
+                "assign": {
+                    "variant_name": first.variant_name,
+                    "is_control": first.is_control,
+                    "sticky": sticky,
+                },
+                "flag": {"enabled": flag.enabled},
+                "track": {"ok": True},
+                "fanout": {"ok": True},
+            },
+            separators=(",", ":"),
+        )
+    )
 ```
 
 Step 4 depends on step 1 and 2 having populated the cache — the smoke tests the fan-out rule
@@ -402,7 +435,7 @@ MANIFEST: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 # SDKs with a local-evaluation mode -> the command that runs their local smoke
-# (with EXPERIMENTLY_LOCAL_API_KEY set). Run after every SDK above, because the
+# (with CONTROLVAR_LOCAL_API_KEY set). Run after every SDK above, because the
 # errors it posts count against the shared contract flag.
 LOCAL_MANIFEST: dict[str, tuple[str, tuple[str, ...]]] = {
     "python": ("python sdk/python/examples/local_eval_smoke.py", ("python",)),
@@ -487,10 +520,12 @@ def run_one(sdk: str, command: str, env: dict[str, str], timeout: int) -> tuple[
 
 The fixtures come from one seed script — an ACTIVE experiment `sdk_contract_ab` with
 control/treatment, an ACTIVE flag `sdk_contract_flag` at 100%, and two API keys: a plain one
-written to `tests/sdk-contract/live/.api_key` (or `EXPERIMENTLY_API_KEY`), and one with the
-`sdk:ruleset` scope written to `tests/sdk-contract/live/.api_key_local` (or
-`EXPERIMENTLY_LOCAL_API_KEY`). Two keys, so the run can show the ruleset refusing the first
-and serving the second.
+written to `tests/sdk-contract/live/.api_key` (or taken from `CONTROLVAR_API_KEY`), and one
+with the `sdk:ruleset` scope written to `tests/sdk-contract/live/.api_key_local` (or taken
+from `CONTROLVAR_LOCAL_API_KEY`). Two keys, so the run can show the ruleset refusing the first
+and serving the second. (The runner still accepts the old `EXPERIMENTLY_*` spellings as a
+fallback, and hands the SDKs it runs a decoy value under those names: an SDK that still read
+the old name would call a dead URL and fail its smoke.)
 
 The CI job is now a call to a reusable workflow, `_platform.yml`, which owns the whole boot
 sequence (services, migrations, the seed, the API, a check that the API is running the
@@ -585,16 +620,17 @@ the fixture is what the seed promised.
 
 ### What & why
 
-Changing a shared contract requires coordination across SDKs and releases. A renamed response
-field, a new endpoint or a revised fan-out policy can affect several independently maintained
-clients. This lesson records what each SDK has been tested against, explains how to assess and
-sequence a contract change, and describes the per-SDK release process.
+The last hour is process, because the hardest part of sixteen SDKs is not writing them — it's
+_changing_ them. A field renamed on the server is sixteen releases; a new endpoint is sixteen
+features; a fix to the fan-out rule is sixteen chances to introduce a behavioural fork. The
+platform's defences are a clear record of **how much each SDK has actually been run**, a
+**drift discipline** for what counts as a contract change, an **order of operations** for
+making one, and a **release path** that ships one SDK at a time.
 
-### How Experimently does it
+### How Controlvar does it
 
 **What each SDK has been run against.** There are three levels of proof, and the strongest
-one is written in a workflow, not in a document. Read it from the code at the reference
-commit:
+one is written in a workflow, not in a document. Read it from the code at v0.36.4:
 
 | SDK | Live contract in CI (`pr-qa-gate.yml`) | Golden vectors (`hash_contract.py`) | Local mode |
 |---|---|---|---|
@@ -620,11 +656,11 @@ exercised by their unit suites in the SDK unit-test workflow, and by the harness
 machine that has their toolchain (`--sdk ios`, `--sdk elixir`, `--sdk flutter`). The runner's
 `SKIP` status exists so that "not run here" is never misreported as "passing".
 
-The prose status table in the app's `docs/sdk-guide.md` is the second copy of this fact, and
-at the reference commit it shows exactly the drift the Watch Out below predicts: it still
-grades Android "not yet" and React Native "unit tests only", although the CI job runs both,
-and its unit-test counts are older than the suites (the Python suite has 187 tests at the
-reference commit). When the document and the workflow disagree, the workflow is what ran.
+The prose status table in the app's `docs/sdk-guide.md` is the second copy of this fact. It
+has drifted before — when Android and React Native joined the CI job, the table kept calling
+them "not yet" and "unit tests only" — and at v0.36.4 it agrees with the workflow again
+(Exercise E4.4 is the script that checks). When the document and the workflow disagree, the
+workflow is what ran.
 
 **What counts as a contract change.** Anything an SDK unit test would have to change to stay
 green: a field name or type in any of the four responses; a status code's meaning (404 vs
@@ -636,9 +672,9 @@ adding a new `reason` value (SDKs pass it through as a string); changing rate li
 already handle 429).
 
 `assigned` and `reason` on the assign response are the worked example of an additive change
-(#315): the server added them, old SDKs ignored them, the JavaScript and Python SDKs started
-reading them — and, being careful, read a _missing_ field as "unknown" rather than `false`.
-The other ports have not followed yet (#316), which is what "port to the rest" in step 4 below
+(the server added them, old SDKs ignored them, the JavaScript and Python SDKs started
+reading them — and, being careful, read a _missing_ field as "unknown" rather than `false`).
+The other ports have not followed yet, which is what "port to the rest" in step 4 below
 looks like while it is still in progress.
 
 **The order of operations** for a real contract change, derived from how the rewiring was
@@ -652,7 +688,8 @@ done:
    JSON line, a new `validate()` check). Run the harness locally for the references.
 4. **Port to the rest**, by the Hour 7 table — invariants first, idiom second — and run each
    SDK's suite plus the harness for every toolchain you have. Open an issue for every port
-   you did not reach, so the gap is visible (#316 and #438 are two such issues).
+   you did not reach, so the gap is visible (the `assigned`/`reason` fields and the
+   flag-evaluation `context` of Hour 7 are two such gaps).
 5. **Deprecate, then remove the old behaviour on the server**, in a separate, later change,
    after the SDK releases that stop using it. Old SDK versions in the wild keep working until
    then.
@@ -731,32 +768,32 @@ _is_ the release, because `go get` resolves it. An `unwired` SDK has a real mani
 publishing identity yet, so tagging one is **refused** rather than going green having
 published nothing.
 
-The registry names and the versions in the manifests at the reference commit:
+The registry names and the versions in the manifests at v0.36.4:
 
 | Directory | Registry name | Manifest version |
 |---|---|---|
-| `sdk/js` | npm `@getexperimently/js-sdk` | 0.1.0 |
-| `sdk/react` | npm `@getexperimently/react-sdk` | 1.1.0 |
-| `sdk/edge` | npm `@getexperimently/edge-sdk` | 0.2.0 |
-| `sdk/react-native` | npm `@getexperimently/react-native-sdk` | 0.1.0 |
-| `sdk/openfeature` | npm `@getexperimently/openfeature-provider` | 0.1.0 |
-| `sdk/python` | PyPI `experimently` (imported as `experimentation`) | 0.1.0 |
-| `sdk/openfeature-python` | PyPI `experimently-openfeature` | 0.1.0 |
-| `sdk/go` | module `github.com/getexperimently/experimently/sdk/go` | the tag |
+| `sdk/js` | npm `@controlvar/js-sdk` | 0.1.1 |
+| `sdk/react` | npm `@controlvar/react-sdk` | 1.1.0 |
+| `sdk/edge` | npm `@controlvar/edge-sdk` | 0.2.0 |
+| `sdk/react-native` | npm `@controlvar/react-native-sdk` | 0.1.0 |
+| `sdk/openfeature` | npm `@controlvar/openfeature-provider` | 0.1.0 |
+| `sdk/python` | PyPI `controlvar` (imported as `controlvar`) | 0.1.1 |
+| `sdk/openfeature-python` | PyPI `controlvar-openfeature` | 0.1.0 |
+| `sdk/go` | module `github.com/controlvar/controlvar/sdk/go` | the tag |
 
-**Nothing has been published yet.** At the reference commit no SDK release tag has been
-pushed: the npm names return 404, and the PyPI names (and NuGet's `Experimently.SDK`) are held
-by 0.0.0 placeholder packages that say "not released yet" and contain no client. So
-`npm install @getexperimently/js-sdk` fails and `pip install experimently` installs only the
-placeholder. Every SDK page in the app's docs gives a from-source route instead; for the two
-references:
+**Two of the sixteen are published.** At v0.36.4 the repository carries release tags
+of the form above for Python (0.1.0 and 0.1.1) and JavaScript (0.1.1), and the app's SDK guide says
+the two reference SDKs are on their registries (beta): `pip install controlvar==0.1.1` and
+`npm install @controlvar/js-sdk@0.1.1`. Every other SDK page says "Not yet published" and
+gives a from-source route instead (the Python OpenFeature name, `controlvar-openfeature`,
+holds only a `0.0.0` placeholder that contains no client). If you installed the package under
+its old name, `experimently`, uninstall it first. To work on the references themselves:
 
 ```bash
-# Python: from a clone, or straight from the repository
+# Python: editable install from a clone
 pip install -e sdk/python
-pip install "experimently @ git+https://github.com/getexperimently/experimently.git#subdirectory=sdk/python"
 # JavaScript: build and pack, then install the tarball in your app
-cd sdk/js && npm ci && npm run build && npm pack      # writes getexperimently-js-sdk-0.1.0.tgz
+cd sdk/js && npm ci && npm run build && npm pack      # writes controlvar-js-sdk-0.1.1.tgz
 ```
 
 The first publish of each package is an irreversible act — a version number on PyPI or npm can
@@ -808,7 +845,8 @@ python scripts/check_sdk_version.py java --expect 1.0.0      # refused: java has
   deprecate, then remove (as #345/#495 → #770 did) → `ENGINE_VERSION` if numbers changed
   meaning.
 - Releases: one tag per SDK (`sdk/<name>/vX.Y.Z`), trusted publishing for PyPI and npm, Go by
-  tag, everything else refused until wired. Nothing is published yet; install from source.
+  tag, everything else refused until wired. At v0.36.4 the Python and JavaScript SDKs are
+  published; install the rest from source.
 - Keep policy on the server; the SDK stays a cache in front of four calls.
 
 ---
@@ -876,7 +914,7 @@ harness; read the failure line; then read the backend log for the corresponding 
 
 **E4.4 — Status hygiene.** Write a tiny script that parses the `sdks:` list out of
 `pr-qa-gate.yml` and the "Verified live" column out of `docs/sdk-guide.md`, and fails if
-the two disagree in either direction. Run it at the reference commit and read what it finds.
+the two disagree in either direction. Run it at v0.36.4 and read what it finds.
 Propose where in CI it would run.
 
 **E4.5 — Change plan.** Write the six-step order-of-operations plan for adding a new
@@ -923,11 +961,12 @@ print("CI runs, the guide does not claim:", sorted(ci - claimed))
 print("the guide claims, CI does not run:", sorted(claimed - ci))
 ```
 
-At the reference commit the first line names `android` and `react-native` (the guide's stale
-rows) and the second names `ios`, which the guide calls "yes" from a run on a developer's
-machine — a third grade the script should learn rather than flag. (The guide lists the
-`openfeature-python` provider under the `sdk/openfeature-python` row, so directory names match
-the job's names here; check that before trusting a clean result.) Run it as a step in the
+At v0.36.4 both lists come back empty: the guide and the workflow agree, and that is the
+state the script exists to protect. (Check that the script is not vacuous before trusting a
+clean result — it should have parsed 16 rows and 13 CI names — and plant a disagreement,
+such as deleting `dotnet` from the `sdks:` list, to watch both lines fire. The guide's
+`openfeature-python` row uses the same directory name as the job, so names match without a
+translation table.) Run it as a step in the
 `SDK Contract Tests` job, next to the golden vectors: cheap, offline, and it fails the PR
 that lets the two facts diverge.
 

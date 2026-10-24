@@ -4,10 +4,13 @@
 
 [Contents](./README.md) · [Part II →](./part-2-building-a-client.md)
 
-The SDK contract defines which decisions belong to the server and how clients request them.
-Hour 1 covers the four main endpoints. Hour 2 examines the shared hash function, golden test vectors
-and the server's adoption of that function for experiment assignment. Hour 3 covers caching,
-assignment fan-out, network failures and the conditions under which an SDK may evaluate a flag locally.
+Before a line of client code, the agreement. This Part is the contract every Controlvar SDK
+implements: the four endpoints and the one rule that governs them (Hour 1); the hash that
+every SDK exports and the golden vectors that pin it, together with the story of how the
+server came to use that same hash for experiment assignment (Hour 2); and the semantics that
+make sixteen implementations behave as one — what's cached, what fans out, what happens when
+the network is gone, and when an SDK may answer a flag itself (Hour 3). Have a clone of
+`Controlvar/controlvar` at `v0.36.4` open: the Try-It sections run against it.
 
 ---
 
@@ -15,9 +18,10 @@ assignment fan-out, network failures and the conditions under which an SDK may e
 
 ### What & why
 
-Product code uses the SDK to obtain experiment assignments, evaluate feature flags and record
-events. The main contract provides four API-key-authenticated HTTP endpoints. Requests identify
-experiments and flags by their public keys:
+An experimentation SDK has to answer three questions for product code: _which variant is this
+user in?_, _is this flag on for this user?_, and _record that this user did X_. Everything
+else is convenience. Controlvar's contract answers them with four HTTP endpoints,
+authenticated with an API key, addressing experiments and flags by their public **keys**:
 
 | Purpose | Method and path | Body / query | Response |
 |---|---|---|---|
@@ -63,7 +67,7 @@ Three reasons, in order of importance:
    the server's `targeting_adapter` evaluates them in three shapes; the SDK sends `context`
    and reads `reason`. Adding an operator to the rules engine changes nothing client-side.
 
-### How Experimently does it
+### How Controlvar does it
 
 The assign endpoint, with the eligibility semantics spelled out in its docstring:
 
@@ -117,7 +121,9 @@ Flag evaluation, with the same "inactive is not an error" rule:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/feature_flags.py
-def _evaluate_flag_by_key(db: Session, flag_key: str, user_id: str, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _evaluate_flag_by_key(
+    db: Session, flag_key: str, user_id: str, context: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
     """Shared body of the GET and POST evaluate endpoints.
 
     A flag that exists but is not ACTIVE (disabled with the kill switch,
@@ -127,7 +133,10 @@ def _evaluate_flag_by_key(db: Session, flag_key: str, user_id: str, context: Opt
     """
     db_flag = db.query(FeatureFlag).filter(FeatureFlag.key == flag_key).first()
     if not db_flag:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Feature flag with key '{flag_key}' not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Feature flag with key '{flag_key}' not found",
+        )
 
     feature_flag_service = FeatureFlagService(db)
     evaluation = feature_flag_service.evaluate_flag_detailed(db_flag, user_id, context)
@@ -158,15 +167,35 @@ The API key dependency — hashed lookup, user must be active:
 # 📁 backend/app/api/deps.py
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 ...
-def get_api_key(db: Session = Depends(get_db), api_key_header: str = Depends(API_KEY_HEADER)) -> Optional[User]:
+def get_api_key(
+    db: Session = Depends(get_db), api_key_header: str = Depends(API_KEY_HEADER)
+) -> Optional[User]:
+    ...
     if not api_key_header:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key missing", headers={"WWW-Authenticate": "APIKey"})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key missing",
+            headers={"WWW-Authenticate": "APIKey"},
+        )
 
     # Look up by hashed key only. API keys must never be stored as plaintext.
     api_key_hash = hash_api_key(api_key_header)
     api_key = db.query(APIKey).filter(APIKey.key == api_key_hash).first()
     if not api_key or not api_key.is_valid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key", headers={"WWW-Authenticate": "APIKey"})
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+            headers={"WWW-Authenticate": "APIKey"},
+        )
+
+    # Get associated user
+    user = db.query(User).filter(User.id == api_key.user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+            headers={"WWW-Authenticate": "APIKey"},
+        )
 ```
 
 A valid key is enough for the four endpoints. The two local-evaluation routes also require
@@ -182,7 +211,11 @@ time** from the user's assignment row, so the SDK never sends a variant:
 ```python
 # 📁 backend/app/api/v1/endpoints/tracking.py
     if request.experiment_key:
-        experiment = db.query(Experiment).filter(Experiment.key == request.experiment_key).first()
+        experiment = (
+            db.query(Experiment)
+            .filter(Experiment.key == request.experiment_key)
+            .first()
+        )
 
         if experiment:
             experiment_id = experiment.id
@@ -190,7 +223,10 @@ time** from the user's assignment row, so the SDK never sends a variant:
             # Find variant if user has an assignment
             assignment = (
                 db.query(Assignment)
-                .filter(Assignment.experiment_id == experiment_id, Assignment.user_id == request.user_id)
+                .filter(
+                    Assignment.experiment_id == experiment_id,
+                    Assignment.user_id == request.user_id,
+                )
                 .order_by(Assignment.created_at.desc())
                 .first()
             )
@@ -265,7 +301,7 @@ with a request ID that is also in the `X-Request-ID` header (quote it when you r
 
 ### What & why
 
-Every Experimently SDK exports a function — `consistent_hash` / `consistentHash` /
+Every Controlvar SDK exports a function — `consistent_hash` / `consistentHash` /
 `ConsistentHash.compute` / `hashUser` — that maps `(user_id, key)` to a float in `[0, 1)`:
 
 1. Concatenate `"{user_id}:{key}"`, UTF-8 encode.
@@ -284,12 +320,12 @@ details right?"
 
 Then the story turned. Measuring the server against the SDKs showed that the server's _own_
 experiment assignment used a different function: the whole 128-bit digest `% 100`, salted
-with the experiment's UUID, which no client has. Issue #81 recorded the disagreement, and the
-fix (#282, commit `b46e5259`) moved the server to the SDK function: **new experiment
-assignments on the server now use exactly the golden-vector hash**, over
-`"{user_id}:{experiment.key}"`. (Those two numbers are from the project's tracker before it
-moved to `getexperimently/experimently`; on the current tracker the same numbers name other
-items, so read the commits.) Hour 9 tells the whole story.
+with the experiment's UUID, which no client has. An issue recorded the disagreement, and the
+fix (commit `b46e5259`, "one consistent hash, the one every SDK implements") moved the server
+to the SDK function: **new experiment assignments on the server now use exactly the
+golden-vector hash**, over `"{user_id}:{experiment.key}"`. (Controlvar was called Experimently
+before 0.35.0, and the project's tracker was renumbered when it moved, so this book cites
+commits, which are stable, rather than issue numbers.) Hour 9 tells the whole story.
 
 So the hash is now a contract between the SDKs and the server's experiment assignment. The
 SDKs still never use it to decide anything: they ask the server. And it is **not** the only
@@ -300,7 +336,7 @@ Hence the **golden vectors**: a JSON file of `(user_id, flag_key) → md5_hex, e
 pairs, plus rollout inclusion vectors at 3/5/50/100%, that every SDK and the backend are
 checked against.
 
-### How Experimently does it
+### How Controlvar does it
 
 The vectors, with the algorithm written into the file so no reader needs the docs:
 
@@ -339,14 +375,14 @@ The vectors, with the algorithm written into the file so no reader needs the doc
 The reference implementation in the Python SDK, whose docstring now says what it is not:
 
 ```python
-# 📁 sdk/python/experimentation/hashing.py
+# 📁 sdk/python/controlvar/hashing.py
 """Cross-SDK MD5 consistent hash.
 
 This is exported as a utility so that ``{user_id}:{flag_key}`` buckets can be
 reproduced offline (and verified against ``tests/sdk-contract/golden-vectors.json``).
 It is NOT the function the server buckets flag rollouts with (that is
 ``int(md5(...).hexdigest(), 16) % 100``, "md5-mod100-v1", which local
-evaluation reproduces in :mod:`experimentation.evaluator`), and nothing in the
+evaluation reproduces in :mod:`controlvar.evaluator`), and nothing in the
 client uses it to decide a variant or a flag.
 ...
 """
@@ -391,7 +427,7 @@ func ConsistentHash(userID, key string) float64 {
 ```
 
 ```java
-// 📁 sdk/java/core/src/main/java/com/getexperimently/sdk/ConsistentHash.java
+// 📁 sdk/java/core/src/main/java/com/controlvar/sdk/ConsistentHash.java
             // Little-endian unsigned 32-bit integer from the first 4 bytes
             // (Python: struct.unpack('<I', digest[:4])[0]).
             long hash = ((bytes[0] & 0xFFL))
@@ -501,9 +537,9 @@ def test_the_whole_digest_modulo_100_is_a_different_answer():
     assert old == 79
 ```
 
-When the change landed, each defect it guards against was planted and the suite watched:
-reading the bytes big-endian failed 3 tests, the old whole-digest `% 100` failed 3, and
-dropping the key from the input failed 4.
+A test like this is only worth having if you have seen it fail. Plant each defect it guards
+against — read the bytes big-endian, restore the old whole-digest `% 100`, drop the key from
+the input — and watch the suite go red (the Try It below lets you do the first).
 
 > **Did You Know?** There used to be a _fourth_ function. The assignment Lambda under
 > `backend/lambda/` salted the key with `_variant` and divided by 2³² − 1, and agreed with
@@ -511,10 +547,10 @@ dropping the key from the input failed 4.
 
 ### Try It Yourself
 
-From a clone of `getexperimently/experimently`:
+From a clone of `Controlvar/controlvar` (checked out at `v0.36.4`):
 
 ```bash
-cd experimently
+cd controlvar
 python tests/sdk-contract/hash_contract.py --list
 python tests/sdk-contract/hash_contract.py python          # add js edge react-native go once they are built
 python -m pytest tests/sdk-contract -q -o addopts=""
@@ -550,10 +586,11 @@ Then write the hash in a language you know that isn't in `sdk/` (bash with `md5s
 
 ### What & why
 
-Even with server-side decisions, clients need consistent policies for caching, concurrent
-requests, events without an explicit experiment and network failures. The JavaScript and Python
-SDKs also support optional local flag evaluation. The SDK guide defines the behavior expected
-across implementations:
+If the server decides, an SDK's design questions are all about the _in-between_: how long to
+believe an answer, what to do while waiting, what to send when the caller didn't say which
+experiment an event belongs to, what to do when the server is unreachable, and — for two
+SDKs — when a flag may be answered without asking. The SDK guide fixes one answer to each,
+and every port implements it:
 
 **Cache.** Successful assignments and evaluations are cached **per user + key** for
 `cache_ttl` (default 300 s; the edge SDK 60 s). **Failures are never cached** — a transient
@@ -581,13 +618,13 @@ the funnel — but the SDK does, because it served them. And raise-vs-swallow gi
 integrator a choice: "I need to know" (`get_assignment`, handle the error) or "just give me
 something safe" (`get_variant`).
 
-### How Experimently does it
+### How Controlvar does it
 
 The Python cache — one lock, per-user dict of per-key `(expires_at, value)`; expired entries
 are dropped on read:
 
 ```python
-# 📁 sdk/python/experimentation/cache.py
+# 📁 sdk/python/controlvar/cache.py
 """Thread-safe per-user, per-key TTL cache. Only successful results are ever stored."""
 
 class UserKeyCache(Generic[T]):
@@ -620,8 +657,18 @@ class UserKeyCache(Generic[T]):
 assignments, one for flags — and `track` reads both:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
-    def track(self, user_id, event_name, event_value=None, properties=None, experiment_key=None, feature_flag_key=None, event_type=None, timestamp=None) -> bool:
+# 📁 sdk/python/controlvar/client.py
+    def track(
+        self,
+        user_id: str,
+        event_name: str,
+        event_value: Optional[float] = None,
+        properties: Optional[Mapping[str, Any]] = None,
+        experiment_key: Optional[str] = None,
+        feature_flag_key: Optional[str] = None,
+        event_type: Optional[str] = None,
+        timestamp: Union[datetime, str, None] = None,
+    ) -> bool:
         """Record an event. Never raises.
 
         * With ``experiment_key`` and/or ``feature_flag_key``: one
@@ -677,8 +724,13 @@ The same rule in Go, where the cache is a single LRU and entries carry their use
 Raise vs swallow, side by side:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
-    def get_variant(self, experiment_key: str, user_id: str, user_attributes=None) -> str:
+# 📁 sdk/python/controlvar/client.py
+    def get_variant(
+        self,
+        experiment_key: str,
+        user_id: str,
+        user_attributes: Optional[Mapping[str, Any]] = None,
+    ) -> str:
         """``get_assignment(...).variant_name``, or ``default_variant`` on any failure."""
         try:
             return self.get_assignment(experiment_key, user_id, user_attributes).variant_name
@@ -686,7 +738,12 @@ Raise vs swallow, side by side:
             logger.warning("get_variant(%s, %s) failed: %s", experiment_key, user_id, exc)
             return self.default_variant
     ...
-    def is_feature_enabled(self, flag_key: str, user_id: str, user_attributes=None) -> bool:
+    def is_feature_enabled(
+        self,
+        flag_key: str,
+        user_id: str,
+        user_attributes: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
         """``get_feature_flag(...).enabled``, or ``False`` on any failure."""
         try:
             return self.get_feature_flag(flag_key, user_id, user_attributes).enabled
@@ -699,7 +756,7 @@ and the error type that makes "raise" useful — status and body attached, `None
 network failures:
 
 ```python
-# 📁 sdk/python/experimentation/types.py
+# 📁 sdk/python/controlvar/types.py
 class ExperimentationError(Exception):
     """Raised by ``get_assignment``, ``get_feature_flag``, ``get_all_flags`` and
     ``get_assignments`` when the API call fails.
@@ -714,7 +771,7 @@ class ExperimentationError(Exception):
 The 429 policy — one retry, `Retry-After` honoured and capped:
 
 ```python
-# 📁 sdk/python/experimentation/client.py
+# 📁 sdk/python/controlvar/client.py
 #: Upper bound honoured for a ``Retry-After`` header on 429.
 MAX_RETRY_AFTER_SECONDS = 5.0
 #: Wait used when a 429 carries no (parseable) ``Retry-After`` header.
@@ -808,8 +865,8 @@ is Hour 10's subject.
 Offline, with the fake transport (Hour 10 has the full tour):
 
 ```python
->>> from experimentation import ExperimentationClient
->>> from experimentation.testing import FakeTransport, make_response
+>>> from controlvar import ExperimentationClient
+>>> from controlvar.testing import FakeTransport, make_response
 >>> t = FakeTransport().route("POST", "/api/v1/tracking/assign", json={"experiment_key": "exp", "user_id": "u", "variant_name": "treatment", "is_control": False, "variant_id": "v1", "configuration": None})
 >>> t.route("GET", "/api/v1/feature-flags/evaluate/f", json={"key": "f", "enabled": True, "config": None, "reason": "rollout"})
 >>> t.route("POST", "/api/v1/tracking/batch", json={"success_count": 2, "failure_count": 0, "errors": []})
@@ -831,7 +888,7 @@ True
 'control'
 >>> c.get_assignment("exp", "u")                   # raised → status 500
 Traceback (most recent call last): ...
-experimentation.types.ExperimentationError: POST /api/v1/tracking/assign failed with HTTP 500
+controlvar.types.ExperimentationError: POST /api/v1/tracking/assign failed with HTTP 500
 >>> c.cached_assignments("u")                      # failure not cached
 []
 ```
