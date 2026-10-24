@@ -1,58 +1,96 @@
 # Production Engineering
 
-### _The Experimently Edition — Decisions, Reliability and Safe Change, in 12 Hours_
+### _The Controlvar Edition — Decisions, Reliability and Safe Change, in 12 Hours_
 
-> **Preface.** This book covers engineering decisions that span Experimently's subsystems. It begins with
-> measurement and experiment design, then examines retries, schedulers, database changes,
-> authorization and data handling. The final Part covers flag retirement and a worked feature
-> review. Use it alongside the statistics, SDK and operations books when a change affects more
-> than one layer of the application.
+> **Preface.** Here are three true stories from one codebase. A user is assigned to an experiment by two
+> API processes at the same instant, the database correctly refuses the second insert, and the user gets
+> a generic 500, until someone writes the test that forces the interleaving no ordinary test can reproduce.
+> An LLM judge fails to answer, the system quietly records 0.5, and every comparison drifts toward
+> "average" without a single error in the logs. A compliance table carries a `retention_expires_at`
+> column that looks like data retention and is read by nothing at all. None of these is a statistics
+> problem or a syntax problem. Each is a gap between what something is *called* and what it *does*, and
+> each was found, fixed and pinned by a test in Controlvar, the open-source A/B testing and feature-flag
+> platform this library uses as its reference codebase.
 >
-> Verified against getexperimently/experimently at `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
-> (source review, 2026-10-23). Other books retain the reference commits named in their own READMEs.
+> This book is about that gap. It is the one volume in the library that crosses the layers: it starts with
+> measurement and the shape of a decision, moves through retries, schedulers, schema changes, security,
+> privacy and retention, and ends with the discipline of changing a running system and proving you did
+> it safely. It is not a survey. In every lesson you will read the lines of real source that implement
+> (or fail to implement) the property, run small pieces of the backend yourself, and plant a defect to
+> watch a guard fire. By the end you should be able to take a proposed change, say which surfaces it
+> touches, which claims are implemented and which are only intended, what evidence supports each, and what
+> you would do if you were wrong.
 
 ---
 
 ## Who this book is for & prerequisites
 
-- Engineers changing the API, dashboard, tracking, schedulers, storage or SDK contract.
-- Experiment owners who need a defensible decision and a rollout/removal handoff.
-- Engineers reviewing authorization, data flow, retention or operational failure behavior.
-- Prerequisites: the **core four**, especially the Build book's assignment/event loop, API and data
-  model. Experienced engineers can use the task routes below with a clone of the app open alongside.
+- Engineers changing the API, dashboard, tracking, schedulers, storage or SDK contract of a system like
+  Controlvar, and engineers reviewing such changes.
+- Experiment owners who need a defensible decision and a rollout-and-removal handoff.
+- Engineers reviewing authorization, data flow, retention or operational failure behaviour.
+- Prerequisites: the **core four** (Python, FastAPI, React/Next.js, and the Build a Platform book),
+  especially the Build book's assignment-and-event loop, the API and the data model. Experienced engineers
+  can jump to a lesson by task (see the table below) with a clone of the app open alongside. You need
+  Python 3.11, a virtual environment with the app's `backend/requirements.txt`, and a clone of
+  `Controlvar/controlvar` at tag `v0.36.4`. No database, browser or cloud account is needed for the
+  hands-on blocks, which run real pieces of the backend in isolation.
 
 ## How to use this book
 
-The 12 lessons are grouped into four Parts. Each explains a problem, examines the implementation
-and provides an exercise with a worked answer. Workshops review the material through questions,
-quizzes and additional exercises. Each lesson identifies a document or result to produce during
-review. Allow extra time for exercises that require a local stack.
+There are 12 lessons in four Parts of three Hours each:
 
-Source links are pinned to the reviewed app commit. “Implemented” describes that snapshot;
-“recommended practice” describes a procedure, not an automatic platform feature. Worked data and
-hypothetical changes are illustrative. No production operations, paid provider calls or live-stack
-exercises were run for this edition. Use a disposable environment and the existing
-[onboarding guide](../guides/onboarding.md) for exercises involving the app.
+- **Part I — Experiment Design and Decisions** (Hours 1–3)
+- **Part II — Reliable Systems** (Hours 4–6)
+- **Part III — Security and Privacy** (Hours 7–9)
+- **Part IV — Safe Change** (Hours 10–12)
 
-The book's [source manifest](../tools/production-engineering-sources.json) records each Part's
-reference commit, review date and app source paths. After an implementation change, compare those
-paths between revisions, review behavioral changes, and update the text, pinned links and manifest
-together. Keep the older books' references unchanged unless you audit their content too. The optional
-[docs tools](../tools/README.md) remain local checks; this book adds no CI/CD configuration.
+Every lesson has the same rhythm:
 
-To run the local docs checks for this book, set `EXPERIMENTLY_APP` to your app checkout as described
-in the tools guide, then use the book's reviewed reference:
+1. **What & why**: the general idea first, then why it matters, and a real Controlvar story that makes it
+   concrete.
+2. **How Controlvar does it**: real excerpts from the source, each followed by what to notice.
+3. **Try It Yourself**: exact commands, the expected output, and a reasoning exercise with a worked answer.
+4. **Key takeaways**, and a **review artifact**: a document or result you could hand to a reviewer.
 
-```bash
-REF=07a430df5b54b0e5dd71ddca95071ced05e9e36c make check SCOPE=production-engineering
-```
+Along the way, sidebars flag a **By the Way** (context), a **Watch Out!** (a trap) or a **Did You Know?**
+(a surprising fact). Each Part ends with a **Workshop**: questions and answers, a quiz, exercises and
+solutions.
 
-This scopes the app-dependent checks to this book and still checks links across the whole library.
-It does not re-verify the older books against the newer commit.
+Two words are used with care throughout. **Implemented** means you can point at the line of code or the
+test at v0.36.4. **Recommended practice** means a procedure you must provide; the platform does not do it
+for you. Illustrative scenarios and numbers are labelled as such. When a lesson says "nothing in the code
+does X", that is a statement about what was searched for and not found, and the lesson says what the search
+was.
 
-> For each change, identify its expected behavior, affected data and access boundaries, validation
-> evidence and recovery plan. State which checks remain unverified so another reviewer can assess
-> the result without reconstructing the development history.
+> **Convention in this book.** Blocks tagged `# 📁 path` are real Controlvar source at v0.36.4, copied from
+> the file at the path; read them against a checkout of the tag. Blocks with no path are illustrative or
+> are commands to type. A line of prose that starts "Expected result" is the output of running the block
+> above it on the tag with the safety environment variables set; a notice about unset Cognito settings may
+> also appear and can be ignored. Have the app clone open at `v0.36.4`, and a terminal in its root with the
+> virtual environment active. Controlvar was called Experimently before 0.35.0, so you will still meet the
+> old name in some identifiers (the advisory-lock namespace `experimently.scheduler.`, for one). They were
+> not renamed because renaming them would change behaviour.
+
+## The one idea to anchor on
+
+**A control is what the code enforces, not what it is called.**
+
+Look at the three stories in the Preface again. A *unique index* is not a promise that the caller gets a
+clean answer. A *fallback score* is not a measurement. A *retention column* is not a retention policy. The
+same shape appears everywhere in this book: a scope named `read` that no route reads; a workspace that
+groups people and separates no data; a 0% rollout that is not a kill switch; a rolled-back flag whose
+SDK has not yet refreshed; a green test that could never have failed.
+
+So every lesson asks the same four questions of whatever it studies:
+
+1. **What does the name promise?** Say it in one sentence.
+2. **What does the code actually enforce?** Find the line, the constraint or the test.
+3. **What would prove the difference?** A planted defect, a forced interleaving, a grep with a stated
+   scope.
+4. **What do you do about the gap?** Close it, document it, or accept it with an owner.
+
+When you can answer those four for your own system, you are doing production engineering.
 
 ---
 
@@ -60,27 +98,27 @@ It does not re-verify the older books against the newer commit.
 
 ### Part I — Experiment Design and Decisions _(Hours 1–3)_ → [`part-1-experiment-design.md`](./part-1-experiment-design.md)
 
-- **Hour 1** — Measurement: populations, assignment/exposure, converting users, attribution and power
-- **Hour 2** — A complete experiment: hypothesis, instrumentation, an inconclusive result, rollout and removal
-- **Hour 3** — LLM evaluation: datasets, judges, failure accounting, cost and promotion decisions
+- **Hour 1** — Measurement and experiment design: the user who bought three times (populations, assignment and exposure, converting users, attribution and power)
+- **Hour 2** — A complete experiment: the ending nobody plans for (hypothesis, instrumentation, an inconclusive result, rollout and removal)
+- **Hour 3** — LLM evaluation engineering: the 0.5 that meant nothing (datasets, judges, failure accounting, cost and promotion decisions)
 
 ### Part II — Reliable Systems _(Hours 4–6)_ → [`part-2-reliable-systems.md`](./part-2-reliable-systems.md)
 
-- **Hour 4** — Assignments, transaction boundaries, ambiguous writes and retry policies
-- **Hour 5** — Scheduler coordination, replica failures, caches and SDK-held rulesets
-- **Hour 6** — Schema evolution, mixed versions, backfills, query plans and connection budgets
+- **Hour 4** — Assignments, transactions and retries: two requests, one user (ambiguous writes, batch results and retry policy)
+- **Hour 5** — Schedulers, replicas and stale state: five loops, one lock (advisory locks, run history, the cache that was deleted, SDK-held rulesets)
+- **Hour 6** — Database evolution and performance: the previous release is still running (expand and contract, two heads, plans, connection budgets)
 
 ### Part III — Security and Privacy _(Hours 7–9)_ → [`part-3-security-and-privacy.md`](./part-3-security-and-privacy.md)
 
-- **Hour 7** — Request authorization, actual scope enforcement, workspace boundaries and threat modeling
-- **Hour 8** — Data inventories, stable identifiers, payload minimization and downstream copies
-- **Hour 9** — Retention mechanisms, deletion scope, exports and restore behavior
+- **Hour 7** — Security engineering through the request path: the scope that checks the key you hold (scopes, roles, workspaces, threat modelling)
+- **Hour 8** — Data inventories, identifiers and minimisation: what leaves in a response (allowlists, redaction, fixed error sentences)
+- **Hour 9** — Retention, deletion and recovery: the column nobody reads (what actually runs, what a delete takes, exports, restore)
 
 ### Part IV — Safe Change _(Hours 10–12)_ → [`part-4-safe-change.md`](./part-4-safe-change.md)
 
-- **Hour 10** — Feature-flag ownership, safe defaults, rollback, compatibility and retirement
-- **Hour 11** — A worked owner-label change across API, storage, dashboard, SDKs and profiles
-- **Hour 12** — A release review: evidence, unverified checks, recovery decisions and maintenance
+- **Hour 10** — The feature-flag lifecycle: the kill switch that was not (status, targeting, rollback, archive and retirement)
+- **Hour 11** — Changing Controlvar safely: the owner's name (a real change across storage, API, dashboard, contract and profiles)
+- **Hour 12** — A release review from evidence to decision: the test that could not fail (verified, failed, unverified; recovery; handoff)
 
 ---
 
@@ -93,7 +131,7 @@ It does not re-verify the older books against the newer commit.
 | Reason about retries, replicas or stale state | Part II, Hours 4–5 |
 | Change a schema or investigate a slow analysis | Part II, Hour 6 |
 | Review an endpoint's access boundary | Part III, Hour 7 |
-| Minimize collection or verify retention/deletion scope | Part III, Hours 8–9 |
+| Minimise collection or verify retention and deletion scope | Part III, Hours 8–9 |
 | Operate and retire a flag | Part IV, Hour 10 |
 | Review a change across the product | Part IV, Hours 11–12 |
 
@@ -108,3 +146,30 @@ Specialize:                                    ├─ Experimentation Statistics
 ```
 
 _Turn to [Part I](./part-1-experiment-design.md)._
+
+---
+
+## A note on accuracy
+
+Verified against Controlvar v0.36.4 (`79f8ed18`).
+
+**What was run.** Every "Try It Yourself" block that says it needs no database was run on the tag, from a
+clean clone, in a fresh virtual environment with `backend/requirements.txt` installed and the backend's
+database and cache addresses pointed at a closed local port, and its output is the output shown. Existing
+tests named in the lessons were run on the tag and passed: the SDK-scope and flag-mutation inventories,
+the API-key scope rules, the flag-cache guard, the exception-text guard, the OpenAPI snapshot check, the
+sample-ratio and automatic-rollback-default tests, and the Python SDK's transport and client tests. The two
+planted-defect exercises (the flag-cache guard and the scope inventory) were run and failed as described.
+
+**What was not run.** Anything that needs PostgreSQL or Redis (the scheduler-lock tests, the concurrent
+first-assignment test, the migration transition tests, a real `EXPLAIN ANALYZE`), the commands that assume
+the Quick Start stack, any paid provider call, and anything that touches a cloud account. Those lessons
+read the test or the document instead and say so. Two claims are searches rather than runs: that nothing
+reads `retention_expires_at`, and that the results path has no attribution-window setting. The lessons give
+the search so you can repeat it.
+
+**How to re-check.** The library's gates check each tagged excerpt and path against the app at a pinned
+reference: see [`tools/README.md`](../tools/README.md), which names the reference tag (`v0.36.4`) and how
+to run the checks for this book. If you read this book against a later release, re-read the excerpts and
+the "Expected result" blocks first: the stability notes, the limitations page and the migration notes in the
+app's `docs/` are the places the behaviour described here is most likely to change.
