@@ -39,7 +39,7 @@ from common import ROOT, Finding, base_parser, finish, git, in_scope, normalise_
 EXTRA = [
     ("bare-account", re.compile(r"(?<![0-9A-Za-z_.-])[0-9]{12}(?![0-9A-Za-z_])"),
      "a 12-digit number shaped like an AWS account id; use 123456789012 or <account>"),
-    ("api-key", re.compile(r"\beptk_[0-9a-f]{32}\b"), "a real-shape Experimently API key"),
+    ("api-key", re.compile(r"\beptk_[0-9a-f]{32}\b"), "a real-shape Controlvar API key"),
     ("aws-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "an AWS access key id"),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"), "a GitHub token"),
 ]

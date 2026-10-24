@@ -4,7 +4,7 @@ Every gate:
   * takes optional scope paths (files or directories, relative to the repo root);
     with none, it checks the whole repository;
   * reads REF from tools/REF unless --ref is given, and refuses a moving ref;
-  * finds the app repository through --app or $EXPERIMENTLY_APP;
+  * finds the app repository through --app or $CONTROLVAR_APP (the old name $EXPERIMENTLY_APP still works);
   * exits 0 clean, 1 on findings, 2 on a setup or usage error (fail closed),
     3 when the gate is not implemented for the requested scope.
 
@@ -65,7 +65,7 @@ def base_parser(gate: str, description: str, needs_app: bool = True) -> argparse
     ap.add_argument("paths", nargs="*", help="scope: files or directories (default: whole repository)")
     if needs_app:
         ap.add_argument("--ref", help="app commit or release tag (default: tools/REF)")
-        ap.add_argument("--app", help="path to a clone of getexperimently/experimently (default: $EXPERIMENTLY_APP)")
+        ap.add_argument("--app", help="path to a clone of Controlvar/controlvar (default: $CONTROLVAR_APP)")
     return ap
 
 
@@ -75,15 +75,15 @@ def resolve_ref_and_app(args: argparse.Namespace) -> Tuple[str, Path]:
         die("no REF: pass --ref or write tools/REF")
     if not REF_SHAPE.match(ref):
         die(f"REF {ref!r} is not a pinned commit or a vX.Y.Z tag; moving refs (main, HEAD, origin/...) are refused")
-    app_s = args.app or os.environ.get("EXPERIMENTLY_APP", "")
+    app_s = args.app or os.environ.get("CONTROLVAR_APP", "") or os.environ.get("EXPERIMENTLY_APP", "")
     if not app_s:
-        die("set EXPERIMENTLY_APP (or --app) to a clone of getexperimently/experimently")
+        die("set CONTROLVAR_APP (or --app) to a clone of Controlvar/controlvar")
     app = Path(app_s).expanduser()
     if not (app / ".git").exists():
-        die("EXPERIMENTLY_APP is not a git clone")
+        die("CONTROLVAR_APP is not a git clone")
     r = git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=app, check=False)
     if r.returncode != 0:
-        die(f"REF {ref} is not in the app clone; run `git -C \"$EXPERIMENTLY_APP\" fetch --tags origin`")
+        die(f"REF {ref} is not in the app clone; run `git -C \"$CONTROLVAR_APP\" fetch --tags origin`")
     return r.stdout.decode().strip(), app
 
 
