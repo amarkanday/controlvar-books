@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run every docs gate (V1-V6) and fail if any of them fails.
 #
-#   EXPERIMENTLY_APP=<clone of getexperimently/experimently> tools/check.sh [PATH ...]
-#   make check SCOPE="guides/onboarding.md guides/usage.md"
+#   CONTROLVAR_APP=<clone of Controlvar/controlvar> tools/check.sh [PATH ...]
+#   make check SCOPE="learn-python-in-24-hours sdk-engineering"
 #
 # PATHs (relative to the repository root) scope V1, V2, V3, V5 and V6 to one
 # pull request's files. V4 (links) always checks the whole tree, because links
@@ -20,8 +20,9 @@ export PYTHONDONTWRITEBYTECODE=1
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
-if [ -z "${EXPERIMENTLY_APP:-}" ]; then
-  echo "error: set EXPERIMENTLY_APP to a clone of getexperimently/experimently" >&2
+export CONTROLVAR_APP="${CONTROLVAR_APP:-${EXPERIMENTLY_APP:-}}"
+if [ -z "$CONTROLVAR_APP" ]; then
+  echo "error: set CONTROLVAR_APP to a clone of Controlvar/controlvar" >&2
   exit 2
 fi
 

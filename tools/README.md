@@ -1,15 +1,19 @@
 # Docs gates
 
-Six checks that hold these books to the app at one pinned commit, `tools/REF`. Python 3.8+ and git, no
-packages. They read the app from a local clone of `getexperimently/experimently`:
+Six checks that hold every book to Controlvar at one pinned release, `tools/REF` (today `v0.36.4`). Python 3.8+
+and git, no packages. They read the app from a local clone of
+[`Controlvar/controlvar`](https://github.com/Controlvar/controlvar):
 
 ```bash
-git -C "$EXPERIMENTLY_APP" fetch --tags origin      # REF must be in the clone
-export EXPERIMENTLY_APP=~/src/experimently          # wherever your clone is
+git clone https://github.com/Controlvar/controlvar.git ~/src/controlvar   # once
+export CONTROLVAR_APP=~/src/controlvar              # wherever your clone is
+git -C "$CONTROLVAR_APP" fetch --tags origin        # REF must be in the clone
 git add -A                                          # V6 refuses while untracked files exist
 make check                                          # every gate, whole repository
-make check SCOPE="platform-operations"              # one pull request's directories
+make check SCOPE="platform-operations"              # one book's directory
 ```
+
+(`EXPERIMENTLY_APP`, the variable's name before the product was renamed, is still accepted.)
 
 `tools/check.sh` runs every gate even when one fails, prints a summary, and exits 0 only if all six pass.
 Exit codes per gate: 0 clean, 1 findings, 2 setup error (fails closed: a gate that scanned nothing, could not
@@ -29,7 +33,7 @@ find REF, or could not parse leak_guard's output never reports clean), 3 not imp
 ## REF
 
 `tools/REF` holds a pinned commit or a `vX.Y.Z` tag; moving refs are refused. To re-pin when a release is
-tagged, change `tools/REF`, paste `git -C "$EXPERIMENTLY_APP" diff --stat <old> <new>` into the pull request,
+tagged, change `tools/REF`, paste `git -C "$CONTROLVAR_APP" diff --stat <old> <new>` into the pull request,
 re-check the cited paths the diff touches, and paste a fresh `make check`.
 
 ## The allowlist, `tools/allow.txt`
@@ -56,11 +60,3 @@ reported as a note; remove it.
 
 Change a gate, then break the thing it guards and watch it fail, in a fresh clone after `git add -A`: plant one
 defect per rule shape, run the gate, see it fail; remove it, see it pass. A gate seen only passing is not a gate.
-
-## Book-specific source manifests
-
-`production-engineering-sources.json` records the reviewed app revision, date and source paths for
-each Part of the Production Engineering book. It is review metadata, not a new automated gate.
-The book's README documents its scoped check command using a `REF` override; the older books keep
-the global reference and their own verification notices. Update a Part's source links and manifest
-together when reviewing it against a newer app revision.
