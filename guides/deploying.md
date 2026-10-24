@@ -1,6 +1,6 @@
 # Deploying Experimently
 
-### _One Docker host, Kubernetes, or AWS: what to run, in what order, and what bites_
+### _Docker Compose and AWS: deployment procedures and operational requirements_
 
 [← experimently-docs](../README.md) · [Cutting a release](./releasing.md) · [Running the open-source project](./open-source.md) · [Troubleshooting](./troubleshooting.md)
 
@@ -9,7 +9,7 @@ breaking ones: #747, #769, #770). Commands and paths below were read from the ap
 GitHub and registry readings are dated where they appear. The app's own pages are the reference and this guide
 points at them: `docs/deployment/deployment-guide.md`, `docs/deployment/rollback-runbook.md`,
 `docs/deployment/secrets-management.md`, `docs/deployment/iam-permissions.md`, `docs/self-hosting/cdk.md`,
-`docs/self-hosting/kubernetes.md` and `docs/self-hosting/releases.md`.
+`docs/self-hosting/releases.md`.
 
 ---
 
@@ -18,8 +18,7 @@ points at them: `docs/deployment/deployment-guide.md`, `docs/deployment/rollback
 | Target | What runs it | Start here |
 |---|---|---|
 | One Docker host | `deploy/compose/compose.yml` and the published images | [§1](#1-one-docker-host-docker-compose) |
-| Kubernetes | the Helm chart in `charts/experimently` | [§2](#2-kubernetes-helm) |
-| AWS, the project's own path | the CDK app in `infrastructure/cdk` and three GitHub workflows: Deploy, Rollback, Database Migration | [§3](#3-aws-cdk-and-github-actions) |
+| AWS, the project's own path | the CDK app in `infrastructure/cdk` and three GitHub workflows: Deploy, Rollback, Database Migration | [§2](#2-aws-cdk-and-github-actions) |
 
 **Profiles apply to every target.** One codebase, Apache-2.0 throughout, two build profiles: **core**
 (`backend/` only) and **full** (adds the optional modules under `modules/`; `modules-manifest.txt` is the
@@ -38,7 +37,6 @@ command is in [Cutting a release, §5](./releasing.md#5-verify-what-shipped)).
 | Target | Who writes the schema |
 |---|---|
 | Compose | the API container, on start (`RUN_MIGRATIONS=true`); it is the only writer |
-| Helm | an init container runs the bootstrap before the API container starts |
 | AWS | only the Deploy workflow's migration task. API tasks run with `RUN_MIGRATIONS=false` |
 
 Source: the header of `backend/docker-entrypoint.sh`.
@@ -64,7 +62,7 @@ docker compose logs -f api                      # the first start creates the sc
 `SECRET_KEY`, `FIRST_SUPERUSER`, `FIRST_SUPERUSER_PASSWORD`, `POSTGRES_PASSWORD` or `PUBLIC_BASE_URL` is unset or
 empty. The full profile also needs `AUDIT_HMAC_KEY`. `deploy/compose/.env.example` lists every setting.
 
-**Gotchas:**
+**Configuration notes:**
 
 - **The API answers only for the host in `PUBLIC_BASE_URL`.** It must be exactly what the browser shows: scheme
   and host, no path, no trailing slash. The proxy must forward the `Host` header unchanged.
@@ -83,48 +81,9 @@ empty. The full profile also needs `AUDIT_HMAC_KEY`. `deploy/compose/.env.exampl
 
 ---
 
-## 2. Kubernetes (Helm)
+<a id="3-aws-cdk-and-github-actions"></a>
 
-`docs/self-hosting/kubernetes.md` is the procedure, and it is tested as written: the `chart-kind` CI job extracts
-its four blocks and runs them in order on kind with ingress-nginx.
-
-**You need:** `kubectl`, `helm` 3.14 or later, `openssl`, `curl` and `jq`, and four shell variables: `CHART`,
-`PUBLIC_BASE_URL`, `ADMIN_EMAIL`, `PROFILE` (`core` or `full`).
-
-1. **Secrets, once.** Create the namespace and a Secret with generated values. The command never replaces a
-   Secret: a second run fails with `AlreadyExists` and leaves it as it was.
-2. **Install:**
-
-   ```bash
-   helm install experimently "$CHART" --namespace experimently \
-     --set profile="$PROFILE" \
-     --set publicBaseUrl="$PUBLIC_BASE_URL" \
-     --set firstSuperuser="$ADMIN_EMAIL" \
-     --set existingSecret=experimently-secrets \
-     --set ingress.className=nginx \
-     --wait --timeout 10m
-   ```
-
-   `ingress.className=nginx` is ingress-nginx's IngressClass; use your cluster's.
-3. **Check:** `curl` on `$PUBLIC_BASE_URL/api/v1/experiments/` prints `401`, and logging in as the first
-   administrator returns the role `ADMIN`. In the first seconds ingress-nginx may answer `503`; run it again.
-4. **Upgrade:** point `CHART` at the new chart, then
-
-   ```bash
-   helm upgrade experimently "$CHART" --namespace experimently \
-     --reset-then-reuse-values \
-     --wait --timeout 10m
-   ```
-
-**Where to get the chart.** Today the chart is a `.tgz` release asset only; the project has decided it will ALSO
-be an OCI package at `oci://ghcr.io/getexperimently/charts/experimently`; the first push and making it public are
-founder-only and not done. Download `experimently-X.Y.Z.tgz` from the GitHub release. The release workflow checks
-that the archive's `version` and `appVersion` are exactly the release's version before attaching it
-(`scripts/check_chart_package.py`), so the chart installs the images of the same release.
-
----
-
-## 3. AWS (CDK and GitHub Actions)
+## 2. AWS (CDK and GitHub Actions)
 
 This is the path the project runs itself. It is long because each step guards against a failure that has
 happened. The ordered checklist in the app is `docs/deployment/deployment-guide.md` §1; the per-deploy procedure
@@ -138,9 +97,11 @@ three workflows first.
 AWS CLI profile name; use your own, never one copied from someone else's notes.
 
 **Billing and irreversible steps are marked.** Each one needs a person to say yes at the moment it happens. They
-are collected as a checklist in [§3.14](#314-founder-only-and-irreversible-steps-aws).
+are collected as a checklist in [§2.14](#214-founder-only-and-irreversible-steps-aws).
 
-### 3.0 Decide first
+<a id="30-decide-first"></a>
+
+### 2.0 Decide first
 
 Before anything else, decide and write down: one AWS account per environment; the region; the profile (`full` or
 `core`); the domain (`app.<domain>`); a budget alarm and who owns the bill; and when a staging environment is torn
@@ -150,7 +111,9 @@ member account per environment, IAM Identity Center sign-in with MFA, and an org
 **Tools:** Python 3.11 or later, Node 18 or later for the CDK CLI (`npm install -g aws-cdk`), Docker with
 buildx, AWS CLI v2, and `gh`. Work from a fresh clone of `main`.
 
-### 3.1 Sign in
+<a id="31-sign-in"></a>
+
+### 2.1 Sign in
 
 ```bash
 aws configure sso --profile <profile>        # once
@@ -162,7 +125,9 @@ aws sts get-caller-identity --query Arn --output text   # check who you are; nev
 Check the account's Fargate On-Demand vCPU quota in the Service Quotas console now. A quota increase is a
 request that takes time, so start it before anything else if the quota is low.
 
-### 3.2 Secrets (billable: each secret is charged per month)
+<a id="32-secrets-billable-each-secret-is-charged-per-month"></a>
+
+### 2.2 Secrets (billable: each secret is charged per month)
 
 Create, with an identity that may call `secretsmanager:CreateSecret`:
 
@@ -213,7 +178,9 @@ done
 - **Keep ARNs out of issues, pull requests and chat.** An ARN carries the account ID. None of the commands above
   prints one.
 
-### 3.3 DNS zone and certificate
+<a id="33-dns-zone-and-certificate"></a>
+
+### 2.3 DNS zone and certificate
 
 1. **A zone for the environment.** In the environment's account, create a hosted zone for the environment's
    subdomain. In the account that holds the parent zone, add an `NS` record for that subdomain with the four name
@@ -230,7 +197,9 @@ done
    It must print `"ISSUED"`. **Irreversible in one sense:** the host name appears in public certificate
    transparency logs from the moment you request it.
 
-### 3.4 A protected GitHub environment, before anything names it
+<a id="34-a-protected-github-environment-before-anything-names-it"></a>
+
+### 2.4 A protected GitHub environment, before anything names it
 
 **A workflow dispatched for an environment that does not exist creates it, unprotected.** So protect the
 environment before any secret, variable or dispatch names it: a required reviewer, and deployment branches `main`
@@ -247,7 +216,9 @@ gh api repos/<owner>/<repo>/environments/<env> --jq '.protection_rules, .deploym
 
 For prod, the reviewer must be someone other than the person who dispatches the run.
 
-### 3.5 The deploy role (GitHub OIDC)
+<a id="35-the-deploy-role-github-oidc"></a>
+
+### 2.5 The deploy role (GitHub OIDC)
 
 `docs/deployment/iam-permissions.md` has the three identities (bootstrap, `cdk deploy`, one workflow role per
 environment) and their exact permissions.
@@ -291,7 +262,9 @@ staging rehearsal that happened three ways: a missing `rds:AddTagsToResource` st
 missing `codedeploy:GetApplicationRevision` stopped Rollback, and without `cloudwatch:DescribeAlarms` and
 `codedeploy:GetDeploymentGroup` every deploy stops at "Could not read the API's alarms".
 
-### 3.6 Environment secrets and variable
+<a id="36-environment-secrets-and-variable"></a>
+
+### 2.6 Environment secrets and variable
 
 ```bash
 gh secret set AWS_ACCOUNT_ID --env <env>      # prompts for the 12 digits
@@ -308,7 +281,9 @@ gh variable set PUBLIC_BASE_URL --env <env> --body https://app.<env-domain>
   straight into the `gh secret set` prompt.
 - `SLACK_BOT_TOKEN`, a repository secret, is optional.
 
-### 3.7 ECR repositories and the bootstrap images (billable: image storage)
+<a id="37-ecr-repositories-and-the-bootstrap-images-billable-image-storage"></a>
+
+### 2.7 ECR repositories and the bootstrap images (billable: image storage)
 
 Two repositories, once per account and region; no stack creates them. Their names keep the project's old prefix,
 `experimentation-platform/`, and the workflows depend on exactly these names.
@@ -340,7 +315,9 @@ docker buildx build --platform linux/amd64 -f frontend/Dockerfile --build-arg EX
   build.
 - **The repositories survive teardown.**
 
-### 3.8 CDK bootstrap (once per account and region)
+<a id="38-cdk-bootstrap-once-per-account-and-region"></a>
+
+### 2.8 CDK bootstrap (once per account and region)
 
 ```bash
 export AWS_PROFILE=<profile> AWS_REGION=us-west-2
@@ -348,14 +325,16 @@ cd infrastructure/cdk && pip install -r requirements.txt
 cdk bootstrap aws://<account>/us-west-2
 ```
 
-### 3.9 Synth, diff, deploy (billable from here)
+<a id="39-synth-diff-deploy-billable-from-here"></a>
+
+### 2.9 Synth, diff, deploy (billable from here)
 
 ```bash
 export AWS_PROFILE=<profile> AWS_REGION=us-west-2 CDK_DEFAULT_REGION=us-west-2
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)   # never echo it
 export ENVIRONMENT=staging EXPERIMENTLY_PROFILE=full
 export CERTIFICATE_ARN=<certificate ARN> PUBLIC_BASE_URL=https://app.<env-domain> ALARM_EMAIL=<ops inbox>
-# and the three *_SECRET_ARN from §3.2, in this same shell
+# and the three *_SECRET_ARN from §2.2, in this same shell
 cdk synth --all > /dev/null && echo "synth ok"
 cdk diff --all > diff.txt 2>&1        # contains the account number: read it, do not paste it
 cdk deploy --all --require-approval never
@@ -403,7 +382,7 @@ function).
 3. **Run the first Deploy soon.** **`cdk deploy` creates no schema.** Until the first Deploy's migration runs,
    `/health` answers 200 and the load balancer's health checks pass, while real requests answer 500. Requests in
    that window, from scanners as much as people, can put a 5xx alarm into ALARM, and Deploy then refuses to start.
-   The way through is Deploy's break-glass (§3.10), and a person decides at that moment whether to use it.
+   The way through is Deploy's break-glass (§2.10), and a person decides at that moment whether to use it.
 
 **Later `cdk deploy`s of a running environment:** deploy only `experimentation-fargate-<env>`, never `--all`, and
 pin what is live. Releases reach the API and the dashboard outside CloudFormation, so an unpinned `cdk deploy`
@@ -423,7 +402,9 @@ cdk deploy "experimentation-fargate-$ENVIRONMENT" --require-approval never \
 `docs/deployment/deployment-guide.md` §1.6 explains each pin, and what to do when the dashboard still runs
 `:bootstrap`.
 
-### 3.10 Every deploy: the Deploy workflow
+<a id="310-every-deploy-the-deploy-workflow"></a>
+
+### 2.10 Every deploy: the Deploy workflow
 
 1. **A release tag whose commit passed the Release Gate.** The Release Gate runs on every push to `main`. For a
    tag cut before that: `gh workflow run release-gate.yml --ref vX.Y.Z`, then wait for it.
@@ -447,7 +428,7 @@ cdk deploy "experimentation-fargate-$ENVIRONMENT" --require-approval never \
      its target group;
    - smoke-tests `GET /api/v1/experiments/` (401 `{"detail":"Not authenticated"}`), rolls the dashboard by digest,
      checks `GET /` answers 200 `text/html`, and checks the API once more;
-   - prints a summary with the rollback line and the `cdk` pins for §3.9.
+   - prints a summary with the rollback line and the `cdk` pins for §2.9.
 5. **Check afterwards** (`docs/deployment/deployment-guide.md` §5): `/health`, the 401 smoke request, and
    `aws ecs describe-services` for the backend and dashboard services.
 
@@ -479,7 +460,9 @@ cdk deploy "experimentation-fargate-$ENVIRONMENT" --require-approval never \
 The forward Deploy path, the alarm auto-rollback and the break-glass have all completed on the project's staging
 environment.
 
-### 3.11 Rollback
+<a id="311-rollback"></a>
+
+### 2.11 Rollback
 
 **Method 1, Actions → Rollback,** is the intended path. Inputs, copied from the deploy summary's rollback line:
 `environment`, `task_definition_arn` (`experimentation-backend-<env>:<n>`), optionally
@@ -511,7 +494,9 @@ release.
   dispatch it to try. Stop and escalate to whoever owns the environment's data; this guide gives no restore
   procedure.
 
-### 3.12 Teardown
+<a id="312-teardown"></a>
+
+### 2.12 Teardown
 
 - Only `prod` keeps its data when its stacks are destroyed (`retains_data(env) == (env == "prod")`).
 - `cdk destroy --all` synthesises the app like any other command: it needs `ALARM_EMAIL` and the three secret ARNs
@@ -523,15 +508,19 @@ release.
   the full table.
 - Closing the account is the only teardown that guarantees nothing is left.
 
-### 3.13 Not verified here
+<a id="313-not-verified-here"></a>
 
-- The Rollback workflow completing green end-to-end on real AWS (§3.11).
+### 2.13 Not verified here
+
+- The Rollback workflow completing green end-to-end on real AWS (§2.11).
 - The prod path as a whole: no prod account or `prod` GitHub environment existed on 2026-10-03.
 - Whether `cdk deploy --all` still diffs clean against a running staging environment at the reference commit.
-- Compose and Helm on a real host. CI runs both (the compose production test and `chart-kind`); this guide's
-  author did not.
+- Production Compose on a real host. The `compose-production` CI test exercises the configuration;
+  this guide's author did not run it on a real host.
 
-### 3.14 Founder-only and irreversible steps (AWS)
+<a id="314-founder-only-and-irreversible-steps-aws"></a>
+
+### 2.14 Founder-only and irreversible steps (AWS)
 
 Each needs a named person at the moment it happens. Read-only checks print no account values.
 
@@ -539,13 +528,13 @@ Each needs a named person at the moment it happens. Read-only checks print no ac
 |---|---|---|---|
 | Create the AWS Organization and the environment's member account | founder | yes (an account is closed, not deleted) | `aws sts get-caller-identity --query Arn` under the new profile |
 | Budget alarm | founder | no | the budget appears in the Billing console |
-| Create the secrets | founder or account administrator | no, but billable | §3.2's by-ARN check and its failing control |
+| Create the secrets | founder or account administrator | no, but billable | §2.2's by-ARN check and its failing control |
 | `NS` delegation in the parent zone's account | founder (the holder of the parent zone) | no | `dig NS <env-domain> +short` |
 | Request the certificate | founder or account administrator | yes: the name is in public CT logs | `aws acm describe-certificate ... --query Certificate.Status` prints `"ISSUED"` |
 | Protect the GitHub environment | repository administrator | no | `gh api repos/<owner>/<repo>/environments/<env> --jq '.protection_rules, .deployment_branch_policy'` |
 | `cdk deploy` | founder | no, but billable from the first stack | `aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE --query "StackSummaries[?contains(StackName, 'experimentation-')].StackName"` |
 | Confirm the SNS subscription with the token | the owner of `ALARM_EMAIL` | no | `aws sns list-subscriptions-by-topic ...` shows no `PendingConfirmation` |
-| Approve each environment deployment | the environment's reviewer (for prod, not the dispatcher) | the traffic shift can be rolled back; the migration may not be | the run summary, then §3.10 step 5 |
+| Approve each environment deployment | the environment's reviewer (for prod, not the dispatcher) | the traffic shift can be rolled back; the migration may not be | the run summary, then §2.10 step 5 |
 | `cdk deploy` of the database stack on a running environment (for example to apply the 35-day backup retention that `infrastructure/cdk/stacks/environments.py` sets for staging and prod) | founder | no, but it changes the live database cluster | run `cdk diff experimentation-database-<env>` first and deploy only if it shows `BackupRetentionPeriod` and nothing else |
 | Tick `override_alarms` | the dispatcher, and the reviewer who approves it | the unwatched deployment cannot be made watched | the run name ends in `ALARMS OVERRIDDEN` |
 | Create the production account and the `prod` environment, with a reviewer other than the dispatcher | founder | yes | `gh api repos/<owner>/<repo>/environments/prod --jq .protection_rules` |

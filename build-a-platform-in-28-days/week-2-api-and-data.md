@@ -2168,7 +2168,6 @@ at once queue rather than race.
 | Where                 | What writes the schema                                                                 |
 | --------------------- | -------------------------------------------------------------------------------------- |
 | Docker Compose        | the one API container, at start-up (`RUN_MIGRATIONS=true`, the entrypoint's default)   |
-| Helm                  | an init container in the API pod runs the bootstrap before the server starts           |
 | AWS (CDK)             | **only** the deploy's one-shot migration task (`python -m backend.app.db.bootstrap`), run by `deploy.yml` before traffic moves; the API tasks set `RUN_MIGRATIONS=false` |
 
 On AWS that last row has a consequence worth knowing before it surprises you: `cdk deploy` on
@@ -2429,7 +2428,7 @@ with no `--head` ("Multiple heads are present"), and `$ALEMBIC upgrade` with the
 - Fresh database → bootstrap (`create_all` + `stamp heads` + first admin); existing → `upgrade
   heads`, with profile switches handled on every alembic path. The bootstrap holds an advisory
   lock.
-- One schema writer per environment: the container in Compose, an init container in Helm, the
+- One schema writer per environment: the container in Compose or the
   deploy's migration task on AWS (API tasks never migrate; `cdk deploy` alone leaves no schema).
 - Models are truth; migrations are the delta, and every migration is expand-only so the
   previous release keeps working. Read every generated file; `down_revision` is an id.

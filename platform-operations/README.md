@@ -3,7 +3,7 @@
 ### _The Experimently Edition — Running the Platform, From Laptop to Production, in 12 Hours_
 
 > **Preface.** This book explains how to run and maintain Experimently. It covers the local Compose stack,
-> self-hosted Compose and Helm deployments, and the AWS infrastructure defined in CDK. The
+> production Compose deployments and the AWS infrastructure defined in CDK. The
 > remaining chapters cover logging, health checks, schedulers, releases and recovery. Read it
 > when setting up an environment, changing infrastructure or preparing to operate the service.
 > Deployment examples describe the configuration at the reference commit below.
@@ -42,7 +42,7 @@ synthesized templates without deploying an account.
 
 ### Part I — The Local and Self-Hosted Stack _(Hours 1–3)_ → [`part-1-local-stack.md`](./part-1-local-stack.md)
 
-- **Hour 1** — Docker Compose: services, profiles, health, and the `.env` contract; the production compose file and the Helm chart
+- **Hour 1** — Docker Compose: services, profiles, health, and the `.env` contract; the production Compose file
 - **Hour 2** — Multi-stage images and single-origin serving
 - **Hour 3** — The entrypoint: check, wait, bootstrap, seed, hand over — and the Makefile
 

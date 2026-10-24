@@ -199,7 +199,6 @@ experimently/
 ├── sdk/                       # 16 SDKs                                      ← Week 3
 ├── demo/                      # ShopLab (:3200), StreamPulse (:3300)         ← Week 3
 ├── infrastructure/cdk/        # AWS CDK stacks (Python)                      ← Week 4
-├── charts/experimently/       # the Helm chart                               ← Week 4
 ├── deploy/compose/            # the production compose file                  ← Week 4
 ├── scripts/                   # core_build.sh, the lock and licence checks   ← Week 4
 ├── tests/sdk-contract/        # golden vectors + live contract harness       ← Week 4

@@ -32,8 +32,8 @@ Experimently is an A/B-testing and feature-flag platform:
   modules' own routers), five background schedulers, a statistics engine;
 - a **Next.js 16** dashboard (TypeScript, **React 19**, Tailwind) under `frontend/src/`;
 - **16 SDKs** under `sdk/` that all speak one HTTP contract;
-- AWS infrastructure in **CDK (Python)** under `infrastructure/cdk/`, a Helm chart under
-  `charts/experimently`, and a production compose file under `deploy/compose`;
+- AWS infrastructure in **CDK (Python)** under `infrastructure/cdk/` and a production
+  Compose file under `deploy/compose`;
 - two demo apps (**ShopLab**, **StreamPulse**) under `demo/` that drive the platform through
   the public API exactly as a customer would;
 - a large test suite (the app README counts "5,400+ backend tests, 640+ dashboard tests", and
@@ -410,7 +410,6 @@ tests/sdk-contract/ golden-vectors.json · ruleset-vectors.json · hash_contract
                     test_hash_contract.py · harness/ · live/   (make test-sdk)
 demo/               shoplab · streampulse · setup-local.sh · teardown-local.sh · DEMO_GUIDE.md
 infrastructure/     cdk/ (app.py + stacks/) · cloudwatch/ · constructs/ · tests/
-charts/             experimently (the Helm chart)
 deploy/             compose (the production compose file)
 scripts/            core_build.sh · leak_guard.py · doc_examples.py · check_requirements_lock.py …
 docs/               getting-started · self-hosting · api · sdk · feature-flags · auth · rbac

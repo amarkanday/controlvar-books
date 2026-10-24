@@ -24,7 +24,7 @@ documentation is at [getexperimently.github.io/experimently](https://getexperime
 warehouse, integrations, counters, ETL, split-URL). Features from a module are marked
 _(module)_ below; a core deployment does not serve them. `GET /api/v1/modules` tells you which
 profile and modules a deployment serves. To run a deployment of your own, see the
-[Operations book](../platform-operations/README.md) (Helm chart, production compose, AWS).
+[Operations book](../platform-operations/README.md) (production Compose and AWS).
 
 ---
 

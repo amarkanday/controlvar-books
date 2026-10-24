@@ -9,7 +9,7 @@ Experimently is an A/B-testing and feature-flag platform: a FastAPI backend (Pyt
 SQLAlchemy, Pydantic v2, PostgreSQL, Redis), a Next.js dashboard (TypeScript, React,
 Tailwind), sixteen client SDKs (including two OpenFeature providers) that all speak one HTTP contract,
 optional `modules/` that turn the **core** profile into the **full** one, signed container images on GHCR,
-a Helm chart and a production compose file, AWS infrastructure defined in CDK, and a statistics engine
+a production Compose file, AWS infrastructure defined in CDK, and a statistics engine
 (Fisher's exact test, sequential/mSPRT, Bayesian, multi-armed bandits; CUPED in beta). About 91,000 lines of
 application Python, 229,000 lines of backend tests (9,100+ test functions, 16,000+ tests collected), 52,000 lines of dashboard
 TypeScript and 44,000 lines of SDK code (measured at `2fe9da1e`, v0.17.0 plus unreleased).
@@ -32,7 +32,7 @@ TypeScript and 44,000 lines of SDK code (measured at `2fe9da1e`, v0.17.0 plus un
 
 ## Operator guides — for whoever runs the project
 
-- **[`guides/deploying.md`](./guides/deploying.md)** — choosing compose, Helm or AWS; the AWS path
+- **[`guides/deploying.md`](./guides/deploying.md)** — Docker Compose and AWS; the AWS path
   step by step (sign-in, secrets by complete ARN, DNS and certificate, the deploy role, `cdk diff` and
   `cdk deploy`), every later deploy, rollback and teardown. Founder-only steps are checklists.
 - **[`guides/releasing.md`](./guides/releasing.md)** — conventional titles, the release-please pull
@@ -67,7 +67,7 @@ product what it is.
    Experimently architecture** end-to-end: the assign → track → analyse loop, the data model,
    access by role, feature flags and the rules engine, the background schedulers and their
    advisory lock, safety auto-rollback, the statistics engine, local evaluation, the core/modules split,
-   the SDK contract, testing and the required checks, signed containers, Helm, AWS. Assumes the three prior books. _After this capstone, you can read and
+   the SDK contract, testing and the required checks, signed containers and AWS. Assumes the three prior books. _After this capstone, you can read and
    extend the codebase._
 
 **Specializations — after the core path, in any order:**
@@ -83,7 +83,7 @@ product what it is.
    React SDK, porting to new languages, the live contract harness, SDK releases, and the ShopLab/StreamPulse
    demo apps.
 7. **[`platform-operations/`](./platform-operations/README.md)** — running it: the compose
-   and production compose files, the container entrypoint, bootstrap and seeds, the Helm chart, the CDK
+   and production compose files, the container entrypoint, bootstrap and seeds, the CDK
    stacks (9 core + 3 module: VPC, Aurora, Redis, ECS Fargate + ALB + CodeDeploy blue/green, analytics,
    Glue), secrets by complete ARN, structured logging, Prometheus and health probes, alarms, the deploy and
    rollback workflows, the migration task as the only schema writer, and releases.

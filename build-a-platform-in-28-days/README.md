@@ -34,8 +34,8 @@ checks discussed in the final week.
   the warehouse module (beta). _The stuff that makes it special._
 - **Week 4 — Production Engineering.** The testing pyramid (unit, integration, smoke, contract,
   E2E), the dashboard's architecture, the CI workflows, containers and compose, the AWS CDK
-  stacks, the self-hosting paths (signed public `core`/`full` images on GHCR, the Helm chart,
-  the production compose file, the one-path AWS deploy), and observability. _What makes it
+  stacks, deployment (signed public `core`/`full` images on GHCR, the production
+  Compose file and the AWS deploy workflow), and observability. _What makes it
   shippable._
 
 Each **Day** is a full chapter-length lesson (set aside ~2–3 hours) with the same rhythm:

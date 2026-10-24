@@ -21,7 +21,7 @@ a release. Day 28 brings these components together in an architecture review.
 | 22  | Testing strategy         | The pyramid, the harness, two profiles, and why mocked seams hid the hot-path bugs   |
 | 23  | The dashboard            | A thin Next.js client: one fetch wrapper, one auth context, a modules seam           |
 | 24  | CI/CD                    | 20 required checks, tamper-tested gates, and one Deploy path for every environment   |
-| 25  | Containers & compose     | Two images in two profiles, one entrypoint, and three ways to self-host              |
+| 25  | Containers & compose     | API and dashboard images, profile selection, and Compose deployment              |
 | 26  | AWS                      | Nine core CDK stacks (twelve with modules), Fargate blue/green, one schema writer    |
 | 27  | Observability            | Request IDs, JSON logs, Prometheus, health probes, alerting                          |
 | 28  | **Capstone:** the map    | Draw the whole system; explain every arrow                                           |
@@ -843,12 +843,14 @@ selects the Cognito provider and `moto` mocks the user pool. No AWS credentials 
 
 ---
 
-## Day 25 — Containers, the compose stacks, and the Helm chart
+<a id="day-25--containers-the-compose-stacks-and-the-helm-chart"></a>
+
+## Day 25 — Containers and the Compose stacks
 
 ### What & why
 
-Two images, each in two profiles, one entrypoint, and three ways to run them yourself. The
-design goal: `docker compose up -d --wait` on a laptop with nothing but Docker, and you can log
+The API and dashboard each have core and full images. Compose combines them with the database
+and cache for local development or a production Docker host. The design goal: `docker compose up -d --wait` on a laptop with nothing but Docker, and you can log
 in — and the same images, unchanged, in production.
 
 - **`experimently-api`** (`backend/Dockerfile`): a multi-stage Python 3.11 image — the builder
@@ -918,8 +920,7 @@ appends `--workers ${WEB_CONCURRENCY:-1}` and the proxy flags. Its contract is i
 and it migrates on start. On AWS the API task sets `RUN_MIGRATIONS=false` and `SEED=` empty,
 and the Deploy workflow's migration task is the only thing that writes the schema: a bootstrap
 refuses a database a newer release migrated, so an older revision started by a replacement, a
-scale-out or a rollback would otherwise exit instead of serving. In the Helm chart the bootstrap
-runs in an init container, not in the serving container.
+scale-out or a rollback would otherwise exit instead of serving.
 
 Two more details are worth knowing before they bite. The **OpenSSL probe** right after the
 preflight: on some
@@ -1002,7 +1003,9 @@ count as unhealthy. The demo profile's simulators read the API keys the seeds wr
 `demo_keys` volume, and the demo images bake fixed keys (`eptk_demo_shoplab_…`) so the
 storefronts work without a manual step.
 
-#### Three ways to self-host
+<a id="three-ways-to-self-host"></a>
+
+#### Development and production Compose
 
 1. **`docker-compose.yml`** at the root: the development stack above, built from a checkout,
    with demo seeds and profiles.
@@ -1012,13 +1015,9 @@ storefronts work without a manual step.
    `./generate-env.sh` writes a `.env` with generated secrets once; `SECRET_KEY`,
    `FIRST_SUPERUSER`, `FIRST_SUPERUSER_PASSWORD`, `POSTGRES_PASSWORD` and `PUBLIC_BASE_URL` are
    required, and `AUDIT_HMAC_KEY` too on the full profile. CI tests it (`compose-production.yml`).
-3. **The Helm chart**, `charts/experimently` (bootstrap in an init container; tested by
-   `chart.yml` and `chart-kind.yml`). Today the chart is a `.tgz` release asset only;
-   the project has decided it will ALSO be an OCI package at
-   `oci://ghcr.io/getexperimently/charts/experimently`; the first push and making it public are
-   founder-only and not done.
 
-The fourth path, AWS, is tomorrow.
+
+The next lesson covers deployment to AWS with CDK and ECS Fargate.
 
 > **Did You Know?** The dashboard proxy means the browser never sees the API's origin:
 > `/api/v1/...` on `:3000` is nginx forwarding to `api:8000` inside the compose network. That's
@@ -1058,10 +1057,10 @@ refuse a container with no `ENVIRONMENT`).
 - The entrypoint runs the preflight (exit 78 with every problem listed), waits for Postgres,
   bootstraps (`upgrade heads`), seeds once (demo seeds development-only), then execs uvicorn —
   and stops the container if any step fails.
-- Only one thing writes the schema: the compose API container, the Helm init container, or on AWS
-  the migration task. AWS API tasks run with `RUN_MIGRATIONS=false`.
-- Development compose has profiles `demo`, `tools`, `aws`; production compose runs published
-  images; the Helm chart is a `.tgz` release asset today.
+- Compose uses the API container as the schema writer. AWS uses a separate migration task,
+  and API tasks run with `RUN_MIGRATIONS=false`.
+- Development Compose has profiles `demo`, `tools`, `aws`; production Compose runs published
+  images without demo services or demo users.
 
 ### Q&A
 
@@ -1607,7 +1606,7 @@ account for.
    CONTAINERS (Day 25): experimently-api {core,full} (entrypoint: preflight → wait →
                         bootstrap where it is the writer → seed → uvicorn)
                         experimently-web {core,full} (static export + nginx proxy)
-                        dev compose · production compose · Helm chart
+                        dev compose · production compose
 ```
 
 ### Build It — the final exercise

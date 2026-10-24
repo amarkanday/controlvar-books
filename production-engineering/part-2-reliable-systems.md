@@ -194,7 +194,7 @@ a declared authority and reconciliation; they are not automatically consistent.
 #### Deployment ownership and recovery
 
 On the AWS deployment described in the [runbook][h6-migrations], API tasks set `RUN_MIGRATIONS=false`;
-the migration task runs before traffic moves. Compose and Helm have different startup paths. Verify
+the migration task runs before traffic moves. Compose has a different startup path. Verify
 the actual deployment's settings rather than copying one environment's assumptions into another.
 
 Plan application rollback separately from database recovery. Prefer a backward-compatible schema

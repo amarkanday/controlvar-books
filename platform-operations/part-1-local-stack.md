@@ -5,7 +5,7 @@
 [Contents](./README.md) · [Part II →](./part-2-aws.md)
 
 Experimently uses the same application images in several deployment environments. Hour 1 compares
-the development Compose stack, production Compose configuration and Helm chart. Hour 2 covers the
+the development and production Compose configurations. Hour 2 covers the
 core and full image targets. Hour 3 follows startup through configuration checks, database readiness,
 bootstrap, seeding and process handoff.
 
@@ -318,17 +318,6 @@ name. When `ALLOWED_HOSTS` is unset it is derived from `PUBLIC_BASE_URL`'s host,
 with any other `Host` header is refused with 400 before a handler sees it — so your reverse proxy
 must forward the `Host` header unchanged.
 
-#### On Kubernetes: the Helm chart
-
-The third way to self-host is the Helm chart in `charts/experimently` (values `profile`,
-`publicBaseUrl`, `firstSuperuser`, `existingSecret`, `ingress.*`, validated at render time by
-`values.schema.json`). The app's `docs/self-hosting/kubernetes.md` is the install guide, and the
-`chart-kind` CI job runs its command blocks as written on a kind cluster. The one operational
-difference from compose: the chart runs the bootstrap in an **init container**, not in the serving
-container (Hour 3). Today the chart is a `.tgz` release asset only; the project has decided
-it will ALSO be an OCI package at `oci://ghcr.io/getexperimently/charts/experimently`; the first push and
-making it public are founder-only and not done.
-
 > **Watch Out!** The three secrets in the development file's header. The default `SECRET_KEY`
 > signs local JWTs (Build book Day 10); anyone who reads this public file can forge a session on
 > a stack that kept it. The `FIRST_SUPERUSER_PASSWORD` default is the demo admin. They are allowed
@@ -383,7 +372,6 @@ Then set `REDIS_REQUIRED=true`, `docker compose stop redis`, and watch `/health/
   "can serve"; `start_period: 300s` covers first-run seeding.
 - `PUBLIC_BASE_URL` decides which host the API answers for; CORS in staging and production lists
   only browser-SDK sites.
-- Kubernetes: the Helm chart in `charts/experimently`, bootstrap in an init container.
 
 ---
 
@@ -702,7 +690,7 @@ same. Either way, an empty `users` table gets the first superuser from `FIRST_SU
 runs under a blocking advisory lock keyed by schema name.
 
 Who runs that step depends on where you are. In compose, the single API container does
-(`RUN_MIGRATIONS=true`). On Kubernetes, the chart's init container does. On AWS, the API never
+(`RUN_MIGRATIONS=true`). On AWS, the API never
 does: a separate migration task does, before each deploy (end of this Hour).
 
 ### How Experimently does it
@@ -989,7 +977,7 @@ lock-check` (the hashed requirements locks), `make openapi` (the committed API s
 
 That's the point of putting the logic in `backend.app.db.bootstrap` rather than in the shell
 script — one implementation, several callers: the entrypoint, the Makefile, CI's
-`run-backend-tests.sh`, the Helm chart's init container, and the AWS migration task, whose
+`run-backend-tests.sh` and the AWS migration task, whose
 command is `python -m backend.app.db.bootstrap` (`MIGRATION_COMMAND` in
 `infrastructure/cdk/stacks/migration_task_stack.py`).
 
