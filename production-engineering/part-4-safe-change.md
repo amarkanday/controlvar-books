@@ -315,7 +315,6 @@ inventory and a removal or long-term review date.
 
 ---
 
-<a id="hour-11--changing-experimently-safely"></a>
 
 ## Hour 11 — Changing Controlvar safely: the owner's name
 
@@ -604,7 +603,6 @@ areas still needing verification, with the relevant check results attached.
 
 ---
 
-<a id="hour-12--a-release-review-from-evidence-to-decision"></a>
 
 ## Hour 12 — A release review from evidence to decision: the test that could not fail
 

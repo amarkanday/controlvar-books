@@ -536,7 +536,6 @@ owner for each retained field.
 
 ---
 
-<a id="hour-9--retention-deletion-and-recovery"></a>
 
 ## Hour 9 — Retention, deletion and recovery: the column nobody reads
 

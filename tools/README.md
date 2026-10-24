@@ -27,7 +27,7 @@ find REF, or could not parse leak_guard's output never reports clean), 3 not imp
 | V2 | `paths_at_ref.py` | Every app path in inline code, and every path-shaped token in a fence, exists at REF (`git cat-file -e REF:path`). | scoped |
 | V3 | `snippets.py` | Every `📁 path` segment: the path is a file at REF, and every identifier in the segment (comments stripped) occurs in that file. | scoped |
 | V4 | `links.py` | Relative links and images resolve; every `#anchor` is a GitHub heading slug (or an explicit `id`/`name`) in the target. | always the whole tree |
-| V5 | `numbers.py` | STUB: inventories the Try-It numbers; exits 3 when learn-python or statistics is in scope. The learn-python and statistics pull requests implement it in the released image at the REF tag. | scoped |
+| V5 | `numbers.py` | STUB, not built yet: it inventories the Try-It numbers and exits 3 ("not implemented") when learn-python or statistics is in scope, so `make check` over the whole repository always reports V5 as a failure. The numbers in those two books were re-run by hand at REF. | scoped |
 | V6 | `secrets.py` | The app's `scripts/leak_guard.py` taken from REF and run over every tracked file, plus: a bare 12-digit number (only `123456789012` allowed; UUID tails and longer tokens ignored), a real-shape API key (the `eptk_demo_` keys are not that shape), AWS key ids, GitHub tokens. `--stdin` scans a pull request title and body. | scoped findings; leak_guard itself always scans the tree |
 
 ## REF

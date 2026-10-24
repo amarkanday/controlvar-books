@@ -335,7 +335,6 @@ the recovery action for reads, assignments, events and partial batches.
 
 ---
 
-<a id="hour-5--schedulers-replicas-and-stale-state"></a>
 
 ## Hour 5 — Schedulers, replicas and stale state: five loops, one lock
 
