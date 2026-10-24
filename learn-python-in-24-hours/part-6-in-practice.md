@@ -4,11 +4,10 @@
 
 [← Part V](./part-5-concurrency.md) · [Contents](./README.md)
 
-The last four hours are the Python this platform actually depends on beyond the language:
-the standard library's hashing and randomness modules and the discipline of determinism
-(Hour 21), the NumPy/SciPy layer under every statistic (Hour 22), `pytest` and the testing
-idioms the codebase expects (Hour 23), and — finally — the style guide that collects every
-convention from the previous twenty-three hours into a review checklist (Hour 24).
+The final four lessons apply Python to recurring backend tasks. Hour 21 covers hashing, randomness
+and deterministic results. Hour 22 introduces the NumPy and SciPy operations used by the statistics
+services. Hour 23 covers pytest and the repository's test conventions. Hour 24 brings the coding
+conventions together as a review reference.
 
 ---
 

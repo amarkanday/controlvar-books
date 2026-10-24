@@ -4,14 +4,12 @@
 
 [← Part III](./part-3-observability.md) · [Contents](./README.md)
 
-How a change becomes a release, how a release becomes what an environment serves, and how
-an environment goes back to the previous release when it has to. Hour 10 is CI: what runs
-on every pull request, what branch protection requires, and why there are two gates rather
-than one. Hour 11 is the release and the deploy: release-please cuts a tag and builds signed
-images, and the one `Deploy` workflow takes that tag to staging or prod through a snapshot, a
-one-shot migration task and a CodeDeploy canary. Hour 12 is the other direction: the
-rollback decision tree, what CodeDeploy rolls back by itself, the `Rollback` workflow, the
-database rollback order, the secrets a deployment needs, and the backups behind all of it.
+Hour 10 describes the pull-request and release checks. Hour 11 follows a release tag through signed
+image creation and deployment, including the migration task and CodeDeploy canary. Hour 12 covers
+rollback, secret configuration and backups.
+
+Application rollback and database recovery have different requirements. Pay particular attention
+to the order of operations when a release changes the schema.
 
 > Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
 > changes, including three breaking ones: #747, #769, #770).
@@ -22,13 +20,10 @@ database rollback order, the secrets a deployment needs, and the backups behind 
 
 ### What & why
 
-Continuous integration is where "it works on my machine" is replaced with a list of things
-that must be true before a change can merge. The platform runs several workflows on a pull
-request, and the important distinction is between **required** checks — branch protection
-blocks the merge until they report success — and **advisory** ones, which run and report but
-don't block. Branch protection on `main` requires **20** checks (listed below); integration,
-performance and Cognito suites and the nightly run add slower coverage where a slow or flaky
-job costs nobody a merge.
+The pull-request workflows include required and advisory checks. Branch protection blocks a
+merge while a required check is missing or unsuccessful; advisory checks report results without
+blocking. At the reviewed revision, `main` requires 20 checks. Additional integration, performance,
+Cognito and nightly suites provide coverage outside that required set.
 
 Two gates exist because they answer different questions. The **PR QA Gate** asks "does the
 code work?" — tests in both profiles, contracts, containers, a real browser. The **Release
@@ -101,10 +96,10 @@ The unit job runs the Lambda suites too, with a comment that explains a past gap
           done
 ```
 
-`-x` (stop at first failure) in the PR gate is a speed choice: a red PR gate needs one
-failure to act on, not the full list; the nightly runs without it. `-p no:cov` disables the
-coverage plugin — coverage is a separate, explicit run. (No stack deploys a handler from
-`backend/lambda/`; these suites keep the code that is there honest. Part II, Hour 4.)
+The PR gate uses `-x` to stop after the first failure and return feedback sooner. Nightly runs
+continue through the suite. `-p no:cov` disables the coverage plugin because coverage is measured
+in a separate run. Tests also cover the handlers under `backend/lambda/`, although no stack deploys
+those handlers (Part II, Hour 4).
 
 The Docker smoke is the job that most resembles a customer — it builds the images and walks
 the same path a self-hoster would:
@@ -332,8 +327,8 @@ check runs and an unfiltered read can miss the gate).
 
 ### What & why
 
-Two separate machines take a change from `main` to an environment, and it pays to keep them
-apart in your head.
+Release creation and environment deployment are separate workflows. Follow their responsibilities
+individually when tracing a change from `main` to a running environment.
 
 **The release** happens on its own. Every merge to `main` is squash-merged with the pull
 request title as its subject, and release-please reads those subjects as conventional commits
@@ -723,12 +718,10 @@ docker inspect --format '{{index .Config.Labels "io.experimently.profile"}}' "$I
 
 ### What & why
 
-A deploy that can't be undone in minutes is a deploy you'll be afraid to do. The rollback
-runbook (`docs/deployment/rollback-runbook.md` in the app) opens with a **decision tree** and
-a two-minute budget, and its first rule is "when in doubt, roll back" — hotfixes are for
-one-line changes only. The tree now starts with two questions the old one never asked,
-because CodeDeploy may already have acted: *did an alarm already roll the API back?* and *is
-CodeDeploy rolling back right now?*
+The app's rollback runbook (`docs/deployment/rollback-runbook.md`) starts with a decision tree and
+a two-minute assessment budget. It favors rollback when the cause is uncertain and reserves hotfixes
+for small, well-understood changes. First check whether CodeDeploy has already completed or started
+an automatic rollback; the manual response depends on that state.
 
 There are three ways the API goes back to a previous revision:
 

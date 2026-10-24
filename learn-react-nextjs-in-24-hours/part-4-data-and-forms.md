@@ -4,13 +4,10 @@
 
 [← Part III](./part-3-nextjs.md) · [Contents](./README.md) · [Part V →](./part-5-ui.md)
 
-Data in, data out. This Part is the services layer — one typed object per API resource,
-mirroring the backend's routes (Hour 14); the new-experiment form — one reducer behind a
-guided wizard and a single-page view, validation that mirrors the server, and failures mapped
-by status (Hour 15); lists with filters, offset pagination and lifecycle actions that keep
-the UI honest while a request is in flight and never offer what the user's role cannot do
-(Hour 16); and a WebSocket hook with reconnect, terminal close codes and a
-subprotocol token (Hour 17).
+This Part follows data between the API and the dashboard. Hour 14 covers the typed service layer.
+Hour 15 examines the new-experiment form, including its reducer, validation and error handling.
+Hour 16 covers filtered lists, pagination and lifecycle actions while requests are pending.
+Hour 17 covers the WebSocket hook, its authentication subprotocol and reconnect behavior.
 
 ---
 
@@ -284,7 +281,7 @@ Both views read the same state and dispatch to the same reducer (Hour 6's sideba
 same validators and send the same request. A link at the top of each switches to the other,
 and the answers carry over because there is only one copy of them.
 
-Four rules keep forms honest:
+The forms follow four validation and state-management rules:
 
 1. **Keep the form in a pure module.** State shape, reducer, validators and payload builder
    live in `src/components/experiments/new/formState.ts`, which imports no React. Views
@@ -427,14 +424,12 @@ export function maxReachableStep(state: ExperimentFormState): number {
 }
 ```
 
-`as const` makes `FORM_STEPS` a tuple of literals, and `(typeof FORM_STEPS)[number]` derives
-the union `'type' | 'details' | 'variants' | 'estimate' | 'review'` from it — one list, one
-type, no drift. The `switch` has no `default`: under `strict`, adding a step to the tuple makes
-the function fail to compile until the new case is handled. `maxReachableStep` is how the
-wizard keeps the URL honest: Next is refused while the current step has a problem (shown in
-`data-testid="step-error"`), and a hand-edited `?step=review` on an incomplete form is moved
-back to the first step that still needs an answer. The Estimate step calls
-`ExperimentsService.estimateSampleSize` for advice only; it sends nothing that is stored.
+`as const` preserves `FORM_STEPS` as a tuple of literal values. `(typeof FORM_STEPS)[number]`
+derives the step union from that tuple. The `switch` has no `default`; under `strict`, adding a
+step requires updating the cases. `maxReachableStep` prevents navigation past an invalid step.
+The page displays the current problem through `data-testid="step-error"` and moves an invalid
+`?step=review` URL back to the first incomplete step. The Estimate step calls
+`ExperimentsService.estimateSampleSize` for advice and does not persist the estimate.
 
 The payload builder is a pure function of the state:
 
@@ -632,10 +627,9 @@ on the server and then in the UI. The dashboard's pattern is `useApi` with the f
 dependency list — change the filter, the hook refetches — and per-row actions that either
 refetch or update the local copy (`setData`) after the API confirms.
 
-For a detail page's **lifecycle actions**, the page must stay honest during the request: the
-clicked button shows its pending label, all actions are disabled, a destructive action asks
-for confirmation first, and the response — the updated resource — replaces local state so the
-next allowed actions come from the server's truth, not from what the client assumed.
+While a lifecycle action is pending, its button displays a pending label and the page disables
+other actions. Destructive operations require confirmation. On success, the updated resource
+returned by the API replaces local state, so subsequent actions reflect the server's response.
 
 ### In the wild
 

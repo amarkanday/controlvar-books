@@ -4,16 +4,13 @@
 
 [← Part I](./part-1-local-stack.md) · [Contents](./README.md) · [Part III →](./part-3-observability.md)
 
-The same images, on AWS. Hour 4 is the map: nine CDK stacks in Python (twelve in a full
-checkout), the environment switch that sizes them, the profile switch that decides whether
-the module stacks exist, and the dependency order that `cdk deploy --all` respects. Hour 5
-is the request path: one internet-facing ALB in front of two ECS Fargate services — the API,
-which CodeDeploy replaces blue/green behind a canary, and the dashboard, which rolls — with
-secrets injected from Secrets Manager by complete ARN and auto-scaling on CPU and memory.
-Hour 6 is everything the API talks to: Aurora PostgreSQL, ElastiCache Redis, DynamoDB, and
-(full profile) the Kinesis → Firehose → S3 event pipeline with Glue and OpenSearch on top,
-plus what is backed up and for how long. Read it with `cdk synth` open; every claim here is a
-line in a stack.
+Hour 4 introduces the CDK stacks, their dependencies and the environment and profile settings that
+select them. The reviewed checkout has nine core stacks and twelve with modules. Hour 5 traces
+requests through the ALB to the API and dashboard services, then covers deployment and scaling.
+Hour 6 examines the data services, analytics pipeline and backups.
+
+Use synthesized templates to inspect resource settings alongside the stack definitions. Details
+such as secret ARNs, network access and retention periods matter when comparing environments.
 
 ---
 

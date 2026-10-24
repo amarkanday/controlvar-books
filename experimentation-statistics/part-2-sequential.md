@@ -4,14 +4,13 @@
 
 [← Part I](./part-1-foundations.md) · [Contents](./README.md) · [Part III →](./part-3-sharper-estimates.md)
 
-Everyone looks at results before the planned end. This Part is about why that quietly
-destroys the guarantees of Part I (Hour 4), the one method the platform uses to make looking
-safe — the mixture sequential probability ratio test, an evidence ratio you may inspect at
-any moment (Hour 5) — and its companion, a confidence sequence that is the same test turned
-inside out, so the interval and the stop decision can never disagree (Hour 6). Hour 6 also
-covers the alpha-spending boundaries the platform used to report and no longer does, and
-why. By the end you'll know what `can_stop`, `always_valid_p_value`, `evidence_strength`,
-`recommended_action`, `at_risk` and the `beta` notice on the Sequential tab actually promise.
+Checking an ordinary fixed-horizon test repeatedly and stopping when it becomes significant can
+increase the false-positive rate. Hour 4 demonstrates the problem. Hours 5 and 6 explain the
+platform's mixture sequential probability ratio test (mSPRT) and its confidence sequence.
+
+The discussion connects the calculations to the response fields: `can_stop`,
+`always_valid_p_value`, `evidence_strength`, `recommended_action` and `at_risk`. It also explains
+why the sequential response carries a `beta` notice and no longer reports alpha-spending boundaries.
 
 > **Status.** The sequential analysis is **beta**: `GET /results/{id}/sequential` answers
 > `analysis_status: "beta"` and an `analysis_notice` saying that the stop/continue decision
@@ -25,16 +24,14 @@ why. By the end you'll know what `can_stop`, `always_valid_p_value`, `evidence_s
 
 ### What & why
 
-A fixed-horizon test promises: _if there's no effect, a p-value below 0.05 happens 5% of the
-time_. The promise holds for **one** look at the pre-planned sample size. Look every day
-and stop the first time p dips below 0.05, and the promise breaks: under the null, the
-running p-value wanders, and over 20 daily looks the chance that it dips below 0.05 _at
-least once_ is not 5% but about 25% (the Try It below measures 0.247). Over unlimited looks
-it's certain — a random walk crosses any fixed line eventually.
+For a valid fixed-horizon test at α = 0.05, the false-positive rate is controlled at 5% when its
+assumptions and planned analysis rule hold. Repeatedly checking the ordinary p-value and stopping
+at the first result below 0.05 changes that rule. In the example below, 20 daily looks produce a
+false-positive frequency of about 25% (the measured value is 0.247). A sequential method is needed
+if the stopping decision will depend on these interim results.
 
-This isn't a subtle effect. It's the single most common way an experimentation program
-"finds" wins that don't replicate, and it happens without anyone doing anything that feels
-wrong: they just checked the dashboard.
+Repeated testing can produce apparent improvements that fail to reproduce. The problem arises
+from the stopping rule, even when each individual p-value is calculated correctly.
 
 Three ways out:
 

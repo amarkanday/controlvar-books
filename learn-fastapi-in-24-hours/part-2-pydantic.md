@@ -4,12 +4,12 @@
 
 [← Part I](./part-1-foundations.md) · [Contents](./README.md) · [Part III →](./part-3-dependencies-and-auth.md)
 
-Pydantic is the half of FastAPI that decides what a request _means_. This Part is the model
-layer from the ground up: fields and their constraints (Hour 5), the two kinds of validator
-and where each belongs (Hour 6), the config knobs and the round trip between ORM objects,
-models and JSON (Hour 7), and `pydantic-settings`, which turns the same machinery on the
-process environment and refuses to start a misconfigured production (Hour 8). Keep a Python
-shell open — `from backend.app.schemas.experiment import ExperimentCreate` and try things.
+Pydantic models describe data and validate it at application boundaries. Hour 5 covers fields and
+constraints; Hour 6 covers field and model validators. Hour 7 follows data between ORM objects,
+Pydantic models and JSON. Hour 8 applies the same validation approach to environment settings.
+
+Use a Python shell to construct `ExperimentCreate` instances with both valid and invalid values.
+The resulting errors show which guarantees the schema provides before a service runs.
 
 > **Version note.** This codebase is **Pydantic v2** (2.13) throughout: `field_validator` /
 > `model_validator` / `ConfigDict` / `model_dump` / `model_validate`. The v1 names
@@ -622,9 +622,9 @@ services called from endpoints (models) and scripts (dicts):
         return dict(event_data)
 ```
 
-Caching a response is a JSON round trip through the model, which is what keeps the cache
-honest — a cached blob that no longer matches the schema fails validation rather than
-returning stale shapes:
+A cached response is serialized to JSON and validated through the response model when read.
+If the stored data no longer matches the schema, validation fails rather than returning an
+incompatible response:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
@@ -705,11 +705,10 @@ ExperimentResponse.model_validate_json(resp.model_dump_json()) == resp        # 
 
 ### What & why
 
-`pydantic-settings` applies the same machinery to configuration: a `BaseSettings` subclass
-whose fields are populated from environment variables (and an optional `.env` file), typed,
-defaulted and — crucially — **validated**. The result is one object, `settings`, imported
-everywhere, that answers "which database, which auth provider, which environment" and
-refuses to exist when the answers are dangerous.
+`pydantic-settings` loads configuration into a `BaseSettings` subclass. Fields come from
+environment variables and an optional `.env` file, with declared types, defaults and validators.
+The application imports the resulting `settings` object to select its database, authentication
+provider and environment. Invalid configurations can be rejected during startup.
 
 Three ideas in Experimently's `core/config.py` that go beyond "read an env var":
 

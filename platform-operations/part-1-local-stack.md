@@ -4,13 +4,13 @@
 
 [Contents](./README.md) · [Part II →](./part-2-aws.md)
 
-Before AWS, the stack that runs everywhere else: on a laptop, on a customer's VM, in CI. It's
-two compose files — the development one you build from a checkout and the production one that
-runs the published images (Hour 1) — two images, each built in a `core` and a `full` profile
-(Hour 2), and an entrypoint that checks its settings and turns an empty Postgres into a
-signed-in platform without a human in the loop (Hour 3). Everything in Parts II–IV is a
-different way of running the same images with the same entrypoint — so this Part is the
-foundation, not the warm-up.
+Experimently uses the same application images in several deployment environments. Hour 1 compares
+the development Compose stack, production Compose configuration and Helm chart. Hour 2 covers the
+core and full image targets. Hour 3 follows startup through configuration checks, database readiness,
+bootstrap, seeding and process handoff.
+
+Start with the local stack before moving to AWS; it provides a convenient environment for inspecting
+these behaviors.
 
 > **Verified against** getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
 > changes). One codebase, Apache-2.0 throughout, built in two **profiles**: **core** (`backend/`
@@ -387,7 +387,9 @@ Then set `REDIS_REQUIRED=true`, `docker compose stop redis`, and watch `/health/
 
 ---
 
-## Hour 2 — The images: two multi-stage Dockerfiles and the nginx single-origin trick
+<a id="hour-2--the-images-two-multi-stage-dockerfiles-and-the-nginx-single-origin-trick"></a>
+
+## Hour 2 — Multi-stage images and single-origin serving
 
 ### What & why
 

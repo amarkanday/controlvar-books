@@ -4,9 +4,10 @@
 
 [Contents](./README.md) · [Part 2 →](./part-2-reliable-systems.md)
 
-This Part follows the decision loop: define what counts, run an experiment through a shipping
-decision, then extend the same discipline to model and prompt evaluation. The worked data is
-illustrative; the source links identify the reviewed implementation.
+This Part covers the work around an experiment's statistical calculation: defining the metric,
+validating collection, deciding what the result supports and planning a rollout. Hour 3 applies
+that approach to LLM evaluation, where dataset selection and judge failures introduce additional
+measurement concerns. The worked data is illustrative.
 
 > **Verified against** getexperimently/experimently at `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
 > (source review, 2026-10-23). Recommended procedures and illustrative examples are identified

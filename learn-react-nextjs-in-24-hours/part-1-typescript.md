@@ -4,17 +4,20 @@
 
 [← Back to Contents](./README.md)
 
-Four hours of TypeScript — exactly the subset the dashboard uses, taught through the code that
-uses it. Why a JavaScript codebase volunteers for a compiler (Hour 1); the type vocabulary
-that describes API data — interfaces, literal unions, `Record` (Hour 2); generics and
-`unknown`, which are how one `apiFetch` serves every endpoint safely (Hour 3); and narrowing,
-optional chaining and the discipline of mirroring the backend's schemas field for field
-(Hour 4). Open a [Playground](https://www.typescriptlang.org/play) tab and type the examples —
-TypeScript is learned through red squiggles.
+This Part introduces the TypeScript features used by the dashboard. Hours 1 and 2 cover compiler
+checks and the types used to describe API data. Hour 3 covers generics and `unknown` through the
+shared `apiFetch` client. Hour 4 covers narrowing, optional chaining and the correspondence between
+frontend types and backend schemas.
+
+You can run the small language examples in the [TypeScript Playground](https://www.typescriptlang.org/play).
+Read the compiler errors as part of each example; they explain which assumptions the type system
+can check.
 
 ---
 
-## Hour 1 — Why TypeScript? The field that wasn't there
+<a id="hour-1--why-typescript-the-field-that-wasnt-there"></a>
+
+## Hour 1 — TypeScript and API response checks
 
 ### What & why
 
@@ -29,7 +32,9 @@ doesn't stop a malformed API response from delivering `"ACTIVE"` where `"active"
 expected. So the discipline is twofold: precise types for data you _control_, and validation
 (or defensive parsing) at the edges for data you _don't_.
 
-#### The field that wasn't there
+<a id="the-field-that-wasnt-there"></a>
+
+#### Case study: an incorrect response-field assumption
 
 The dashboard's results hook parses WebSocket snapshots from the server. The server sends
 snake_case JSON; the hook converts it to camelCase. Before the fields were typed and parsed
@@ -75,9 +80,10 @@ The complementary discipline is at the top of the types file:
  */
 ```
 
-The dashboard's types are hand-written mirrors of the Pydantic schemas, snake_case included.
-There's no generated client; the mirror is kept honest by tests that hit the real shapes and
-by a URL guard (Hour 23). When the backend adds a field, someone adds it here.
+The dashboard's TypeScript types are maintained by hand to match the Pydantic schemas, including
+snake_case field names. There is no generated client. Tests check response shapes, while the URL
+guard described in Hour 23 checks route usage. Backend schema changes may therefore require a
+corresponding frontend type change.
 
 ### In the wild
 
@@ -399,10 +405,10 @@ function knowing anything about experiments. That's how one fetch wrapper serves
 endpoints with full typing at each call site. Generic _classes_ and _hooks_ work the same
 way: `useApi<T>(fetcher: () => Promise<T>)` returns `{ data: T | null, ... }`.
 
-**`unknown`** is the type for "a value we haven't looked at yet." Unlike `any`, you can't
-_do_ anything with an `unknown` until you narrow it (`typeof`, `instanceof`, `in`, a type
-guard). It's the honest type for a parsed JSON body, an error's `detail`, or a caught
-exception — and the dashboard uses it at every edge.
+`unknown` describes a value whose structure has not yet been checked. Unlike `any`, it requires
+narrowing before most operations, using `typeof`, `instanceof`, `in` or a type guard. This is useful
+for parsed JSON, an error's `detail` and caught exceptions, all of which enter the dashboard from
+outside the immediate function's guarantees.
 
 #### Why `apiFetch` is generic but `ApiError.detail` is `unknown`
 
@@ -585,10 +591,10 @@ Record<string, unknown>>` — so `keyof T` is usable for field names:
 export function useForm<T extends Record<string, unknown>>(options: UseFormOptions<T>): UseFormResult<T> {
 ```
 
-> **Watch Out!** `as` is not a conversion; it's you telling the compiler to believe you.
-> `(parsed as { detail: unknown }).detail` in `readErrorDetail` is guarded by
-> `'detail' in (parsed as object)` — the check makes the assertion honest. An `as` with no
-> check nearby is a review comment.
+> **Watch Out!** A type assertion with `as` does not convert or validate a value at runtime.
+> In `readErrorDetail`, the check `'detail' in (parsed as object)` precedes access through
+> `(parsed as { detail: unknown }).detail`. Review assertions together with the runtime checks
+> that justify them.
 
 > **Did You Know?** `Promise<T>` and `Promise<void>` are how async functions are typed;
 > `apiFetch<void>` on a DELETE returns `undefined` for a 204, and `readSuccessBody` handles

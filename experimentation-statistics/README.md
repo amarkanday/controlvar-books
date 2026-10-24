@@ -2,20 +2,11 @@
 
 ### _The Experimently Edition — The Maths Behind the Results Page, in 12 Hours_
 
-> **Preface.** This is a **specialization** book, not a core-path one. After the
-> [core four](../README.md) (Python → FastAPI → React/Next.js → Build a Platform) you
-> understand the whole system; this book goes deep on the part that makes Experimently a
-> _decision_ tool rather than a counting tool: the statistics. A results page is a set of
-> claims — "treatment is 12% better," "p = 0.03," "probability to be best 0.94," "stop now" —
-> and each claim is only as good as the method behind it and the assumptions it makes. You'll
-> learn what each number means, how the code computes it, where it lies, and how the
-> platform stops it lying (SRM checks, minimum sample sizes, always-valid p-values, seeded
-> Monte Carlo). Read this if you'll touch `sufficient_stats_analysis.py` (where the proportion
-> and mean maths now lives), `analysis_service.py`, `srm_service.py`,
-> `sequential_testing_service.py`, `cuped_service.py`, `bayesian_service.py`,
-> `bandit_service.py`, `core/stats_engine.py`, `core/analysis_status.py`, the results
-> endpoint, or the results dashboard — or if you'll be the person a product manager asks
-> "can we ship?"
+> **Preface.** This book explains the statistical methods behind Experimently's results and how they are
+> implemented. It covers randomisation checks, conversion-rate comparisons, power, sequential
+> testing, variance reduction, Bayesian analysis, bandits and multiple comparisons. The examples
+> connect calculations to service code and API responses, including the limits of each analysis.
+> It is intended for engineers maintaining the results system and people interpreting its output.
 
 ---
 
@@ -60,12 +51,9 @@ virtualenv active and `APP_ENV=test`.
 
 Part IV Hour 12 explains the `analysis_status` table behind the beta labels.
 
-> **The one idea to anchor on:** a randomised experiment makes two groups
-> **exchangeable** — identical in expectation except for the treatment. Every statistic on
-> the platform is a way of asking "given exchangeability, how surprising is this
-> difference?" and every honesty check is a way of asking "was exchangeability actually
-> true?" Break exchangeability (an SRM, a bandit shifting traffic, a targeting bug) and the
-> p-value is arithmetic on a lie.
+> The interpretation of a result depends on its allocation, metric definition and statistical
+> assumptions. Start with those conditions when investigating a surprising result; a computed
+> p-value does not establish that the data collection was valid.
 
 ---
 

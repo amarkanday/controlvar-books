@@ -2,26 +2,22 @@
 
 ### _The Experimently Architecture — How a Real A/B-Testing & Feature-Flag Platform Is Actually Built_
 
-> **Preface.** You've learned [Python](../learn-python-in-24-hours/README.md),
-> [FastAPI](../learn-fastapi-in-24-hours/README.md) and
-> [React/Next.js](../learn-react-nextjs-in-24-hours/README.md). You can read the code. This
-> book answers the bigger question: **how do all the pieces fit together to make a real
-> platform?** It's a guided tour of the _entire_ Experimently stack — a FastAPI backend that
-> assigns users to variants and evaluates feature flags, a statistics engine that turns events
-> into decisions, five background schedulers that keep experiments and rollouts moving, a
-> Next.js dashboard, sixteen SDKs speaking one contract, and AWS infrastructure in CDK —
-> explaining not just _what_ each technology is, but _how Experimently uses it and why._ By
-> Day 28 you'll understand the system well enough to extend it.
+> **Preface.** This book explains how Experimently's components work together. It assumes the Python,
+> FastAPI and React/Next.js material from the earlier books, then follows an experiment through
+> assignment, event collection, analysis and the dashboard. Later chapters cover targeting,
+> schedulers, SDKs, deployment and operations. Each week ends with a practical exercise that
+> connects the components discussed in that week.
 
 ---
 
-## Why 28 days (and not 7)
+<a id="why-28-days-and-not-7"></a>
 
-A todo app fits in a weekend. **Experimently is a production system** — a core backend with
-about forty API router modules, a set of optional modules beside it, five schedulers, a stats
-engine, a Next.js dashboard, sixteen SDKs (13 of them run against a live backend in CI), and 20
-required status checks on every pull request. Teaching it honestly takes four weeks, one theme
-each:
+## How the book is organized
+
+The book is divided into four weeks, each covering a different area of the platform. The order
+starts with the experiment workflow, then adds request handling, advanced features and operations.
+The reviewed system includes optional modules, five schedulers, sixteen SDKs and the application
+checks discussed in the final week.
 
 - **Week 1 — The Core Loop.** Assign a user, track an event, compute a result. The domain
   model, deterministic hashing, conversion matching, and the statistics that turn counts into a
@@ -51,9 +47,9 @@ Each **Day** is a full chapter-length lesson (set aside ~2–3 hours) with the s
 3. **Build It** — a concrete exercise (often: find/trace/modify something in the repo).
 4. **Key takeaways**, then a **Q&A** that pressure-tests what you just read.
 
-Sams-style sidebars — **By the Way**, **Watch Out!**, **Did You Know?** — run throughout.
-Each **Week** ends with a **Capstone** that traces one real feature end-to-end, then a
-**Workshop**: a quiz (with answers) and exercises (with worked solutions) to lock it in.
+Sidebars provide additional context and point out limitations. Each week ends with a capstone
+that traces a feature across components, followed by a workshop with questions, a quiz and worked
+exercise solutions.
 
 > **Convention.** `# 📁 path` = real Experimently source. Snippets are sometimes trimmed for
 > teaching; the file path lets you read the full version. You'll need a clone of the
@@ -69,7 +65,8 @@ Each **Week** ends with a **Capstone** that traces one real feature end-to-end, 
 
 ## The whole system on one page
 
-Before Day 1, here's the map. Keep it handy; every Day fills in one box.
+The following diagram shows the main components and request paths. Refer to it when tracing the
+individual services in the chapters.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐

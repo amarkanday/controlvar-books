@@ -2,11 +2,11 @@
 
 ### _The Experimently Edition — Decisions, Reliability and Safe Change, in 12 Hours_
 
-> **Preface.** This is a **specialization** book. The core four teach you to read and extend
-> Experimently; this one teaches you to review the decisions around a change: what the experiment
-> measures, what retries and replicas guarantee, who may access data, and how to ship and retire
-> behavior without overlooking old clients or retained copies. It connects the statistics, SDK and
-> operations books through worked engineering problems rather than repeating their setup instructions.
+> **Preface.** This book covers engineering decisions that span Experimently's subsystems. It begins with
+> measurement and experiment design, then examines retries, schedulers, database changes,
+> authorization and data handling. The final Part covers flag retirement and a worked feature
+> review. Use it alongside the statistics, SDK and operations books when a change affects more
+> than one layer of the application.
 >
 > Verified against getexperimently/experimently at `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
 > (source review, 2026-10-23). Other books retain the reference commits named in their own READMEs.
@@ -23,10 +23,10 @@
 
 ## How to use this book
 
-12 lessons in 4 Parts, following the library's rhythm: **What & why → How Experimently does it →
-Try It Yourself → Key takeaways**, with a **Workshop** per Part containing Q&A, a quiz with answers
-and an exercise with a worked solution. Each Hour identifies a concrete review artifact.
-The hours organize study; allow additional time for exercises that require a local stack.
+The 12 lessons are grouped into four Parts. Each explains a problem, examines the implementation
+and provides an exercise with a worked answer. Workshops review the material through questions,
+quizzes and additional exercises. Each lesson identifies a document or result to produce during
+review. Allow extra time for exercises that require a local stack.
 
 Source links are pinned to the reviewed app commit. “Implemented” describes that snapshot;
 “recommended practice” describes a procedure, not an automatic platform feature. Worked data and
@@ -50,9 +50,9 @@ REF=07a430df5b54b0e5dd71ddca95071ced05e9e36c make check SCOPE=production-enginee
 This scopes the app-dependent checks to this book and still checks links across the whole library.
 It does not re-verify the older books against the newer commit.
 
-> **The one idea to anchor on:** a production change is a set of claims about decisions, state,
-> authority and recovery. Make each claim explicit, verify it at its boundary, and keep any missing
-> evidence visible.
+> For each change, identify its expected behavior, affected data and access boundaries, validation
+> evidence and recovery plan. State which checks remain unverified so another reviewer can assess
+> the result without reconstructing the development history.
 
 ---
 

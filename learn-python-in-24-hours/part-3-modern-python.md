@@ -4,12 +4,10 @@
 
 [← Part II](./part-2-data-structures.md) · [Contents](./README.md) · [Part IV →](./part-4-idioms.md)
 
-Parts I and II were the language a script is written in. This Part is the language a
-_codebase_ is written in: how some 70,000 lines of `backend/app` are split into modules and why the import spelling
-matters (Hour 9), classes and the three kinds of method (Hour 10), the two lightweight ways
-to give data a shape — dataclasses and enums (Hour 11), the type-hint vocabulary that
-Pydantic enforces and `mypy` can check (Hour 12), and how errors are raised, caught, chained and — most
-importantly — _not_ swallowed (Hour 13).
+As a Python application grows, module boundaries, interfaces and error handling become as important
+as individual expressions. Hours 9–11 cover imports, classes, dataclasses and enums. Hour 12 explains
+the type annotations used by Pydantic and static checkers. Hour 13 covers exceptions, including how
+to preserve error context and when a fallback can hide a programming defect.
 
 ---
 
@@ -781,9 +779,9 @@ method, not its result.
     ) -> Dict[str, Any]:
 ```
 
-`Union[str, UUID]` says "we accept either" — and the body does `str(experiment_id)` where
-it matters. `-> Dict[str, Any]` is honest (the service returns dicts) and weak (`Any` values);
-the endpoint's response model is where the strong type lives.
+`Union[str, UUID]` allows either input type; the implementation converts `experiment_id` to a
+string where needed. `Dict[str, Any]` describes the service's dictionary result but provides little
+information about its values. The endpoint's response model supplies the more specific structure.
 
 `Literal` and `Annotated` on settings — hints that Pydantic _enforces_:
 
@@ -871,8 +869,8 @@ matters:
     )
 ```
 
-(Three stored shapes; the adapter normalises; `Any` is the honest type. Everywhere else,
-`Any` in a signature is a review comment.)
+The adapter accepts three stored shapes and normalizes them, which explains the use of `Any`
+here. Elsewhere, check whether a more specific type can describe the value before using `Any`.
 
 > **Watch Out!** `Optional[X]` means "or `None`" — it does **not** mean "has a default."
 > `def f(x: Optional[int])` still requires `x` to be passed. Write `x: Optional[int] = None`
@@ -964,11 +962,10 @@ Four disciplines separate exception handling that helps from exception handling 
 
 #### The exception that hid the bug
 
-Hour 1's `get_counters` survived because of `except Exception: logger.warning(...); return
-None`. That handler was _correct_ for its purpose (DynamoDB unavailable → fall back) and
-_catastrophic_ for a typo: it converted a programming error into a silent degradation. The
-lesson isn't "never catch broadly" — the fallback is a feature — it's "a broad catch must be
-loud (log at warning, count a metric) and must be tested with the real collaborator."
+The broad exception handler around Hour 1's `get_counters` call allowed the typo to persist.
+Returning a fallback was intended for DynamoDB failures, but it also caught the programming error.
+When a broad handler is necessary, make its use observable through logging and metrics, and test
+it with the actual collaborator as well as the expected failure cases.
 
 ### In the wild
 

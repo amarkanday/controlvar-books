@@ -4,11 +4,9 @@
 
 [← Part IV](./part-4-data-and-forms.md) · [Contents](./README.md) · [Part VI →](./part-6-production.md)
 
-Three hours on what the user sees. Tailwind — utility classes as the design system, and the
-few tokens the dashboard adds (Hour 18); the targeting rule builder — the most complex piece
-of client state, shaped exactly like the JSON the backend expects (Hour 19); and charts with
-Recharts, including the mocking trick that lets hundreds of Jest tests render charts without
-a canvas (Hour 20).
+Hours 18–20 cover three UI subsystems: Tailwind styling, the targeting-rule builder and Recharts
+visualizations. The examples show how the rule builder produces the JSON expected by the API and
+how chart components are rendered in Jest tests without a browser canvas.
 
 ---
 

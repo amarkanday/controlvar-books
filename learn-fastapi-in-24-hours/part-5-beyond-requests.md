@@ -4,12 +4,10 @@
 
 [← Part IV](./part-4-sqlalchemy.md) · [Contents](./README.md) · [Part VI →](./part-6-testing-and-operating.md)
 
-Not everything is a request that gets a response. This Part covers the three things the
-backend does that don't fit that shape: work on a timer with no request at all (Hour 19), long
--lived connections that push data to clients (Hour 20), and a fast shared store that survives
-across requests and processes — and the discipline of degrading gracefully when it isn't
-there (Hour 21). Each is where the `async` half of "async web framework" stops being a
-formality.
+Several backend operations have lifetimes that differ from an HTTP request. Hour 19 covers
+scheduled work. Hour 20 covers WebSocket connections and server-to-client updates. Hour 21 examines
+Redis as a shared store, including the application's behavior when it is unavailable. These
+examples show where blocking calls, cancellation and resource cleanup need explicit handling.
 
 ---
 

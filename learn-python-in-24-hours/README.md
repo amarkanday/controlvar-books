@@ -2,36 +2,24 @@
 
 ### _The Experimently Edition — Teach Yourself Modern, Typed Python From Zero Using a Real Codebase_
 
-> **Preface.** Most Python tutorials teach the language with `print("Hello")` and a
-> shopping-cart class, then stop before the parts a production codebase actually runs on —
-> type hints, dataclasses, generators, context managers, `async`, threads, hashing, testing.
-> This book is different. Every concept is taught **twice**: once in the abstract, and once
-> with a real snippet pulled from the **Experimently** backend (an A/B-testing and
-> feature-flag platform: about 70,000 lines of type-hinted Python 3.11 in `backend/app`, some
-> 16,000 tests). By Hour 24 you
-> won't just _know_ Python — you'll know how a disciplined team uses it to run a service
-> where a single naive `datetime` once stopped every rollout in production (you'll meet that
-> bug in Hour 17), and where a method that didn't exist silently ran for months (Hour 1).
+> **Preface.** This book introduces Python through examples from Experimently's backend. It begins with
+> values, control flow and functions, then covers the modules, types, resource management and
+> concurrency patterns used by the application. The final lessons cover numerical libraries,
+> testing and coding conventions. Short examples introduce each language feature before the
+> corresponding repository code is examined.
 
 ---
 
 ## Who this book is for
 
-- **Engineers new to Python** joining Experimently (or any modern Python backend) who want
-  to go from zero to "I can read and extend this repo" fast.
-- **Developers from other languages** (TypeScript, Java, Go) who keep bouncing off Python's
-  idioms — comprehensions, decorators, `yield`, `with`, `async` — because tutorials never
-  show _why_ you'd reach for them.
-- **Reviewers** who want one reference for the Python conventions this codebase enforces,
-  so code review is about substance, not style.
-
-You need: basic programming literacy in any language (variables, loops, functions). You do
-**not** need prior Python.
+This book is for developers new to Python, engineers joining the backend team and reviewers who
+need to understand the repository's Python conventions. It assumes familiarity with variables,
+loops and functions in another language. Prior Python experience is not required.
 
 ## How to use this book
 
-It's structured as **24 one-hour lessons**, grouped into six Parts. Each Hour follows the
-same rhythm so you can pace yourself:
+The 24 lessons are grouped into six Parts. Each lesson introduces a concept, examines its use
+in the repository and provides an exercise:
 
 1. **What & why** — the concept and the problem it solves.
 2. **In the wild** — the real Experimently code that uses it (file path included so you can
@@ -39,7 +27,7 @@ same rhythm so you can pace yourself:
 3. **Try It Yourself** — a short exercise in a Python shell or a scratch file.
 4. **Common mistakes** and **Key takeaways** — the 3–5 things to remember.
 
-Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lock it in.
+Each Part ends with a workshop containing questions, a quiz and exercises with solutions.
 
 > **Convention in this book.** Code blocks tagged `# 📁 path/to/file.py` are real, current
 > Experimently source. Blocks with no path are illustrative. `# ✅` marks the idiom we want;
@@ -49,27 +37,28 @@ Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lo
 
 ---
 
-## The Experimently Python Creed (read this first)
+<a id="the-experimently-python-creed-read-this-first"></a>
 
-Six rules drive almost every Python decision in this repo. You'll learn the machinery behind
-each over the next 24 hours; keep them in view as your North Star:
+## Python conventions used in this book
 
-1. **Python 3.11, type hints on every signature.** Not decoration — the hints are how
-   Pydantic and FastAPI know what a request means, and what `mypy` reads when you run it.
-   (`mypy` is configured in `pyproject.toml` but no CI gate runs it; ruff and the tests are
-   what CI enforces.) → Hours 12, 24
-2. **Fully qualified imports, always.** `from backend.app.models.metrics.metric import RawMetric`
-   — never `from app.…`, never relative. Two spellings of one module produce two classes and
-   a runtime error. → Hour 9
-3. **Explicit over clever.** A cumulative-distribution loop beats a one-line trick; a
-   dataclass beats a tuple of unnamed things; a named constant beats a magic string
-   (`REASON_HOLDOUT = "holdout"`). → Hours 5, 11
-4. **Determinism is a feature.** Hashes, not random; seeded RNGs, not `random.random()`;
-   naive UTC everywhere a column is naive. → Hours 17, 21
-5. **Never swallow what you didn't expect.** Catch specific exceptions; re-raise what you
-   can't handle; let `CancelledError` through. → Hours 13, 19
-6. **Test the real thing.** Mocks for what you don't own; the real function, the real
-   database, for what you do. → Hour 23
+The following conventions recur throughout the backend. The lesson references explain their
+implementation and the cases where extra care is required:
+
+1. **Use Python 3.11 and annotate function signatures.** Pydantic and FastAPI use annotations
+   at validation boundaries. `mypy` is configured but not run by a CI gate at the reviewed
+   revision; CI enforces Ruff and tests. See Hours 12 and 24.
+2. **Use fully qualified imports.** For example,
+   `from backend.app.models.metrics.metric import RawMetric`. Loading a module through inconsistent
+   paths can create distinct class objects and runtime failures. See Hour 9.
+3. **Prefer explicit data structures and operations.** Named dataclass fields and constants such as
+   `REASON_HOLDOUT = "holdout"` make interfaces easier to inspect than unnamed tuples or repeated
+   string literals. See Hours 5 and 11.
+4. **Preserve reproducibility and time conventions.** Use the specified hash functions and seeded
+   random generators, and handle naive UTC columns consistently. See Hours 17 and 21.
+5. **Handle exceptions at a boundary that can act on them.** Catch expected failures, preserve
+   unexpected errors and allow cancellation to propagate. See Hours 13 and 19.
+6. **Test owned behavior with its actual implementation.** Use real functions and database paths
+   where the behavior depends on them; substitute external systems where appropriate. See Hour 23.
 
 ---
 
@@ -77,8 +66,8 @@ each over the next 24 hours; keep them in view as your North Star:
 
 ### Part I — Getting Started _(Hours 1–4)_ → [`part-1-getting-started.md`](./part-1-getting-started.md)
 
-- **Hour 1** — Why Python? The method that didn't exist
-- **Hour 2** — Values, types and variables (and the 0–1 vs 0–100 trap)
+- **Hour 1** — Python in the backend
+- **Hour 2** — Values, types, variables and units
 - **Hour 3** — Control flow: `if`, `for`, `while`, truthiness
 - **Hour 4** — Functions: arguments, defaults, return values, docstrings
 
@@ -102,7 +91,7 @@ each over the next 24 hours; keep them in view as your North Star:
 - **Hour 14** — Decorators
 - **Hour 15** — Context managers and `with`
 - **Hour 16** — Iterators, generators, and `yield`
-- **Hour 17** — Dates and times: the naive/aware bug that stopped every rollout
+- **Hour 17** — Dates and times: naive and timezone-aware values
 
 ### Part V — Concurrency _(Hours 18–20)_ → [`part-5-concurrency.md`](./part-5-concurrency.md)
 

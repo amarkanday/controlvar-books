@@ -4,12 +4,10 @@
 
 [← Part V](./part-5-beyond-requests.md) · [Contents](./README.md)
 
-The last three hours are about trust: how you know an endpoint works (Hour 22), how you test
-the paths that touch a real database without the tests trampling each other (Hour 23), and
-how the running service tells you it's healthy — plus the style guide that collects every
-convention this book has taught (Hour 24). Hour 22 opens with the incident that reshaped the
-platform's testing policy; keep it in mind whenever you're tempted to mock the thing you're
-testing.
+Hours 22 and 23 cover endpoint testing and database-backed integration tests. They explain the
+difference between testing a response in isolation and exercising the collaborators that produce
+it, including the repository's approach to per-process test databases. Hour 24 covers health checks
+and summarizes the backend conventions used throughout the book.
 
 ---
 
@@ -308,10 +306,9 @@ Run both: `python -m pytest backend/tests/integration/api/<your file> backend/te
 
 ### What & why
 
-A test that touches PostgreSQL needs four things the harness provides: a database that's
-_yours_ (not the dev one, not another process's), a schema that matches the models, a session
-whose lifetime you control, and cleanup that doesn't deadlock. Each was learned the hard way,
-and each is documented in the conftest itself.
+The database test harness provides an isolated database, a schema matching the models, a controlled
+session lifetime and cleanup. Isolation prevents a test run from modifying the development database
+or interfering with another process. The conftest documents how these resources are allocated.
 
 1. **Environment before import.** The schema name is fixed when `backend.app.models` is
    imported (`get_schema_name()` reads `APP_ENV`/`TESTING`), so the conftest sets them at the
@@ -530,9 +527,8 @@ Then write a fixture in the house style — `make_flag(**overrides)` that insert
 
 ### What & why
 
-An API you can't observe is an API you can't operate. Three built-in signals, each with a
-specific consumer, and then the checklist that turns twenty-three hours of conventions into
-something you can review a pull request against.
+The API exposes three operational signals for different consumers. This lesson explains their
+purpose and then collects the backend conventions into a pull-request review checklist.
 
 - **Structured logs** (`structlog`): JSON outside development (for CloudWatch Logs
   Insights), console in development; every line carries the request id, path and method

@@ -4,20 +4,23 @@
 
 [← Back to Contents](./README.md)
 
-This Part is Python from nothing: what the language is and why a platform is written in it
-(Hour 1), the values it computes with and the one unit mismatch that lives in this repo
-(Hour 2), how a program decides and repeats (Hour 3), and how work is packaged into functions
-(Hour 4). Open a shell — `python` with the repository's virtualenv active — and type every
-example. Python is a language you learn at the prompt.
+This Part introduces the Python needed to follow the backend examples. Hour 1 explains the
+language's execution and type model. Hour 2 covers values and operators, including a unit mismatch
+from the repository. Hours 3 and 4 cover control flow and functions.
+
+Activate the repository's virtual environment and run the examples in a Python shell. Inspect the
+value and type of each result before moving on.
 
 ---
 
-## Hour 1 — Why Python? The method that didn't exist
+<a id="hour-1--why-python-the-method-that-didnt-exist"></a>
+
+## Hour 1 — Python in the backend
 
 ### What & why
 
-Python is a **high-level, dynamically typed, interpreted** language. Three words, three
-consequences:
+Python is a high-level, dynamically typed language. Its interpreter compiles source to bytecode
+and executes it. These properties have practical consequences for how backend code is written:
 
 - **High-level**: you write `total += variant.traffic_allocation` and never think about
   memory, pointers or integer widths. The language manages objects for you.
@@ -28,17 +31,17 @@ consequences:
 - **Interpreted**: there's no separate compile step. `python script.py` reads, compiles to
   bytecode in memory, and runs. The feedback loop is seconds.
 
-Why does a production experimentation platform choose it? Because the backend's job is
-_glue with judgement_: parse requests, query a database, run a statistical test, decide.
-Python has the best ecosystem in the world for the "judgement" part — NumPy, SciPy, pandas —
-and a mature web stack (FastAPI, SQLAlchemy) for the glue. The costs — it's slower than Go
-or Java per line, and dynamic typing lets mistakes wait — are real, and the platform pays
-them deliberately: hot paths are short database reads, heavy maths is NumPy (which is C
-underneath), and functions are type-annotated so a checker like `mypy` can catch what the
-interpreter won't. (Annotations are the convention, not a gate: `mypy` is configured in
-`pyproject.toml` but no CI job runs it. Hour 12.)
+Python provides numerical libraries such as NumPy, SciPy and pandas alongside web libraries such
+as FastAPI and SQLAlchemy. This suits a backend that combines request handling, database access
+and statistical calculation. Much numerical work runs in compiled library code; request paths
+also spend time waiting for storage. Dynamic typing still allows mistakes to reach runtime, so the
+repository uses annotations and validation at important boundaries. `mypy` is configured in
+`pyproject.toml`, but it is not run by a CI job at the reviewed revision; annotations remain a
+convention rather than a fully enforced static-checking gate (Hour 12).
 
-#### The method that didn't exist
+<a id="the-method-that-didnt-exist"></a>
+
+#### Case study: an invalid counter-service call
 
 Here is the dynamic-typing cost, concretely, from this codebase. The multi-armed bandit
 scheduler reads per-variant counts from a DynamoDB counter service:
@@ -161,7 +164,9 @@ Then, with the venv active, import something real and look at it:
 
 ---
 
-## Hour 2 — Values, types and variables (and the 0–1 vs 0–100 trap)
+<a id="hour-2--values-types-and-variables-and-the-01-vs-0100-trap"></a>
+
+## Hour 2 — Values, types, variables and units
 
 ### What & why
 
@@ -185,7 +190,9 @@ Operators are what you'd expect, plus a few worth learning on day one: `//` (flo
 `%` (modulo — the bucket operator in this codebase), `**` (power), and `is`/`is not` for
 identity.
 
-#### The 0–1 vs 0–100 trap
+<a id="the-01-vs-0100-trap"></a>
+
+#### Proportions and percentages
 
 Types tell you _what kind_ of value, not _what unit_. `traffic_allocation` is an `int` in
 the API and the database, meaning a **percentage 0–100**; the Lambda functions under
@@ -347,10 +354,10 @@ traffic_allocation`.
 
 ### What & why
 
-Python's control flow is indentation-delimited: a colon opens a block, and the block is
-whatever's indented beneath it (four spaces, enforced by `ruff format`). There are no braces and no
-`end`. That makes structure visible at a glance and makes a misindented line a logic
-change, not a syntax error — worth knowing when you paste code.
+Python uses indentation to delimit blocks. A colon introduces the block, and the indented
+statements form its body; the repository's formatter uses four spaces. Changing indentation can
+change which statements execute under a condition or loop, even when the result remains valid
+syntax. Check indentation when copying or moving code.
 
 - `if` / `elif` / `else` — chained conditions; the first true branch runs.
 - `for x in iterable:` — iterates _values_, not indices. `for i, x in enumerate(xs)` when

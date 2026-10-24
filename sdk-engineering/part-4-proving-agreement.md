@@ -4,14 +4,11 @@
 
 [← Part III](./part-3-sixteen-sdks.md) · [Contents](./README.md)
 
-Sixteen implementations of one contract are only "one SDK" if you can prove it. This Part is
-the proof machinery. Hour 10 is the unit level: fake transports and recorded requests that
-let every contract rule be asserted offline in milliseconds, and a corpus generated from the
-server that holds local evaluation to the server's answers. Hour 11 is the integration
-level: `contract_smoke`, one entry point per SDK that prints one JSON line, and the runner
-that executes them against a real backend on every pull request. Hour 12 is what to do with
-the proof — what each SDK has actually been run against, how to change a contract sixteen
-clients depend on without breaking any of them, and how an SDK is released.
+The SDK test suites check agreement at several levels. Hour 10 covers fake transports, recorded
+requests and the generated corpus for local evaluation. Hour 11 covers the `contract_smoke` entry
+points and the live-backend runner. Hour 12 reviews coverage limits, contract changes and SDK releases.
+Passing an offline test and passing a live integration test provide different evidence; both are
+useful when maintaining clients in several languages.
 
 ---
 
@@ -290,11 +287,10 @@ read `_request`'s `if not response.body: return None` to see why it passes.
 
 ### What & why
 
-The September rewiring was triggered by a discovery that unit tests could never have made:
-SDKs with green suites were calling endpoints that didn't exist, or bucketing locally with a
-hash the server didn't share. The fix wasn't more unit tests; it was a test that runs each
-SDK **against the real backend** and checks the things that matter — assignment is sticky
-_on the server_, the flag comes back enabled, events are accepted, key-less events fan out.
+The SDK changes followed failures that isolated client tests had missed: requests used nonexistent
+endpoints, and local assignment used a different hash from the backend. Live-backend tests exercise
+the connection between the implementations. They check persisted assignment stickiness, flag
+evaluation, accepted events and fan-out for events without an experiment key.
 
 The design has three parts. Every SDK has a **`contract_smoke`** entry point: a small
 program in the SDK's own language that runs the four calls and prints **one JSON line** to
@@ -589,12 +585,10 @@ the fixture is what the seed promised.
 
 ### What & why
 
-The last hour is process, because the hardest part of sixteen SDKs is not writing them — it's
-_changing_ them. A field renamed on the server is sixteen releases; a new endpoint is sixteen
-features; a fix to the fan-out rule is sixteen chances to introduce a behavioural fork. The
-platform's defences are a clear record of **how much each SDK has actually been run**, a
-**drift discipline** for what counts as a contract change, an **order of operations** for
-making one, and a **release path** that ships one SDK at a time.
+Changing a shared contract requires coordination across SDKs and releases. A renamed response
+field, a new endpoint or a revised fan-out policy can affect several independently maintained
+clients. This lesson records what each SDK has been tested against, explains how to assess and
+sequence a contract change, and describes the per-SDK release process.
 
 ### How Experimently does it
 

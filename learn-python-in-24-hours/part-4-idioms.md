@@ -4,13 +4,11 @@
 
 [← Part III](./part-3-modern-python.md) · [Contents](./README.md) · [Part V →](./part-5-concurrency.md)
 
-Four features that make Python code look like Python: decorators, which wrap functions with
-behaviour (Hour 14); context managers, which guarantee cleanup (Hour 15); generators, which
-produce values lazily and are the mechanism under half of FastAPI (Hour 16); and the
-standard library's `datetime`, whose naive/aware split stopped every rollout in this platform
-until one function was written (Hour 17). You've already been _using_ all four — `@router.get`,
-`with scheduler_lock(...)`, `yield db`, `datetime.utcnow()` — this Part is where you learn
-what they are.
+The backend uses decorators to register routes and validators, context managers to release
+resources, and generators to supply dependencies. Hours 14–16 explain how these mechanisms work.
+Hour 17 covers date and time handling through a scheduler failure caused by comparing naive and
+timezone-aware values. The examples connect familiar constructs such as `@router.get` and
+`yield db` to their underlying Python behavior.
 
 ---
 
@@ -35,11 +33,11 @@ the wrapper under the original name. `functools.wraps` copies the original's nam
 docstring onto the wrapper so `help()`, logging and FastAPI's introspection still see the
 real function.
 
-Decorators are how this codebase says "this function is a route" (`@router.post`), "this
-method is a validator" (`@field_validator`), "this is a computed attribute" (`@property`),
-"this is a test that runs on an event loop" (`@pytest.mark.asyncio`), "this generator is a
-context manager" (`@contextmanager`), and "retry this on failure" (`@with_retry`). Reading
-a decorator's definition once turns each of those from magic into a function call.
+The backend uses decorators for several tasks: registering routes (`@router.post`), declaring
+validators (`@field_validator`), exposing computed attributes (`@property`), marking async tests
+(`@pytest.mark.asyncio`), creating context managers (`@contextmanager`) and wrapping retries
+(`@with_retry`). Inspect a decorator's definition to see which function it receives, what it returns
+and when its added behavior runs.
 
 #### Decorators with arguments
 
@@ -573,8 +571,8 @@ generators it's a five-line loop.
                 rule_id = str(rule.get("id", f"rule_{i}"))
 ```
 
-`iter()`/`next()` under the hood, and why exhausting a generator matters — a generator can
-be consumed once:
+The following example uses `iter()` and `next()` explicitly. It also shows what happens after a
+generator is exhausted:
 
 ```python
 >>> gen = (x * 2 for x in [1, 2, 3])
@@ -637,7 +635,9 @@ Then read `backend/app/api/v1/endpoints/bulk_toggle.py::stream_audit_logs` and c
 
 ---
 
-## Hour 17 — Dates and times: the naive/aware bug that stopped every rollout
+<a id="hour-17--dates-and-times-the-naiveaware-bug-that-stopped-every-rollout"></a>
+
+## Hour 17 — Dates and times: naive and timezone-aware values
 
 ### What & why
 
@@ -653,7 +653,9 @@ Arithmetic between them raises too. Everything else — `timedelta`, `.isoformat
 `fromisoformat`, `.replace(tzinfo=...)`, `.astimezone(...)` — works on both, which is how
 the two kinds spread through a codebase unnoticed until a comparison meets them.
 
-#### The bug
+<a id="the-bug"></a>
+
+#### Case study: incompatible timestamp values
 
 The platform's columns are `DateTime` without `timezone=True` (Hour 14 of the FastAPI
 book): PostgreSQL stores naive timestamps and SQLAlchemy returns naive `datetime`s. The

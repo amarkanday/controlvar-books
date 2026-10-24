@@ -4,14 +4,10 @@
 
 [← Part I](./part-1-the-contract.md) · [Contents](./README.md) · [Part III →](./part-3-sixteen-sdks.md)
 
-Part I fixed the semantics. This Part reads three real implementations of them, chosen because
-each one faces a different environment. The Python SDK (Hour 4) is the reference: synchronous,
-dependency-free, thread-safe, with a transport abstraction that makes it testable. The
-JavaScript SDK (Hour 5) has to work in Node and in browsers, where `fetch` has no timeout,
-requests are concurrent by default, and "never reject" needs an escape hatch. The React SDK
-(Hour 6) wraps the same client in a provider and hooks, adds an SSR entry point, and is the
-one two demo apps consume from source — the integration the rest of the platform is judged
-by.
+This Part examines the Python, JavaScript and React implementations of the SDK contract. Hour 4
+covers Python's synchronous transport and thread-safe client. Hour 5 covers JavaScript in Node and
+the browser, including timeouts, concurrent requests and error handling. Hour 6 covers the React
+provider, hooks and server-side rendering entry point, with examples from the two demo applications.
 
 ---
 
@@ -19,13 +15,11 @@ by.
 
 ### What & why
 
-The Python SDK's server mode is a 591-line client plus four small modules — and the four
-modules are the design. **Transport** isolates HTTP so the client can be tested without a network and
-users can swap `urllib` for `requests` or `httpx`. **Request** is one private method that
-turns a `(method, path, body, query)` into decoded JSON or a typed error, with the 429 retry
-in exactly one place. **Cache** is the `UserKeyCache` from Hour 3, twice. **Types** are
-frozen dataclasses so callers get attribute access, equality (the contract smoke compares two
-assignments with `==`) and nothing mutable.
+The Python SDK separates transport, request handling, caching and result types. The transport
+interface allows HTTP implementations to be replaced in tests or integrations. A shared request
+method handles serialization, response decoding, typed errors and 429 retry. Assignment and flag
+caches use `UserKeyCache`. Frozen dataclasses provide named result fields and value equality without
+allowing callers to mutate the returned records.
 
 The constraint that shaped it: **no runtime dependencies**. A server-side SDK gets installed
 into applications with their own pinned `requests`/`urllib3`/`httpx` versions; a dependency
@@ -289,13 +283,12 @@ send(self, *a): print(a[0], a[1]); return super().send(*a)`) and watch the cache
 
 ### What & why
 
-The JS SDK implements the same contract for two hostile-in-different-ways environments.
-**Browsers**: `fetch` has no timeout (you need `AbortController`), a page fires many
-concurrent calls for the same user on first render, `crypto.subtle` has no MD5 and is
-async anyway, and "call `fetch` bound to an object" throws `Illegal invocation`. **Node**: the
-global `fetch` exists from 18 onward but integrators on older runtimes or with `undici`
-wrappers need to inject their own. And in both, `track` "never rejects" means an unhandled
-failure is invisible — so there's an `onError` hook.
+The JavaScript SDK supports browsers and Node, which impose different transport constraints.
+Browser `fetch` needs explicit timeout handling through `AbortController`, and initial page renders
+can issue concurrent requests for the same user. Browser cryptography does not provide MD5 through
+`crypto.subtle`; injected `fetch` functions also need the correct binding. Node supplies global
+`fetch` from version 18, while integrations may inject another implementation. An `onError` hook
+makes failures observable for operations such as `track` that do not reject.
 
 The additions over Python, then: an abort-based timeout, **in-flight deduplication** (ten
 components asking for the same flag share one request), a custom `fetch` slot, `onError`,
@@ -587,11 +580,10 @@ for `NETWORK_ERROR`.
 
 ### What & why
 
-React changes the shape of the problem. A component can't `await` in render; it needs a
-value _now_ (loading), then a value _later_ (the answer), and it re-renders when either
-changes. The user is app-wide state, not a parameter. And the same code may run on the
-server (Next.js `getServerSideProps`) where there is no DOM, no hooks and no place to keep
-a per-session cache.
+A React integration must represent loading, success and failure as state, then update components
+when the result arrives. It also needs a way to share the current user across components. Server-side
+rendering introduces a separate lifetime: `getServerSideProps` has no DOM or component hooks and
+must not share a user's cached state with unrelated requests.
 
 The React SDK's answers: a **provider** holds one client and one user; **hooks** wrap each
 contract call in `useState` + `useEffect` with loading/error states and _safe defaults while

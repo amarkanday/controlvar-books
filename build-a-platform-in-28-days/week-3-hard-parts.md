@@ -4,12 +4,9 @@
 
 [← Week 2](./week-2-api-and-data.md) · [Contents](./README.md) · [Week 4 →](./week-4-production.md)
 
-Weeks 1 and 2 were the request/response spine. This week is everything that makes Experimently
-more than a CRUD app over five tables: flags that turn on for 5% of users and then 25%, targeting
-rules with twenty operators and three storage shapes, five background loops that must not race
-across replicas, a safety net that rolls a flag back when the crash rate spikes, a statistics
-engine that lets you peek at results without lying to yourself, and sixteen SDKs that all speak
-one contract. By Day 21 you'll narrate a crash spike turning into an automatic rollback.
+Week 3 covers feature flags, targeting, scheduled work, safety monitoring, statistical methods and
+SDK integration. These features use the request and storage patterns introduced in the first two
+weeks. The final exercise follows a crash report through the safety monitor to a flag rollback.
 
 > **Which code this chapter reads.** Every quoted file was checked against
 > getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased changes, including three
@@ -17,15 +14,12 @@ one contract. By Day 21 you'll narrate a crash spike turning into an automatic r
 > refuse unknown keys at every level (#747, Day 16), and the edge bootstrap and OpenFeature flag
 > listings are removed (#770, Day 20).
 
-> **The one sentence to carry through Week 3.** _Everything "clever" in the platform is a
-> deterministic function over the same two tables plus a small amount of persisted state — a
-> flag decision is `md5(user_id:flag.key) % 100 < percentage`, a rule match is a pure function
-> of a normalised context, a scheduler tick is `SELECT … WHERE due` under an advisory lock, a
-> rollback is a threshold over the last 15 minutes of error logs, a bandit weight is a seeded
-> Monte Carlo over conversion counts — and the cleverness is in getting the inputs right, not
-> in the arithmetic._
+> Each subsystem has inputs and persisted state that affect its behavior. Flag rollout uses a
+> user/key hash and percentage; targeting uses normalized context; schedulers select due work
+> under an advisory lock. Safety monitoring reads a trailing error window, while bandit updates
+> use conversion counts and seeded sampling. Check those inputs when investigating a result.
 
-| Day | Topic                              | The one thing it's really about                                     |
+| Day | Topic                              | Focus                                     |
 | --- | ---------------------------------- | ------------------------------------------------------------------- |
 | 15  | Feature flags                      | `enabled` + `reason`, and a hash on `flag.key` instead of an id     |
 | 16  | The rules engine & adapter         | Three storage shapes, one engine, and `expand_context`'s aliases    |
@@ -41,11 +35,9 @@ one contract. By Day 21 you'll narrate a crash spike turning into an automatic r
 
 ### What & why
 
-An experiment asks "which arm?"; a **feature flag** asks "on or off for this user?" — and the
-answer has to be explainable, because the person debugging "why don't I see the new player?"
-needs to know whether it was the kill switch, a targeting rule, or the rollout dice. So the
-flag service returns not just `enabled` but a **`reason`** — `targeting_rule`, `rollout`,
-`inactive` or `error` — and the SDKs surface it.
+A feature-flag evaluation returns whether the flag is enabled for a user and the reason for that
+decision. The `reason` field distinguishes `targeting_rule`, `rollout`, `inactive` and `error`.
+SDKs expose it so an operator can investigate why a particular user received an experience.
 
 Three properties shape the design:
 
@@ -1083,11 +1075,10 @@ tracker, the in-memory rate-limit fallback) isn't shared.
 
 ### What & why
 
-A gradual rollout is a bet that the new code is fine; safety monitoring is the stop-loss. The
-platform watches every **active** flag's error rate (and latency) over a trailing window,
-compares it to per-flag thresholds, and — if the global setting allows — rolls the flag back
-automatically, records why, notifies Slack/email, and **pauses** the flag's rollout schedule so
-nothing raises it again behind your back.
+Safety monitoring checks active flags against configured error-rate and latency thresholds over
+a trailing window. When a threshold is breached and automatic rollback is enabled globally, the
+service changes the flag, records the rollback, sends Slack/email notifications and pauses the
+rollout schedule. Pausing prevents the schedule from increasing exposure again.
 
 The design decisions:
 
@@ -1766,10 +1757,9 @@ from a warehouse in the beta warehouse module, and no warehouse connector is ena
 
 ### What & why
 
-Sixteen SDKs is a lot of code to keep honest (13 of the 16 run against a live backend in CI).
-The way Experimently does it is to make the SDK _small_ — a thin HTTP client with a cache — and
-to make the **contract** the thing that's specified, tested and shared. `docs/sdk-guide.md`
-states it in one table:
+Experimently maintains a shared HTTP contract across sixteen SDKs; thirteen run against a live
+backend in CI. The clients keep most decision logic on the server and implement transport, caching
+and failure behavior locally. `docs/sdk-guide.md` summarizes the contract:
 
 | Purpose                                 | Method and path                                                                      | Response                                                                          |
 | --------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |

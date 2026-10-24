@@ -4,12 +4,12 @@
 
 [← Back to Contents](./README.md)
 
-This Part lays the bedrock the other twenty hours build on: _why_ a Python team reaches for a
-framework that validates before it runs (Hour 1), how an application is assembled from routers
-and documented for free (Hour 2), how inputs are _declared_ rather than parsed (Hour 3), and how
-responses are shaped, coded and refused (Hour 4). Have the API running (`make dev`) and a
-second terminal open — FastAPI is a framework you learn by watching the 422s, and those only
-appear when you send requests.
+A FastAPI endpoint declares the inputs it accepts and the response it returns. This Part follows
+that request lifecycle. Hours 1 and 2 cover validation, application setup, routers and generated API
+documentation. Hours 3 and 4 examine input declarations, response models and HTTP status codes.
+
+Run the API with `make dev` and use a second terminal to send the example requests. Compare valid
+responses with the validation errors returned for invalid input.
 
 ---
 
@@ -17,11 +17,10 @@ appear when you send requests.
 
 ### What & why
 
-FastAPI is a Python web framework built on three ideas: **type hints are the API contract**,
-**validation happens before your code runs**, and **the documentation is generated from the
-same declarations**. You write a function whose parameters say what the request must contain;
-the framework parses, validates, converts, documents and serialises. The value proposition is
-one sentence: **a request that reaches your function is already well-formed.**
+FastAPI uses Python parameter declarations and type annotations to parse requests, validate
+inputs and generate OpenAPI documentation. A path operation describes the data it expects, and
+the framework checks those declarations before calling it. Business rules and checks not expressed
+in the declarations still belong in application code.
 
 The phrase "already well-formed" is load-bearing. In a framework that hands you a raw request,
 every handler begins with defensive code — is the id a UUID? is `limit` an integer, and is it
@@ -793,9 +792,8 @@ async def delete_experiment(...) -> None:
         )
 ```
 
-The results endpoint shows a response model doing real work: the service returns a dict, the
-endpoint builds a typed response — and a failure anywhere in that is a clean 500, never a
-half-rendered JSON:
+The results endpoint constructs a typed response from the service's dictionary. If calculation
+or response validation fails, the endpoint returns a 500 response rather than partial result JSON:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py

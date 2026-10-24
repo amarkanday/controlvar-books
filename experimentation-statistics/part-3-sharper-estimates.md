@@ -4,14 +4,13 @@
 
 [← Part II](./part-2-sequential.md) · [Contents](./README.md) · [Part IV →](./part-4-many-comparisons.md)
 
-Part I asked "is there a difference?"; Part II asked "when may I look?". This Part asks
-three sharper questions. Can pre-experiment data make the same users tell you more — CUPED
-(Hour 7)? Can we answer the question the product manager actually asked, "what's the
-probability B is better, and what do I lose if I'm wrong?" — the Bayesian analysis (Hour 8)?
-And can the experiment _optimise while it runs_, sending more users to the better arm —
-bandits, and what that costs in inference (Hour 9)? The Part ends with the warehouse
-analysis, which computes the same results from per-variant sums without the raw rows ever
-leaving the warehouse.
+CUPED, Bayesian analysis and multi-armed bandits address different requirements. CUPED uses
+pre-experiment observations to reduce variance. Bayesian analysis estimates probabilities and
+expected loss under a specified model. A bandit changes traffic allocation as outcomes arrive.
+Hours 7–9 describe each method, its implementation and the assumptions needed to interpret it.
+
+The final section covers warehouse analysis from per-variant summary statistics, without moving
+raw observations out of the warehouse.
 
 ---
 
@@ -19,11 +18,10 @@ leaving the warehouse.
 
 ### What & why
 
-The width of every interval and the size of every sample-size requirement is driven by one
-thing: the **variance** of the metric. Users differ enormously in how much they spend, how
-often they visit, how likely they are to convert — and most of that variation has nothing
-to do with the treatment. If you knew, for each user, what they were _going to do anyway_,
-you could subtract it and compare only the residual.
+Metric variance affects both confidence-interval width and sample-size requirements. Users differ
+in spending, activity and conversion propensity for reasons unrelated to treatment. Pre-experiment
+observations can explain some of this variation. CUPED uses that information to adjust the outcome
+and compare residual variation between arms.
 
 **CUPED** (Controlled-experiment Using Pre-Experiment Data; Deng, Xu, Kohavi & Walker, 2013)
 does exactly that with a covariate X measured _before_ the experiment — last month's spend,
@@ -192,11 +190,10 @@ its per-user rows from an experiment's assignments and events yet, so
 existing experiment (404 for an unknown one, 422 for a malformed body). It used to answer
 with numbers generated at random (issue #443); the 501 replaced them.
 
-> **Watch Out!** X must be measured **before** assignment. A "covariate" observed during the
-> experiment (sessions this week) can be affected by the treatment, and adjusting on it
-> _introduces_ bias — the classic post-treatment-adjustment mistake. A zero-variance or
-> uncorrelated X gives θ ≈ 0 and no reduction, which is the honest outcome — and exactly what
-> the beta route's placeholder covariate produces.
+> **Watch Out!** Measure X before assignment. A value observed during the experiment, such as
+> sessions that week, may itself be affected by treatment. Adjusting for it can introduce bias.
+> A covariate with no variance or no outcome correlation provides no useful variance reduction.
+> At this book's reference commit, the beta route's placeholder covariate has that limitation.
 
 > **Did You Know?** New users have no pre-period data. The usual treatment is to give them
 > the covariate mean, so their adjustment is zero — they still count, they just don't
@@ -250,11 +247,10 @@ assignment-order covariate gives you.
 
 ### What & why
 
-A frequentist p-value answers a question nobody asked ("how surprising is this data if
-nothing's going on?"). A product manager asks: **what's the probability B is better than A,
-and how much do I stand to lose if I pick wrong?** Bayesian analysis answers those directly by
-treating each arm's conversion rate θ as uncertain, expressing that uncertainty as a
-distribution, and updating it with data.
+Bayesian analysis estimates the uncertainty in each arm's conversion rate θ as a probability
+distribution and updates it with observed data. Under the chosen model and prior, this supports
+quantities such as the probability that treatment is better than control and the expected loss
+from choosing an arm. These quantities answer different questions from a frequentist p-value.
 
 For conversion rates the maths is a gift: the **Beta** distribution is _conjugate_ to the
 binomial, so if the prior on θ is Beta(α, β) and you observe c conversions in n trials, the
@@ -487,11 +483,11 @@ the recommendation and ends the experiment.
 `bayesian_enabled: true` on create or update, with an optional `bayesian_config` (omitted,
 the default `BayesianConfig` is stored). A cloned experiment keeps its analysis settings.
 
-> **Watch Out!** The prior matters at small n. Beta(1, 1) is "uninformative" but it's still
-> a claim that a 90% conversion rate is as plausible as 4%; with 20 users it pulls the
-> posterior toward 50%. For a mature product, an informative prior (Beta(4, 96) for a ~4%
-> baseline, say) is more honest and makes early PtBB numbers less excitable. The
-> `alpha`/`beta` config fields exist for this; the default is a placeholder.
+> **Watch Out!** Prior assumptions have more influence with small samples. Beta(1, 1) is uniform
+> over conversion rates, even when historical rates suggest a much narrower range. A prior such
+> as Beta(4, 96) represents a mean near 4%, but its use should be justified by relevant prior data.
+> The `alpha` and `beta` configuration fields allow this choice. Document the prior and consider
+> how sensitive an early probability-to-be-best estimate is to it.
 
 > **Did You Know?** Bayesian methods don't have a "peeking problem" in the frequentist
 > sense — the posterior is what it is at every look. But a _stopping rule_ on the posterior
@@ -564,12 +560,11 @@ And the A/A calibration in miniature — two identical arms at 1%, 5,000 users e
 
 ### What & why
 
-An A/B test spends the whole run showing half the users the worse variant, so that at the
-end you _know_ which is better. A **multi-armed bandit** spends the run learning _and_
-exploiting: it shifts traffic toward arms that look better as evidence accumulates, so fewer
-users see the loser. The price is inference: the arms are no longer exchangeable (later
-users are routed by earlier outcomes), so the clean causal estimate an A/B test gives is
-gone, and SRM warnings are expected rather than alarming.
+A fixed-allocation A/B test keeps its planned traffic split while estimating treatment effects.
+A multi-armed bandit updates allocation as outcomes arrive, directing more traffic toward arms
+with promising results. Adaptive allocation can improve outcomes during the run, but it also changes
+the sampling process. Ordinary fixed-allocation comparisons need additional care, and allocation
+imbalance is expected rather than necessarily indicating a routing defect.
 
 Three algorithms, one interface (`compute_weights(variant_stats) → {variant_id: weight}`):
 
@@ -757,15 +752,13 @@ def _select_bandit_variant(experiment: Experiment, bandit_state: Optional[Bandit
 
 #### What a bandit costs you
 
-Say it plainly, because the results page can't: **a bandit's per-arm conversion rates are
-biased estimates.** Users routed later are routed _because_ of earlier outcomes; if an arm
-had a lucky start it gets more traffic and its later (regression-to-the-mean) users pull its
-rate down — or a temporal effect (weekend vs weekday) lands unevenly across arms. Thompson
-Sampling's exploration mitigates this but doesn't eliminate it. The honest uses of a bandit:
-(1) a short-lived decision where optimising during the run matters more than knowing the
-effect size afterwards (a promotion banner this week); (2) many arms where an A/B test's
-equal split would waste most users on bad options; (3) a "always-on" optimisation that
-never needs a report. For a decision you'll cite in a quarterly review, run an A/B test.
+Adaptive allocation affects how per-arm conversion rates should be interpreted. Later allocation
+depends on earlier outcomes, and time-varying user populations can reach arms in different
+proportions. Thompson Sampling provides exploration but does not remove every inference concern.
+Bandits are useful when improving outcomes during the run matters more than obtaining a
+fixed-allocation effect estimate, such as a short promotion or an ongoing optimization. When the
+goal is a causal effect estimate for a later decision, use an appropriate experimental design and
+analysis rather than interpreting the raw bandit rates as an ordinary A/B result.
 
 > **Watch Out!** Because a bandit is _supposed_ to drift from the configured split, the SRM
 > check is skipped for `optimization_type != "fixed"`. That also means the one exchangeability

@@ -4,12 +4,13 @@
 
 [← Back to Contents](./README.md)
 
-Three hours on the bedrock. Why randomisation is the whole point and how the platform
-checks that it actually happened (Hour 1); the tests and intervals behind a conversion-rate
-comparison and the labels the dashboard puts on them (Hour 2); and power — the number that
-tells you how many users a decision needs and the gate that stops a lucky early result from
-shipping (Hour 3). Keep a Python shell with `scipy` open; every formula here is one line away
-from a number.
+A conversion-rate comparison depends on three things: a valid allocation of users, a suitable
+statistical test, and enough observations to detect an effect worth acting on. This Part covers
+those requirements in order. Hour 1 explains randomisation and the sample-ratio mismatch check.
+Hour 2 covers tests and confidence intervals for conversion rates. Hour 3 introduces power and
+sample-size planning, including the platform's minimum-sample-size check.
+
+The examples use SciPy. Run them in a Python shell as you work through the calculations.
 
 ---
 
@@ -17,31 +18,30 @@ from a number.
 
 ### What & why
 
-An A/B test is a **randomised controlled experiment**: users are assigned to variants by a
-process that has nothing to do with them — a hash of their id — so the groups are, in
-expectation, identical in every way except the treatment. That property is
-**exchangeability**, and it's what turns a difference in conversion rates into evidence about
-the treatment rather than about who happened to be in which group.
+An A/B test assigns units, usually users, to variants through a randomisation procedure. With
+valid assignment and no other systematic differences introduced by the experiment, the groups are
+comparable in expectation before treatment. This property supports interpreting an outcome
+difference as a treatment effect. The implementation uses a deterministic hash of the user's ID
+to produce stable allocations.
 
-Everything downstream assumes it. The z-test assumes the two samples are draws from the
-same population under the null. The confidence interval assumes the only systematic
-difference is the variant. If exchangeability fails — because a bug assigns iOS users to
-control, because a bot hammers one URL, because a bandit deliberately routes better users
-to the better arm — the p-value is still computed, still small or large, and means nothing.
+The statistical comparison depends on that design. A routing defect that sends a particular user
+population to one arm, uneven collection loss or an adaptive allocation policy can change the
+sampling process. Calculating a p-value does not detect or correct every such problem. Check the
+assignment and collection path before interpreting the test.
 
-You can't observe exchangeability directly. You can observe its most common _symptom_: a
-**sample-ratio mismatch (SRM)**. The experiment was configured 50/50; the assignment counts
-are 6,043 vs 5,712. Under a working randomiser, that's a Bernoulli coin flipped 11,755
-times landing on one side 51.4% of the time — a chi-square goodness-of-fit test says how
-surprising that is. If it's very surprising (p < 0.001), the randomiser isn't doing what you
-think, and nothing else on the page can be trusted until you know why.
+A sample-ratio mismatch (SRM) check compares observed allocation counts with the configured split.
+For example, a 50/50 experiment with counts of 6,043 and 5,712 has assigned 51.4% of 11,755 users
+to one arm. A chi-square goodness-of-fit test measures the evidence against the expected ratio.
+A result below the platform's 0.001 threshold warrants investigation. Passing this check does not
+prove exchangeability; it addresses allocation balance, which is only one requirement.
 
 #### Why p < 0.001, not 0.05
 
-Because the dashboard is polled constantly. An SRM check that fires at p < 0.05 would raise
-a false alarm on one in twenty refreshes of a perfectly healthy experiment. The conventional
-threshold in industry (Microsoft, Booking, Optimizely all use ~0.001) is deliberately
-strict: an SRM warning should be rare and should always mean something.
+The platform uses a stricter threshold for SRM warnings than the 0.05 level often used for outcome
+tests. This reduces warnings caused by ordinary allocation variation. Repeated dashboard refreshes
+are correlated observations, so the threshold should not be interpreted as a guarantee about a
+fixed number of false alarms per refresh. Investigate a warning in the context of the allocation
+and collection process.
 
 ### How Experimently does it
 
@@ -175,9 +175,8 @@ Then simulate the false-alarm rate: draw 10,000 fair 50/50 splits of 10,000 user
 
 ### What & why
 
-A conversion metric is a **proportion**: `converting users / assigned users` per variant.
-Comparing two proportions is the oldest question in statistics, and there are several
-standard tools. This is what the platform uses each one for:
+For a binary conversion metric, each variant's rate is `converting users / assigned users`.
+Several statistical tools can compare these proportions. The platform uses them as follows:
 
 | Question                            | `/results` (every metric)                    | `?breakdown=` segments              |
 | ----------------------------------- | -------------------------------------------- | ----------------------------------- |
@@ -443,12 +442,11 @@ its `sample_size` and `conversions` to `binomial_metric_result` with
 
 ### What & why
 
-A test has two ways to be wrong. A **Type I error** (false positive) is declaring a
-difference that isn't there; α = 0.05 caps it at 5% per test. A **Type II error** (false
-negative) is missing a difference that is; **power** = 1 − β is the probability of
-detecting a real effect of a given size. Power is what you _buy_ with sample size: for a
-baseline rate p₁, a minimum detectable effect (MDE), α and desired power, the required
-users per arm is a closed-form number.
+A Type I error is a false positive: rejecting the null hypothesis when it is true. The
+significance level α controls this error rate under the test's assumptions. A Type II error is
+failing to detect a specified real difference. Power, 1 − β, is the probability of detecting that
+effect. Sample-size planning uses the baseline rate p₁, minimum detectable effect (MDE), α and
+target power to estimate the observations needed per arm.
 
 The reason it matters operationally: **a significant result from an underpowered test is
 more likely to be wrong, and more likely to overstate the effect.** With 100 users an arm, a
@@ -545,11 +543,10 @@ when the primary metric is significant _and_ every variant has reached the minim
 
 The dashboard's meter shows `current / required` and turns red below 80%.
 
-> **Watch Out!** `minimum_sample_size` defaults to **100**, which is far below what most
-> conversion tests need (a 4% baseline with a 10% relative MDE at 80% power wants 39,475
-> per arm). The default keeps demos and small internal tests from being permanently
-> "inconclusive"; a real experiment should set it from the planner. The gate only protects
-> you if the number in it is honest.
+> **Watch Out!** `minimum_sample_size` defaults to 100. That is enough for small demos but is
+> usually too small for a planned conversion-rate test. For example, the planner requires 39,475
+> users per arm for a 4% baseline, a 10% relative MDE and 80% power. Set the experiment's threshold
+> from its planning assumptions; the default does not establish adequate power.
 
 > **Did You Know?** Power calculations assume you'll look **once**, at the planned n. If
 > you'll look every day — and everyone does — use the sequential analysis (Part II), whose

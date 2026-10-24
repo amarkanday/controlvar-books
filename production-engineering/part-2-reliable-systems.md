@@ -4,9 +4,10 @@
 
 [← Part 1](./part-1-experiment-design.md) · [Contents](./README.md) · [Part 3 →](./part-3-security-and-privacy.md)
 
-This Part follows failure across boundaries: an ambiguous write, a scheduler running on several
-replicas, a stale ruleset and a schema change during a rolling deployment. The goal is to state
-what the system guarantees and produce evidence for recovery.
+A request may commit before its response is delivered, a scheduler may lose its database connection,
+and an SDK may hold an older ruleset than the server. Hours 4 and 5 examine these cases and their
+recovery implications. Hour 6 covers schema changes and query performance during overlapping
+application versions.
 
 > **Verified against** getexperimently/experimently at `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
 > (source review, 2026-10-23). Recommended procedures and illustrative examples are identified

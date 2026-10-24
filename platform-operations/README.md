@@ -2,22 +2,11 @@
 
 ### _The Experimently Edition — Running the Platform, From Laptop to Production, in 12 Hours_
 
-> **Preface.** This is a **specialization** book. The core four books teach you how
-> Experimently is built; this one teaches you how it _runs_ — on your laptop, in a Docker
-> Compose stack or a Helm release a customer can self-host, and on AWS behind an ALB with
-> blue/green deploys — and how you know it's healthy, what you look at when it isn't, and
-> how a change gets from a pull request to production without anyone holding their breath.
-> Every piece of it is real: the development `docker-compose.yml` with its profiles and seeds,
-> the production compose file and the Helm chart that run the published images, the two
-> Dockerfiles with their `core` and `full` targets, the entrypoint that checks its
-> configuration, waits for Postgres and bootstraps the schema (everywhere but AWS, where a
-> one-shot migration task is the only schema writer), nine CDK stacks (twelve with the
-> optional modules), the structured-log and Prometheus wiring, the five background schedulers
-> and their advisory locks, the CI gates, release-please and the signed release images, the
-> one `Deploy` workflow with its canary and its migration task, and the `Rollback` workflow
-> and runbook. Read this if you'll be on call, if you'll deploy, if you'll set up a
-> customer's self-hosted instance, or if you'll touch anything under `infrastructure/`,
-> `charts/`, `deploy/compose/`, `.github/workflows/` or `backend/app/core/health.py`.
+> **Preface.** This book explains how to run and maintain Experimently. It covers the local Compose stack,
+> self-hosted Compose and Helm deployments, and the AWS infrastructure defined in CDK. The
+> remaining chapters cover logging, health checks, schedulers, releases and recovery. Read it
+> when setting up an environment, changing infrastructure or preparing to operate the service.
+> Deployment examples describe the configuration at the reference commit below.
 >
 > Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased
 > changes, including three breaking ones: #747, #769, #770).
@@ -36,22 +25,16 @@
 
 ## How to use this book
 
-12 lessons in 4 Parts, the usual rhythm: **What & why → How Experimently does it (real
-code/config) → Try It Yourself → Key takeaways**, with a Workshop per Part. Configuration
-and infrastructure files are quoted with `# 📁 path` like source code — because they are
-source code. A tagged block is an excerpt: `...` marks lines or text left out, and everything
-else is the file's own. A tag that ends in `(condensed)` marks a summary instead: the names
-are real, but lines have been joined or shortened and the trailing comments are the book's.
-Most Try-It-Yourself sections are things you can do on a laptop with Docker;
-the AWS ones are written so you can follow them with `cdk synth` and reading, without an
-account.
+The 12 lessons are grouped into four Parts. Each explains an operational requirement, examines the
+relevant configuration and provides an exercise. Workshops include questions, quizzes and worked
+solutions. Blocks marked `# 📁 path` quote source or configuration; `...` marks omissions. A
+`(condensed)` label identifies a summary whose lines or comments have been edited for explanation.
+Local exercises use Docker. The AWS lessons can be followed by reading stack definitions and
+synthesized templates without deploying an account.
 
-> **The one idea to anchor on:** an operations system is a set of **contracts between
-> layers** — the container promises the orchestrator a liveness probe, the entrypoint
-> promises the image a bootstrapped database, the scheduler promises its replicas a lock,
-> the deploy promises the on-call engineer a rollback path, the health endpoint promises the
-> load balancer a truthful 503. Each contract is small; the platform works because none of
-> them lie. Every Hour here names one and shows where it's kept.
+> Each layer exposes a different operational contract: startup establishes configuration and
+> schema readiness, probes guide routing and restarts, scheduler locks coordinate workers, and
+> deployment procedures define recovery. Check the relevant contract when diagnosing a failure.
 
 ---
 
@@ -60,7 +43,7 @@ account.
 ### Part I — The Local and Self-Hosted Stack _(Hours 1–3)_ → [`part-1-local-stack.md`](./part-1-local-stack.md)
 
 - **Hour 1** — Docker Compose: services, profiles, health, and the `.env` contract; the production compose file and the Helm chart
-- **Hour 2** — The images: two multi-stage Dockerfiles (`core` and `full`) and the nginx single-origin trick
+- **Hour 2** — Multi-stage images and single-origin serving
 - **Hour 3** — The entrypoint: check, wait, bootstrap, seed, hand over — and the Makefile
 
 ### Part II — AWS _(Hours 4–6)_ → [`part-2-aws.md`](./part-2-aws.md)

@@ -4,12 +4,10 @@
 
 [← Part V](./part-5-ui.md) · [Contents](./README.md)
 
-The last four hours are about trusting and shipping the dashboard: unit and page tests with
-Jest and React Testing Library, and the mocking shapes the codebase standardises on (Hour 21);
-Playwright for the browser journeys that gate every pull request, plus the nightly visual and
-accessibility suites (Hour 22);
-the build, the image, nginx, and the URL guard that keeps every service path honest against
-the live OpenAPI spec (Hour 23); and the style guide that collects the whole book (Hour 24).
+The final Part covers testing and deployment of the dashboard. Hour 21 uses Jest and React Testing
+Library for unit and page tests. Hour 22 covers Playwright journeys and the visual and accessibility
+suites. Hour 23 follows the production build through the container and nginx, including the API URL
+guard. Hour 24 collects the dashboard's coding conventions for use during review.
 
 ---
 

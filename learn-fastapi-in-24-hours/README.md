@@ -2,41 +2,28 @@
 
 ### _The Experimently Edition — Teach Yourself FastAPI, Pydantic v2, SQLAlchemy 2 and Alembic Using a Real Codebase_
 
-> **Preface.** Most FastAPI tutorials stop at `@app.get("/items/{id}")` and a `BaseModel` with
-> two fields. This book is different. Every concept is taught **twice**: once in the abstract,
-> and once with a real snippet pulled from the **Experimently** backend (a FastAPI + SQLAlchemy +
-> PostgreSQL experimentation platform: about 70,000 lines of typed Python in the core
-> `backend/app`, and 5,400+ backend tests by the app README's count). By Hour 24 you won't
-> just _know_ FastAPI — you'll know how a production team uses it to run an API with
-> thirty-seven core routers (plus the optional modules' routers, mounted through a seam),
-> several authentication paths, five background schedulers, and a test harness that spins up
-> a database per process. And you'll have met the 422 that saved a bad
-> experiment (Hour 1) and the shape mismatch that 5,000 green tests didn't catch (Hour 22).
+> **Preface.** This book introduces FastAPI and the libraries used with it in Experimently: Pydantic v2,
+> SQLAlchemy 2 and Alembic. The lessons follow a request from input validation through dependencies,
+> authentication, database access and response serialization. Later chapters cover background work,
+> WebSockets, caching and tests. Examples include both small demonstrations and excerpts from the
+> backend, so you can compare a framework feature with its use in an application.
 
 ---
 
 ## Who this book is for
 
-- **Python developers new to FastAPI** joining Experimently (or any FastAPI codebase) who want
-  to go from "I know Python" to "I can add an endpoint with tests" fast.
-- **Developers coming from Flask, Django or Express** who keep bouncing off dependency
-  injection, Pydantic validators and async/sync rules because tutorials never show _why_ a
-  production app reaches for them.
-- **Reviewers** who want one reference for the conventions this backend enforces —
-  fully-qualified imports, `Depends(get_db)`, access by role through one rule per resource,
-  the `except HTTPException: raise` idiom — so review is about substance.
+This book is for Python developers learning FastAPI, engineers joining the backend team and
+reviewers working with its endpoint conventions. It assumes familiarity with functions, classes,
+decorators, type hints and `async`/`await`. It does not require prior FastAPI, Pydantic or SQLAlchemy
+experience.
 
-You need: working Python (functions, classes, decorators, `async`/`await`, type hints). You do
-**not** need prior FastAPI, Pydantic or SQLAlchemy.
-
-> **🆕 New to Python?** Start with the companion prerequisite —
-> [**Learn Python in 24 Hours — The Experimently Edition**](../learn-python-in-24-hours/README.md).
-> It begins from absolute zero and ends exactly where this book starts.
+If those Python topics are unfamiliar, begin with
+[Learn Python in 24 Hours](../learn-python-in-24-hours/README.md).
 
 ## How to use this book
 
-It's structured as **24 one-hour lessons**, grouped into six Parts. Each Hour follows the
-same rhythm so you can pace yourself:
+The 24 lessons are grouped into six Parts. Each lesson introduces a concept, examines its use
+in the repository and provides an exercise:
 
 1. **What & why** — the concept and the problem it solves.
 2. **In the wild** — the real Experimently code that uses it (file path included so you can
@@ -44,7 +31,7 @@ same rhythm so you can pace yourself:
 3. **Try It Yourself** — a short exercise against the running API or in a scratch file.
 4. **Common mistakes** and **Key takeaways** — the 3–5 things to remember.
 
-Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lock it in.
+Each Part ends with a workshop containing questions, a quiz and exercises with solutions.
 
 > **Convention in this book.** Code blocks tagged `# 📁 path/to/file.py` are real, current
 > Experimently source. Blocks with no path are illustrative. `# ✅` marks the idiom we want;
@@ -54,28 +41,30 @@ Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lo
 
 ---
 
-## The Experimently Backend Creed (read this first)
+<a id="the-experimently-backend-creed-read-this-first"></a>
 
-Six rules drive almost every backend decision in this repo. You'll learn the machinery behind
-each over the next 24 hours; keep them in view:
+## Backend conventions used in this book
 
-1. **Declare, don't parse.** Inputs are typed parameters (`Path`, `Query`, `Body`, `Depends`);
-   FastAPI turns a bad UUID into a 422 before your function runs. → Hours 3, 5
-2. **Two layers of validation.** Pydantic validators give users a 422 with a message; database
-   constraints give the system a guarantee. Never rely on only one. → Hours 6, 14
-3. **`Depends(get_db)`, never `SessionLocal()`, in an endpoint.** One session per request,
-   closed after the response — and the seam the test harness overrides. → Hours 9, 10, 22
-4. **Endpoints are thin; services hold logic; models are tables.** The dependency direction is
-   endpoint → service → model, never back. → Hours 2, 16
-5. **Async where it's async, sync where it's sync.** The access rules routes actually call
-   are sync — `can_act_on_feature_flag` for every flag change, `get_experiment_change_access`
-   for experiments — and only flag create is an async `Depends(deps.can_create_feature_flag)`;
-   synchronous SQLAlchemy in an `async def` blocks the loop, so keep handlers short and
-   consistent per module. → Hours 12, 19
-6. **Fail closed.** Settings validators refuse to start production with a weak secret or the
-   dev bypass; `except HTTPException: raise` keeps a deliberate 404 from becoming a 500;
-   access is decided by role, and a role without the action is refused even on what it
-   created. → Hours 4, 8, 12
+The backend follows these conventions for request handling, persistence and error handling.
+The referenced lessons explain their rationale and application:
+
+1. **Declare inputs through FastAPI.** Use typed `Path`, `Query`, `Body` and dependency parameters
+   so invalid declared inputs, such as malformed UUIDs, are rejected before the handler runs.
+   See Hours 3 and 5.
+2. **Validate at both application and database boundaries.** Pydantic provides request errors;
+   database constraints protect persisted invariants. See Hours 6 and 14.
+3. **Obtain the endpoint session through `Depends(get_db)`.** This establishes the request lifetime
+   and provides the override used by tests. Avoid opening an independent `SessionLocal()` in the
+   endpoint. See Hours 9, 10 and 22.
+4. **Keep the dependency direction from endpoint to service to model.** Put business behavior in
+   services and persistence definitions in models. See Hours 2 and 16.
+5. **Account for synchronous work in async handlers.** The permission helpers used by routes are
+   synchronous except for the flag-create dependency. Synchronous SQLAlchemy calls in `async def`
+   block the event loop; follow the module's established conventions and review blocking work.
+   See Hours 12 and 19.
+6. **Preserve deliberate failures.** Settings reject unsafe production configuration, access checks
+   reject disallowed actions, and `except HTTPException: raise` preserves intended HTTP errors.
+   See Hours 4, 8 and 12.
 
 ---
 

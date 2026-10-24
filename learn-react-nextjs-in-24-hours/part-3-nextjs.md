@@ -4,14 +4,13 @@
 
 [← Part II](./part-2-react.md) · [Contents](./README.md) · [Part IV →](./part-4-data-and-forms.md)
 
-Next.js is the framework around React that gives the dashboard routing, a build, a dev server
-and a production artefact. Four hours: files are routes (Hour 10); `_app.tsx`, the shell, and
-how a route's _kind_ decides what wraps it (Hour 11); the client-side auth gate, `useRouter`,
-and dynamic routes (Hour 12); and the environment/base-URL contract plus the static export
-that ships behind nginx (Hour 13). The dashboard runs **Next.js 16 with React 19** and uses the
-**pages router** (`src/pages/`), not the app router — deliberately, and this Part explains why.
-Since Next 16, `next build` bundles with **Turbopack** by default;
-`next build --webpack` still selects webpack, and the config keeps both working (below).
+Next.js provides the dashboard's routing, development server and production build. Hours 10–12
+cover file-based routes, `_app.tsx`, page wrappers, authentication and dynamic route parameters.
+Hour 13 covers environment configuration and the static export served by nginx.
+
+The reviewed dashboard uses Next.js 16, React 19 and the pages router (`src/pages/`). Next.js 16
+uses Turbopack for `next build` by default; `next build --webpack` selects webpack. The configuration
+supports both build paths.
 
 ---
 

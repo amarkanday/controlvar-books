@@ -4,14 +4,10 @@
 
 [← Part II](./part-2-building-a-client.md) · [Contents](./README.md) · [Part IV →](./part-4-proving-agreement.md)
 
-The Python and JavaScript SDKs are the references; the other fourteen are ports or adapters.
-This Part is about porting well. Hour 7 walks the nine "native" ports — Go, Java (and its Spring Boot
-starter), Swift, Kotlin, Ruby, PHP, .NET, Elixir, Flutter — and shows that each one is the
-same five decisions expressed in its language's idiom for concurrency, errors and lifetime.
-Hour 8 covers the three that sit on a standard or a special runtime: the OpenFeature
-providers, the edge client, React Native. Hour 9 is a case study with an ending: a _second
-implementation of the server's decision_, the four hash functions that drifted apart, and the
-two changes that closed it.
+Porting an SDK requires equivalent behavior expressed through different language and runtime
+facilities. Hour 7 compares the Go, Java, Swift, Kotlin, Ruby, PHP, .NET, Elixir and Flutter clients.
+Hour 8 covers OpenFeature providers, the edge client and React Native. Hour 9 examines the assignment
+hash mismatch and the changes that brought client and server behavior into agreement.
 
 ---
 
@@ -151,12 +147,10 @@ Hour 9).
 public class ExperimentationClient: ExperimentationClientProtocol {
 ```
 
-The mobile SDKs (Swift, Kotlin, Flutter, React Native) add one thing the server-side ones
-don't: an **offline store**. A phone loses the network; the last successful evaluation is
-persisted (`UserDefaults` / `SharedPreferences` / `AsyncStorage`) and served when the API is
-unreachable. The rule that keeps this honest: **a definitive 404 never falls back to a stale
-persisted value** — "the flag was turned off" must not be masked by "the flag was on last
-week."
+The Swift, Kotlin, Flutter and React Native SDKs persist successful evaluations for offline use,
+using platform stores such as `UserDefaults`, `SharedPreferences` and `AsyncStorage`. Network
+failures may use that stored result. A definitive 404 must not return a stale stored value, because
+that would conceal the server's response that the flag is no longer available.
 
 **Kotlin** — suspend functions on `Dispatchers.IO`, a `SupervisorJob` scope for
 fire-and-forget:
@@ -358,15 +352,12 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
         return { ok: false, errorCode: ErrorCode.FLAG_NOT_FOUND, ...
 ```
 
-Two things to notice. The provider _composes_ the JS SDK rather than reimplementing the
-contract — the cache, dedupe and error codes come for free, and the golden vectors already
-cover its hash. And it's honest about the mismatch between the standards: OpenFeature has no
-concept of experiments or events, so those are reached through `provider.client`, and the
-provider reports the SDK's cache hit as OpenFeature's `CACHED` reason. The Python provider
-mirrors it (`resolve_boolean_details` etc., `Reason.CACHED` / `TARGETING_MATCH` / `DISABLED`
-/ `ERROR`), and the same docblock rules apply. The JS provider is the package
-`@getexperimently/openfeature-provider` and takes `@openfeature/server-sdk` as a peer
-dependency, so the application chooses the OpenFeature version.
+The OpenFeature provider delegates to the JavaScript SDK, reusing its caching, request deduplication
+and error handling. OpenFeature does not define experiment assignment or event tracking; those
+remain available through `provider.client`. The provider maps a cache hit to OpenFeature's `CACHED`
+reason. The Python provider uses the corresponding resolution methods and reasons. The JavaScript
+package is `@getexperimently/openfeature-provider`, with `@openfeature/server-sdk` as a peer dependency
+so the application selects the OpenFeature version.
 
 The server once had OpenFeature-shaped routes of its own. The evaluate routes were removed in
 #345 (they never returned a result), and the flag listing under `/api/v1/openfeature/` was

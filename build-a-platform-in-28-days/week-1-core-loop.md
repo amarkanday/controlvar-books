@@ -4,52 +4,48 @@
 
 [← Contents](./README.md) · [Week 2 →](./week-2-api-and-data.md)
 
-This week is the product's heartbeat: how a user gets a variant, how what they do afterwards is
-recorded, and how those two facts become a number a product manager can act on. By Day 7 you'll
-trace one experiment from an SDK call all the way to a p-value on the dashboard.
+This week follows the main experiment workflow: assign a variant, record user activity and
+calculate results. The final exercise traces an SDK request through those steps to the result
+shown in the dashboard.
 
-You already know the language (the Python book) and the framework (the FastAPI book). This week
-is about **architecture** — not "what is a SQLAlchemy model" but "why is an assignment a row in
-PostgreSQL rather than a cookie, and what breaks if you change that." Every Day grounds its lesson
-in real files you can open in the
-[`getexperimently/experimently`](https://github.com/getexperimently/experimently) repository.
-Read them alongside the prose; the file paths marked `# 📁` are real source, quoted exactly
-(trimmed where marked `...`), and the whole point is that you can go verify them. This week was
-checked against commit `a4a6dbd2` (0.17.0 plus unreleased changes, including three breaking
-ones: #747, #769, #770).
+The Python and FastAPI books cover the language and framework. Here the focus is on the design
+choices connecting them: why assignments are persisted, which constraints events must satisfy,
+and how analysis uses both. Read the referenced files in the
+[`getexperimently/experimently`](https://github.com/getexperimently/experimently) repository
+alongside the examples. Blocks marked `# 📁` quote source; omissions are marked with `...`.
+This week was checked against `a4a6dbd2` (0.17.0 plus unreleased changes, including #747, #769
+and #770).
 
-> **The one sentence to carry through Week 1.** _An experiment is two tables — `assignments`
-> (who saw what) and `events` (what they did) — joined by `(experiment_id, user_id)`; assignment
-> is a deterministic hash so the join is stable, tracking is append-only so the join is honest,
-> and every statistic on the platform is a query over that join, counting users, not events._
-> Once you see the join, the rest of the codebase is machinery for filling those two tables
-> correctly and reading them rigorously.
+> Assignments record the variant allocated to each user; events record subsequent activity.
+> Analysis connects them by experiment and user, with the variant association checked when counting
+> conversions. Persisted assignments keep allocations stable, and binary conversion metrics count
+> converting users rather than event rows.
 
-A map of the week, so each piece has somewhere to land as it arrives:
+The week is organized as follows:
 
-| Day | Topic                            | The one thing it's really about                                  |
+| Day | Topic                            | Focus                                  |
 | --- | -------------------------------- | ---------------------------------------------------------------- |
 | 1   | The big picture                  | The shape of the system, and the bug that shows why shape matters |
 | 2   | The repo and the dev loop        | Getting from clone to a running API + dashboard, and staying there |
 | 3   | The domain model                 | Five tables, and the constraints that make them trustworthy       |
 | 4   | Assignment                       | `bucket_of(user_id, experiment.key)` and why the row is sticky    |
 | 5   | Tracking & conversion matching   | Append-only events, and the one helper every analysis must use    |
-| 6   | Results                          | From assigned and converting users to a verdict, with honesty checks |
+| 6   | Results                          | From assigned and converting users to a verdict, with validity checks |
 | 7   | **Capstone:** end-to-end trace   | One experiment through every layer above                          |
 
-Notice the arc: Days 1–2 set the stage (system shape, tooling), Days 3–6 are the four pillars
-of the core loop (model, assign, track, analyse), and Day 7 walks one real experiment through
-all four at once. Don't skip Day 1 even though it has little code — the mental map it builds is
-what makes every later file make sense.
+Days 1–2 introduce the system and development setup. Days 3–6 cover the model, assignment,
+tracking and analysis. Day 7 combines them in a complete request trace. Read Day 1 before following
+the individual services; it identifies the components and the data passed between them.
 
 ---
 
-## Day 1 — The big picture: Experimently's architecture and the "0% conversions" bug
+<a id="day-1--the-big-picture-experimentlys-architecture-and-the-0-conversions-bug"></a>
+
+## Day 1 — Architecture and the experiment data flow
 
 ### What & why
 
-Before any code, hold the shape of the system in your head. Experimently is a **client-server
-platform with two kinds of client**:
+Experimently is a client-server platform. Two types of client use its API:
 
 - **Your application**, through one of **sixteen SDKs** (Python, JavaScript, React, React
   Native, Go, Java, iOS/Swift, Android/Kotlin, Ruby, PHP, .NET, Elixir, Flutter, an edge
@@ -113,7 +109,9 @@ client."
 > Experiments are still assigned only by the server, for the three reasons above. Week 3 covers
 > local evaluation.
 
-#### The bug that justifies the week
+<a id="the-bug-that-justifies-the-week"></a>
+
+#### Case study: conversion events missing from analysis
 
 Abstract architecture is forgettable. Here is a concrete bug that actually shipped in this
 codebase, and it justifies the whole "two tables, one join" way of thinking.
@@ -337,9 +335,9 @@ ignore the directory.
 
 ### What & why
 
-A backend you can't run is a backend you can't learn. Today is about the **edit → run → see
-it** loop for both halves of the system and the small number of environment facts that,
-if wrong, produce the most confusing failures in the repo.
+A working local setup makes it easier to trace requests and test changes. This lesson sets up the
+API and dashboard development loop, then explains the environment settings most likely to cause
+local startup or connection failures.
 
 The backend needs three things: a **Python 3.11 virtual environment** with the pinned
 dependencies, a **PostgreSQL** server on `localhost:5432`, and a handful of **environment
@@ -590,10 +588,9 @@ both. The API's CORS defaults include 3000, 3001, 3100, 3200 (ShopLab), 3300 (St
 
 ### What & why
 
-Every experimentation platform has the same five nouns. Experimently's are five tables in the
-`experimentation` schema, and today is about their _shape_ and, more importantly, their
-_constraints_ — because in this system the database is where invariants are enforced, not
-just where data is kept.
+The core workflow uses five tables in the `experimentation` schema. This lesson examines their
+columns, relationships and constraints. The constraints are particularly important: they enforce
+invariants even when several requests or processes write to the same database.
 
 - An **experiment** is the unit of decision: a name, a stable `key` for the SDKs, a status
   (`draft → active → paused/completed → archived`), an owner, optional targeting rules and
@@ -897,8 +894,7 @@ were true at assignment rather than at conversion.
 
 ### What & why
 
-"Which variant is this user in?" has to satisfy four properties at once, and the tension
-between them is the whole design:
+Assignment must satisfy four requirements. The implementation has to preserve them together:
 
 1. **Deterministic.** The same user must get the same variant every time, on every device,
    from every SDK, even before the platform has stored anything about them.
@@ -1276,10 +1272,9 @@ a holdout, mutual-exclusion group or targeting rule may make them ineligible (co
 
 ### What & why
 
-The second table. An **event** is an append-only fact — "user X did Y at time T, worth V" —
-and the tracking API's job is to accept those facts from any SDK at high volume, attach the
-identifiers the analysis will need, and never lose one. Three design decisions follow from
-"append-only fact":
+An event records user activity: who performed an action, when it occurred and, where applicable,
+its numeric value. The tracking API accepts these records from SDKs and attaches identifiers used
+by analysis. Treating events as append-only records leads to three design decisions:
 
 1. **Events are never updated.** There's no `PUT /events/{id}`. A wrong event is corrected by
    another event or by excluding it at analysis time, never by mutation — because the
@@ -1519,11 +1514,9 @@ validated and stored independently and the response reports `success_count`,
 
 ### What & why
 
-You have two tables. A result is, at its heart, four numbers per variant — assigned users,
-converting users, a rate, and how sure you are that the rate differs from control — plus a
-recommendation. Today is about how the platform gets from two counts to "ship treatment",
-and about the **honesty checks** it runs on the way, because a results page that only shows
-the flattering number is worse than no results page.
+Results combine assignment and event data. For each variant, the service reports assigned users,
+converting users, a conversion rate and a statistical comparison with control. This lesson follows
+that calculation and the checks used when producing a recommendation.
 
 The primary path is deliberately simple statistics — a contingency table per variant vs
 control, a test of whether the proportions differ, a confidence interval on each rate —
@@ -1640,10 +1633,12 @@ confidence_level`. Effect sizes (Cohen's h, `2·asin√p₁ − 2·asin√p₀`)
 negligible/small/medium/large so the dashboard can say "significant but negligible" — the most
 useful sentence in experimentation.
 
-#### The honesty checks
+<a id="the-honesty-checks"></a>
 
-The endpoint that the dashboard calls, `GET /api/v1/results/{experiment_id}`, wraps the
-computation with checks that stop it lying:
+#### Result validation checks
+
+The dashboard calls `GET /api/v1/results/{experiment_id}`. The endpoint applies the following
+checks around the statistical calculation:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/results.py
@@ -1804,9 +1799,9 @@ experiment gets the long TTL too. Both are bypassed by `use_cache=false`.
 
 ### What & why
 
-Days 3–6 each took one layer. Today you walk one experiment through all of them in order, from
-the React SDK hook in ShopLab's home page to the `p_value` on the results dashboard, and you
-name the file at every hop. If you can narrate this trace from memory, Week 1 has done its job.
+This exercise traces one experiment across the layers covered in Days 3–6. Start at the React SDK
+hook in ShopLab, follow the request through the API and storage services, and finish at the
+`p_value` displayed in the results page. Identify the file responsible for each step.
 
 The experiment is ShopLab's **hero A/B** (`shoplab_hero_banner`): variant `control` shows an
 image hero, variant `video_hero` shows a video hero, 50/50. The primary metric is the hero's
@@ -1886,7 +1881,7 @@ with the admin's bearer token. Cache miss (or `use_cache=false`) →
 Fisher's exact test vs control, a normal-approximation interval at the requested confidence
 level.
 
-**10. The honesty checks run.** `_compute_srm` chi-squares the assignment counts against
+**10. The validity checks run.** `_compute_srm` chi-squares the assignment counts against
 50/50 and reports the result in `srm`; `sample_size_adequate` checks every variant against
 the primary metric's `minimum_sample_size` (2,000 here); the summary recommends
 `SHIP_VARIANT` only if the primary metric has a significant winner _and_ the sample size is
@@ -1958,7 +1953,7 @@ stored row, and which column does a metric with `event_name: "signup"` match on?
 Both are `"signup"` (`/track` copies `event_type` into `event_name` when the latter is
 absent). The metric matches on `event_name`, via `conversion_event_filter("signup")`.
 
-**4. Which three honesty checks wrap a results response, and which of them can change the
+**4. Which three validity checks wrap a results response, and which of them can change the
 recommendation?**
 Sample-ratio mismatch (chi-square, warning at p < 0.001, for fixed-allocation experiments),
 multiple-testing correction (Bonferroni / Benjamini-Hochberg), and the minimum-sample-size gate

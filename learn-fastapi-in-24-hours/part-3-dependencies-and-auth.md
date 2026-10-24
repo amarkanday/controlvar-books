@@ -4,12 +4,10 @@
 
 [← Part II](./part-2-pydantic.md) · [Contents](./README.md) · [Part IV →](./part-4-sqlalchemy.md)
 
-`Depends` is the idea that separates FastAPI from "Flask with type hints." This Part starts
-with the mechanism itself (Hour 9), then follows the three dependencies every Experimently
-endpoint uses: the database session (Hour 10), the identity of the caller (Hour 11), and what
-the caller may do (Hour 12). Hour 13 steps outside the dependency graph to the middleware that
-wraps every request before any dependency runs. By the end you'll be able to read
-`backend/app/api/deps.py` top to bottom and know why each function is shaped the way it is.
+FastAPI dependencies supply the resources and checks an endpoint needs. Hour 9 explains `Depends`.
+Hours 10–12 trace database sessions, caller authentication and authorization through the dependencies
+used by Experimently. Hour 13 covers middleware, which wraps request handling outside that dependency
+graph. Read these lessons alongside `backend/app/api/deps.py`.
 
 ---
 

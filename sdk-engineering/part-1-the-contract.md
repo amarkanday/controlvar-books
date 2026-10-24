@@ -4,12 +4,10 @@
 
 [Contents](./README.md) · [Part II →](./part-2-building-a-client.md)
 
-Before a line of client code, the agreement. This Part is the contract every Experimently SDK
-implements: the four endpoints and the one rule that governs them (Hour 1); the hash that
-every SDK exports and the golden vectors that pin it, together with the story of how the
-server came to use that same hash for experiment assignment (Hour 2); and the semantics that
-make sixteen implementations behave as one — what's cached, what fans out, what happens when
-the network is gone, and when an SDK may answer a flag itself (Hour 3).
+The SDK contract defines which decisions belong to the server and how clients request them.
+Hour 1 covers the four main endpoints. Hour 2 examines the shared hash function, golden test vectors
+and the server's adoption of that function for experiment assignment. Hour 3 covers caching,
+assignment fan-out, network failures and the conditions under which an SDK may evaluate a flag locally.
 
 ---
 
@@ -17,10 +15,9 @@ the network is gone, and when an SDK may answer a flag itself (Hour 3).
 
 ### What & why
 
-An experimentation SDK has to answer three questions for product code: _which variant is this
-user in?_, _is this flag on for this user?_, and _record that this user did X_. Everything
-else is convenience. Experimently's contract answers them with four HTTP endpoints,
-authenticated with an API key, addressing experiments and flags by their public **keys**:
+Product code uses the SDK to obtain experiment assignments, evaluate feature flags and record
+events. The main contract provides four API-key-authenticated HTTP endpoints. Requests identify
+experiments and flags by their public keys:
 
 | Purpose | Method and path | Body / query | Response |
 |---|---|---|---|
@@ -553,11 +550,10 @@ Then write the hash in a language you know that isn't in `sdk/` (bash with `md5s
 
 ### What & why
 
-If the server decides, an SDK's design questions are all about the _in-between_: how long to
-believe an answer, what to do while waiting, what to send when the caller didn't say which
-experiment an event belongs to, what to do when the server is unreachable, and — for two
-SDKs — when a flag may be answered without asking. The rewiring fixed one answer to each, in
-the SDK guide, and every port implements it:
+Even with server-side decisions, clients need consistent policies for caching, concurrent
+requests, events without an explicit experiment and network failures. The JavaScript and Python
+SDKs also support optional local flag evaluation. The SDK guide defines the behavior expected
+across implementations:
 
 **Cache.** Successful assignments and evaluations are cached **per user + key** for
 `cache_ttl` (default 300 s; the edge SDK 60 s). **Failures are never cached** — a transient

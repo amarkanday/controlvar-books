@@ -4,15 +4,13 @@
 
 [← Part III](./part-3-sharper-estimates.md) · [Contents](./README.md)
 
-Everything so far assumed one comparison: one metric, one treatment against one control,
-one look (or a correctly-priced sequence of looks). Real experiments have five metrics, three
-treatments and a "let's break it down by platform" request from the PM — and every extra
-comparison is another lottery ticket for a false positive. Hour 10 is the correction
-machinery; Hour 11 is the honest way to slice results (and the three drift-and-contamination
-checks that ride alongside — two of them not yet computed by the platform); Hour 12 is the
-engineering discipline that makes any number the platform ever showed recomputable: seeds,
-engine versions, fingerprint tests, snapshots, the cache, and the table that says which
-analyses are `ga` and which are `beta`.
+An experiment may compare several treatments, measure several outcomes and report results for
+multiple segments. These additional comparisons affect how significance should be interpreted.
+Hour 10 covers multiple-testing correction. Hour 11 examines segment breakdowns and the platform's
+heterogeneity, novelty and interaction checks, including their implementation limits.
+
+Hour 12 covers reproducibility: random seeds, engine versions, snapshots, caching and the
+`ga`/`beta` analysis labels. Together, these records explain how a reported result was produced.
 
 ---
 
@@ -20,11 +18,11 @@ analyses are `ga` and which are `beta`.
 
 ### What & why
 
-Run one test at α = 0.05 and, if nothing is going on, you'll be fooled 5% of the time. Run
-_m_ independent tests and the chance that _at least one_ fools you is `1 − 0.95^m`: 14% for
-three metrics, 40% for ten, 64% for twenty. An experiment with three treatments and five
-metrics has fifteen p-values on its results page; a "winner somewhere" is close to a coin
-flip under the null.
+For m independent tests whose null hypotheses are all true, testing each at α = 0.05 gives a
+probability of at least one false positive of `1 − 0.95^m`. That is about 14% for three tests,
+40% for ten and 64% for twenty. A results page with several treatments and metrics therefore needs
+a declared multiple-testing policy; choosing whichever uncorrected comparison is significant does
+not preserve a 5% error rate for the collection.
 
 Two philosophies of correction:
 
@@ -219,13 +217,11 @@ how often any raw p < 0.05, then how often any Bonferroni-adjusted p < 0.05.
 
 ### What & why
 
-"Does it work on iOS?" is a reasonable question and a statistical trap. Break a result into
-_s_ segments and you've run _s_ more tests (Hour 10), on smaller samples (Hour 3), chosen
-after seeing the data (the garden of forking paths). The platform's answer is to allow the
-breakdown but label it **exploratory**, Bonferroni-correct it by the number of segments,
-and flag **heterogeneous treatment effects (HTE)** — the situation where the effect genuinely
-differs by segment, which is the one case where the breakdown deserves a follow-up
-experiment rather than a decision.
+Segment breakdowns can help investigate whether treatment effects differ across populations.
+They also add comparisons, reduce the sample in each comparison and may be selected after examining
+the data. The platform labels these results exploratory, applies Bonferroni correction by the
+number of segments and reports a heterogeneous-treatment-effect (HTE) indicator. Treat an apparent
+segment difference as a reason for further investigation or a planned follow-up experiment.
 
 Three related checks belong alongside because they all attack exchangeability from the
 outside. The platform has helper functions for all three, but its interactions and novelty
@@ -345,11 +341,11 @@ segments, with two heuristics as backstop:
         return False
 ```
 
-Be honest about what this is: the chi-square tests whether the _distribution of conversions
-across segments_ differs between treatment and control, which is a proxy for "the effect
-differs by segment" and is sensitive to segment-size imbalance; the heuristics (coefficient
-of variation of lifts > 0.5; lifts of opposing sign) catch the cases that matter most to a
-reader. HTE = `True` renders a red `role="alert"` and means "don't average this — investigate."
+The chi-square calculation tests whether conversions are distributed differently across segments
+in treatment and control. It is a proxy for treatment-effect heterogeneity and is sensitive to
+segment-size imbalance. Additional heuristics examine variation in lifts and lifts with opposing
+signs. An HTE value of `True` renders a red `role="alert"` indicator; investigate the breakdown before
+relying on the aggregate result.
 
 **Novelty** — regress the daily effect on day index; a slope below −0.05 is flagged:
 
@@ -544,9 +540,9 @@ True
 
 ### What & why
 
-A results page is evidence in a decision that someone will be asked to justify later — in a
-retro, a quarterly review, an audit. "The dashboard said 0.94 in March" is only evidence if
-you can _recompute_ 0.94 in September. Three things get in the way:
+A reported result may need to be reviewed months after the experiment. Reproducing it requires
+more than the displayed value: the data, calculation version and random sampling inputs must be
+known. Three sources of change complicate that work:
 
 1. **Randomness** — Monte Carlo statistics (PtBB, expected loss, Thompson weights) differ
    run to run unless seeded, and a dashboard that polls would show a number that flickers.
@@ -817,10 +813,9 @@ stability is what lets a September client parse a March snapshot's `payload`. Wh
 meaning changes (not just its value), bump `ENGINE_VERSION`; when its shape changes, that's an
 API version, and the snapshot's `engine_version` is how you know which parser to use.
 
-**What is `ga` and what is `beta`.** A second kind of honesty rides on the analysis
-responses: whether the numbers can be relied on at all. One table,
-`backend/app/core/analysis_status.py`, holds it, and the responses read it when they are
-built:
+**What is `ga` and what is `beta`.** Analysis responses also describe the implementation status of
+their numbers. The definitions are maintained in `backend/app/core/analysis_status.py` and read
+when responses are constructed:
 
 | Analysis (route)                                  | Status | Why, in its `analysis_notice`                                                    |
 | ------------------------------------------------- | ------ | -------------------------------------------------------------------------------- |

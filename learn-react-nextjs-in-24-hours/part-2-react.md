@@ -4,12 +4,12 @@
 
 [← Part I](./part-1-typescript.md) · [Contents](./README.md) · [Part III →](./part-3-nextjs.md)
 
-React in five hours, the way the dashboard uses it: components as functions returning JSX
-(Hour 5), the one-way flow of props in and state held by `useState` (Hour 6), effects for
-"do something after render" and the cancellation discipline that stops stale responses
-(Hour 7), custom hooks — the unit of reuse — and the rules that make them work (Hour 8), and
-context for the two things every page needs without prop-drilling: who's logged in and how
-to show a toast (Hour 9). Have `make web` running and edit a component to see it hot-reload.
+The dashboard uses function components and hooks. Hour 5 covers JSX and component composition;
+Hour 6 covers props and local state. Hours 7 and 8 explain effects, request cancellation and custom
+hooks. Hour 9 covers the authentication and toast contexts shared by pages.
+
+Run `make web` while working through the component examples so you can compare state changes with
+what the browser renders.
 
 ---
 

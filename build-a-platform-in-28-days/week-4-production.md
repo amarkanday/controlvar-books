@@ -7,21 +7,16 @@
 > Verified against getexperimently/experimently at `a4a6dbd2` (0.17.0 plus unreleased changes, including
 > three breaking ones: #747, #769, #770).
 
-Three weeks of _how it works_. This week is _how you know it works, and how it gets to
-production_: the test pyramid and the lesson the team learned about mocked seams, the dashboard's
-architecture, the checks a pull request must pass, the container images and the two compose
-files, the AWS deployment in CDK, and the logs, metrics and alerts that tell you it's healthy.
-Day 28 hands you the whole map and asks you to draw it from memory.
+Week 4 covers testing, the dashboard, container builds, AWS deployment and observability. It
+examines the evidence provided by each test layer and the steps between merging code and serving
+a release. Day 28 brings these components together in an architecture review.
 
-> **The one sentence to carry through Week 4.** _A change is real when it has passed the 20
-> checks branch protection requires on `main`; when it ships as a signed, immutable image from a
-> release tag, through one Deploy workflow that refuses before it changes anything, runs the
-> migration task as the only schema writer, and shifts traffic blue/green under 5xx alarms that
-> roll it back; and when `/health/ready`, `/metrics` and the scheduler run history say it's
-> alive. Every one of those gates exists because something once slipped through without it, and
-> every one has been broken on purpose to prove it fires._
+> At the reviewed revision, branch protection requires 20 checks. Releases produce signed images,
+> and the Deploy workflow runs a migration task before shifting API traffic through CodeDeploy.
+> Deployment alarms can trigger rollback. Health probes, metrics and scheduler run history provide
+> separate evidence about the running service; none alone establishes that every feature works.
 
-| Day | Topic                    | The one thing it's really about                                                      |
+| Day | Topic                    | Focus                                                      |
 | --- | ------------------------ | ------------------------------------------------------------------------------------ |
 | 22  | Testing strategy         | The pyramid, the harness, two profiles, and why mocked seams hid the hot-path bugs   |
 | 23  | The dashboard            | A thin Next.js client: one fetch wrapper, one auth context, a modules seam           |
@@ -1352,7 +1347,7 @@ your own canary judgement are for.
 
 ### What & why
 
-You can't operate what you can't see. Four signals, each with a specific consumer:
+The platform exposes four types of operational signal, each intended for a different consumer:
 
 1. **Structured logs** (`structlog`) — JSON in staging/production for CloudWatch Logs
    Insights, coloured console in development; every line carries `request_id`, `path`,
@@ -1466,14 +1461,13 @@ Health probes are deliberately asymmetric:
 """
 ```
 
-The distinction is the whole point: a database outage must take the service _out of the load
-balancer_ (readiness fails) without making the orchestrator _restart_ every healthy process
-(liveness still passes) — restarting wouldn't fix the database and would add a thundering
-herd of reconnects when it comes back. The probe is unauthenticated, so what it reports is
-scrubbed: the checks report only an error's type, and the one free-text failure (the modules
-check) goes through `_scrub`, which keeps one line of at most 200 characters, strips URL
-credentials, ARN account ids and named secret assignments, and drops a message that still
-mentions a password.
+A database outage should fail readiness so the load balancer stops routing requests to the
+instance. It should not fail liveness and cause the orchestrator to restart a healthy process;
+restarts do not repair the database and can increase reconnect load when it returns. Because the
+probe is unauthenticated, errors are scrubbed. Checks report exception types, while the modules
+check passes free text through `_scrub`. That function limits the message to one line and 200
+characters, removes URL credentials, ARN account IDs and named secret assignments, and drops a
+message that still mentions a password.
 
 Alerting closes the loop from Week 3: `NotificationService.notify_safety_rollback`,
 `notify_experiment_started`, `notify_experiment_ended` and `notify_rollout_advanced` fan out to
@@ -1555,8 +1549,9 @@ acceptable; user ids are not).
 
 ### What & why
 
-Twenty-seven days, four weeks, one system. Today you draw it from memory and explain every
-arrow — the test of whether the architecture is in your head rather than in this book.
+The final exercise is an architecture review. Draw the components and data flows covered in the
+previous lessons, then explain each connection. Use the source files to check any part you cannot
+account for.
 
 ### The map, with every day's box filled in
 
@@ -1623,7 +1618,7 @@ produces:
 
 1. SDK → `/tracking/assign` → `assignments` row.
 2. SDK → `/tracking/track` → `events` row with `variant_id`.
-3. Dashboard → `/results/{id}` → `p_value` (and the three honesty checks).
+3. Dashboard → `/results/{id}` → `p_value` (and the three validity checks).
 4. Client error → `/tracking/errors` → safety tick → `rollout_percentage` change (at 0% the flag
    is also turned off for everyone and its rollout schedule paused) →
    `safety_rollback_records` row.

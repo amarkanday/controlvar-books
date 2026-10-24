@@ -4,9 +4,9 @@
 
 [← Part 2](./part-2-reliable-systems.md) · [Contents](./README.md) · [Part 4 →](./part-4-safe-change.md)
 
-This Part follows authority and data: which actor can perform an action, which fields an integration
-needs, and what a deletion or retention process actually covers. The engineering recommendations
-are not claims of certification or automatic tenant isolation.
+Hour 7 traces authorization through the request path. Hours 8 and 9 follow collected data through
+storage, exports, retention and recovery. The examples distinguish controls implemented by the
+platform from procedures an operator must provide.
 
 > **Verified against** getexperimently/experimently at `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
 > (source review, 2026-10-23). Recommended procedures and illustrative examples are identified

@@ -4,12 +4,10 @@
 
 [← Part I](./part-1-getting-started.md) · [Contents](./README.md) · [Part III →](./part-3-modern-python.md)
 
-Python has four built-in containers and one text type, and a production backend is mostly
-moving data between them and a database. This Part is lists and tuples — ordered sequences,
-mutable and not (Hour 5); dictionaries — the shape of every JSON payload and every JSONB
-column (Hour 6); sets and the comprehension syntax that builds any container in one
-expression (Hour 7); and strings, f-strings and the regular expressions that turn a name into
-a key (Hour 8). Keep typing in the shell.
+Lists, tuples, dictionaries and sets appear throughout the backend, often as intermediate forms
+between an API request and a database operation. Hours 5–7 explain how these containers differ,
+when to use each one and how comprehensions construct them. Hour 8 covers strings, formatting and
+regular expressions, with examples that turn user-supplied names into keys.
 
 ---
 

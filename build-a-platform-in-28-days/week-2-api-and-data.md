@@ -4,21 +4,16 @@
 
 [← Week 1](./week-1-core-loop.md) · [Contents](./README.md) · [Week 3 →](./week-3-hard-parts.md)
 
-Week 1 was _what_ the platform does. This week is the machinery every request passes through
-on the way to doing it: the FastAPI application and its middleware onion, the settings object
-that decides which environment you're in and refuses to start when it's unsafe, the ways a
-caller proves who they are, the role table that decides what they may do, the SQLAlchemy models
-and the PostgreSQL schema they live in, and the migration story. By Day 14 you'll add a column
-and watch it light up from the database to the dashboard.
+Week 2 follows requests through the backend. It covers middleware, configuration, authentication,
+authorization, database models and migrations. The final exercise adds a column and exposes it
+through the API and dashboard.
 
-> **The one sentence to carry through Week 2.** _A request enters through eight middleware
-> layers (CORS outermost), is authenticated by one of the `deps` functions (bearer JWT, Cognito
-> token, or API key), authorised by a role → resource → action table in which ownership plays
-> no part, handled by a thin endpoint that delegates to a service, which reads and writes
-> SQLAlchemy models inside one `Session` per request — and every one of those layers is
-> configured by a single `Settings` object that fails closed in staging and production._
+> A request passes through eight middleware layers, with CORS outermost. Dependencies authenticate
+> the caller; role, resource and action determine authorization. Endpoints delegate to services
+> using a request-scoped SQLAlchemy session. The shared `Settings` object configures these layers
+> and applies additional validation in staging and production.
 
-| Day | Topic                               | The one thing it's really about                                     |
+| Day | Topic                               | Focus                                     |
 | --- | ----------------------------------- | ------------------------------------------------------------------- |
 | 8   | The FastAPI application             | The onion of middleware, the router tree and the modules seam      |
 | 9   | Configuration                       | One `Settings` class, four environments, validators that refuse     |
@@ -300,9 +295,8 @@ outside development and test the process refuses to start. The unauthenticated
 `GET /api/v1/modules` reports `{"profile": "core"|"full", "modules": [...], "version": ...}`;
 the dashboard reads it to decide which navigation to render.
 
-The rule that keeps the seam honest: **everything under `backend/` must work with `modules/`
-deleted.** `scripts/core_build.sh` builds exactly that tree and runs the suite in it, and an
-import-linter contract refuses a core import of a module.
+The core must work with `modules/` deleted. `scripts/core_build.sh` builds and tests that reduced
+tree, and an import-linter contract rejects imports from core code into a module.
 
 #### A path operation, anatomised
 
@@ -482,11 +476,10 @@ ten-per-minute login budget on requests the user never made.
 
 ### What & why
 
-Configuration is where a platform decides what it _is_ in this process: which database, which
-auth provider, which environment, which secrets, which hostname. Experimently uses
-**pydantic-settings**: a `Settings` class whose fields are read from environment variables
-(and an optional `.env.dev` / `.env.test` / `.env.prod` file), type-coerced, and validated —
-with the validation doing real safety work.
+Configuration selects the database, authentication provider, environment, secrets and public
+hostname for a process. Experimently uses `pydantic-settings` to read these values from environment
+variables and optional `.env.dev`, `.env.test` or `.env.prod` files. The settings classes convert
+values to their declared types and validate combinations before startup.
 
 Four ideas organise the module:
 
@@ -1381,8 +1374,8 @@ mount, so a revoked token can't resurrect a session.
 
 ### What & why
 
-Authentication answered _who_. Authorization answers _may they_. Experimently's model is one
-table and a trump card:
+Authorization checks whether the authenticated caller may perform an action. Experimently uses
+a role-based permission table and a superuser override:
 
 1. **Role × resource × action.** Four roles (`ADMIN`, `DEVELOPER`, `ANALYST`, `VIEWER`), seven
    resource types (experiment, feature flag, user, role, permission, report, and `API_KEY`,
@@ -1390,8 +1383,8 @@ table and a trump card:
 2. **Superuser** trumps everything — `check_permission` returns `True` before looking at the
    table.
 
-What is _not_ in the model is the most important thing about it: **access is by role, not by
-ownership.** For feature flags and for experiments alike:
+Access to experiments and feature flags is determined by role. Creating a resource does not
+establish an ownership-based access rule. The implications are:
 
 - **ADMIN and DEVELOPER** read, create, change and delete _any_ flag and _any_ experiment —
   including scheduling, starting, pausing, completing, archiving and deleting one.

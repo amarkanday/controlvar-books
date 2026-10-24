@@ -4,9 +4,10 @@
 
 [← Part 3](./part-3-security-and-privacy.md) · [Contents](./README.md)
 
-This Part follows a change from release flag to maintenance: define its failure behavior, review
-every affected surface, and assemble a decision from evidence. No deployment or CI/CD configuration
-is created by these lessons.
+The final Part covers feature-flag maintenance and review of changes that affect several layers.
+Hour 10 follows a flag from creation to removal. Hour 11 works through a hypothetical experiment
+owner-label feature. Hour 12 assembles the evidence, recovery plan and maintenance handoff for
+that change.
 
 > **Verified against** getexperimently/experimently at `07a430df5b54b0e5dd71ddca95071ced05e9e36c`
 > (source review, 2026-10-23). Recommended procedures and illustrative examples are identified
@@ -238,8 +239,9 @@ both client versions. Review authorization and response snapshots before claimin
 Map a behavior change across storage, schemas, permissions, UI, consumers and profiles. Review
 contract changes and distinguish omitted fields from explicit clearing in a partial update.
 
-**Review artifact:** an impact map with “affected,” “unaffected, because…” or “needs verification”
-for each surface, plus concrete passing evidence and an honest account of anything unverified.
+**Review artifact:** an impact map identifying affected surfaces, unaffected surfaces with a reason,
+and areas still needing verification. Attach the relevant check results and state what remains
+unverified.
 
 ---
 
@@ -250,10 +252,10 @@ including its rollout, missing evidence and maintenance obligations.
 
 ### What & why
 
-A change can pass one layer's checks while violating another layer's contract. The API may serialize
-a new field correctly while an old writer clears it, a browser exposes a server-only credential,
-or a rollback leaves a stale SDK ruleset serving old behavior. A release decision needs evidence
-about those boundaries, not just a list of files edited.
+Review needs to cover the interactions between layers. A valid API response does not establish
+that old writers preserve the field, that credentials remain on the server or that SDKs observe
+rollback promptly. For each affected interaction, identify the expected behavior and the check
+that supports it.
 
 The packet below is a recommended review procedure. It is not an automatic release gate and does
 not create a new CI/CD requirement for this documentation repository.
@@ -290,9 +292,9 @@ stop action and verification after stopping. Inspect server state and applicatio
 local SDK refresh. For database recovery, use the established runbook and record compatibility and
 potential data loss instead of inventing a universal downgrade command.
 
-Finally, record maintenance: remove the temporary flag when supported clients no longer need it,
-keep long-lived controls exercised, update source pins when the implementation changes and retain
-decision evidence under the agreed data policy. Completion includes the handoff, not just deployment.
+Include maintenance in the handoff. Name who will remove the temporary flag once supported
+clients no longer need it, exercise any long-lived controls, and update source references when
+behavior changes. Retain the decision evidence under the agreed data policy.
 
 ### Try It Yourself
 
