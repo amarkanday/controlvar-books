@@ -4,10 +4,12 @@
 
 [← Part II](./part-2-pydantic.md) · [Contents](./README.md) · [Part IV →](./part-4-sqlalchemy.md)
 
-FastAPI dependencies supply the resources and checks an endpoint needs. Hour 9 explains `Depends`.
-Hours 10–12 trace database sessions, caller authentication and authorization through the dependencies
-used by Experimently. Hour 13 covers middleware, which wraps request handling outside that dependency
-graph. Read these lessons alongside `backend/app/api/deps.py`.
+`Depends` is the idea that separates FastAPI from "Flask with type hints." This Part starts
+with the mechanism itself (Hour 9), then follows the three dependencies every Controlvar
+endpoint uses: the database session (Hour 10), the identity of the caller (Hour 11), and what
+the caller may do (Hour 12). Hour 13 steps outside the dependency graph to the middleware that
+wraps every request before any dependency runs. By the end you'll be able to read
+`backend/app/api/deps.py` top to bottom and know why each function is shaped the way it is.
 
 ---
 
@@ -151,11 +153,9 @@ def require_sdk_ruleset_key(
 ) -> APIKey:
     """Return the presented ``APIKey`` row if it carries ``sdk:ruleset``."""
     ...
-    if not has_scope(api_key.scopes, SDK_RULESET_SCOPE):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=MISSING_SCOPE_DETAIL
-        )
-    ...
+    refusal = scope_refusal(db, api_key)
+    if refusal is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal)
     return api_key
 ```
 
@@ -174,7 +174,11 @@ dependency), runs `deps.get_api_key` — which also depends on `get_db` and the 
 already cached — and only then `require_sdk_ruleset_key` with all three results. The
 endpoint's own `db: Session = Depends(deps.get_db)` gets the _same_ session — one per request.
 The `_owner` parameter is never read: it is there so that `get_api_key`'s 401 for a missing or
-unknown key happens first, before the scope check can answer 403.
+unknown key happens first, before the scope check can answer 403. The 403 has two reasons,
+both in `scope_refusal`: the key lacks the `sdk:ruleset` scope, or its _owner_ can no longer
+change feature flags (deactivated, or demoted to a role that cannot). A key is only as
+powerful as the person it was created by, and that is checked on every request, not once at
+creation.
 
 The override, from the test harness:
 
@@ -187,7 +191,7 @@ The override, from the test harness:
         finally:
             pass
     ...
-    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[deps.get_db] = override_get_db
     app.dependency_overrides[deps.get_current_user] = override_get_current_user
     app.dependency_overrides[deps.get_current_active_user] = override_get_current_active_user
 ```
@@ -423,7 +427,7 @@ provides **security schemes** (`OAuth2PasswordBearer`, `APIKeyHeader`, `HTTPBear
 extract the credential from the request _and_ register themselves in the OpenAPI document,
 so the docs show which endpoints need which credential and the "Authorize" button works.
 
-Experimently has two schemes and one dispatcher:
+Controlvar has two schemes and one dispatcher:
 
 - `oauth2_scheme = OAuth2PasswordBearer(tokenUrl=".../auth/token", auto_error=False)` reads
   `Authorization: Bearer <token>`; `get_current_user` resolves it (dev bypass → local JWT →
@@ -433,7 +437,7 @@ Experimently has two schemes and one dispatcher:
 
 #### Why `auto_error=False`
 
-By default a scheme raises 401 itself when the credential is missing. Both of Experimently's
+By default a scheme raises 401 itself when the credential is missing. Both of Controlvar's
 schemes set `auto_error=False` so a _missing_ credential reaches the dependency, which decides
 what missing means: for the bearer scheme, "is the dev bypass active?" before "401"; for the
 API-key scheme, a 401 with a `WWW-Authenticate: APIKey` header the SDKs recognise. The
@@ -697,7 +701,7 @@ this in code): `python -c "import jwt; print(jwt.decode('$TOKEN', options={'veri
 ### What & why
 
 Authentication (Hour 11) answers _who is this_. Authorization answers _may they do this to
-that_. In Experimently the answer comes from the caller's **role**, never from who created
+that_. In Controlvar the answer comes from the caller's **role**, never from who created
 the thing:
 
 - **ADMIN** and **DEVELOPER** read, create, change and delete any experiment and any feature
@@ -1063,13 +1067,14 @@ receive, send)`, wrapping the next app directly.
 
 The one fact everybody gets wrong at least once: **`add_middleware` wraps the current app,
 so the last one added is the outermost.** Registration order and execution order are
-reversed. `main.py` registers eight layers, in an order it explains in comments:
+reversed. `main.py` registers nine layers, in an order it explains in comments:
 
 ```
-registration:  UnhandledError → RelativeSlashRedirect → RateLimit → TrustedHost
-               → SecurityHeaders → Prometheus → RequestID → CORS
+registration:  UnhandledError → RequestBodyLimit → RelativeSlashRedirect → RateLimit
+               → TrustedHost → SecurityHeaders → Prometheus → RequestID → CORS
 execution:     CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost
-               → RateLimit → RelativeSlashRedirect → UnhandledError → router
+               → RateLimit → RelativeSlashRedirect → RequestBodyLimit
+               → UnhandledError → router
 ```
 
 (Prometheus and RequestID are registered only when the monitoring packages import, which they
@@ -1095,6 +1100,13 @@ do in every build the project ships.)
   session.
 - **RelativeSlashRedirect**: rewrites Starlette's trailing-slash 307 so its `Location` is
   relative and the browser keeps the origin (and the scheme) it was already using.
+- **RequestBodyLimit**: a body larger than `MAX_REQUEST_BODY_SIZE` (5 MiB, a constant in
+  `main.py`) is answered 413 on every route: at once if `Content-Length` says so, otherwise
+  when the bytes the application reads pass the limit. It sits inside every
+  `BaseHTTPMiddleware` layer on purpose: registered outside one, the route reading the body is
+  handed an `ExceptionGroup` instead of the `HTTPException`, and a chunked body over the limit
+  would answer 400 instead of 413 (the comment in `main.py` says it was measured). Being
+  inside CORS, the request id and the headers layer, its 413 carries their headers.
 - **UnhandledError innermost**: a route's unhandled exception becomes a plain 500 _here_, so
   it travels back out through every layer above and carries CORS, the request id and the
   security headers. Left to Starlette, the 500 would be sent by its own outermost
@@ -1143,7 +1155,10 @@ _NUMERIC_PATTERN: re.Pattern = re.compile(r"/\d+")
 
 
 def normalize_path(path: str) -> str:
-    """Replace dynamic path segments with ``{id}`` for stable metric labels."""
+    """Replace dynamic path segments with ``{id}`` for stable metric labels.
+
+    ...
+    """
     path = _UUID_PATTERN.sub("/{id}", path)
     path = _NUMERIC_PATTERN.sub("/{id}", path)
     return path
@@ -1220,15 +1235,32 @@ The security-headers middleware is pure decoration with one environment-aware li
         # HSTS — only in non-dev environments to avoid local HTTPS issues.
         # "dev" is the legacy spelling of "development" (see core/config.py).
         if settings.ENVIRONMENT not in ("development", "dev"):
-            response.headers["Strict-Transport-Security"] = ("max-age=31536000; includeSubDomains; preload")
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains; preload"
+            )
 
-        # Content Security Policy — strict for an API-only service
-        # No scripts, no styles, no frames; only direct API responses
-        response.headers["Content-Security-Policy"] = ("default-src 'none'; frame-ancestors 'none'")
+        # Content-Security-Policy: strict for an API-only service, no
+        # scripts, no styles, no frames. The two API reference pages, matched
+        # by exact path, get DOCS_CSP so that their assets load.
+        if request.url.path in DOCS_PATHS:
+            response.headers["Content-Security-Policy"] = DOCS_CSP
+        else:
+            response.headers["Content-Security-Policy"] = API_CSP
 ```
 
+`API_CSP` is `default-src 'none'; frame-ancestors 'none'`: an API response is data, so the
+browser is told to load nothing from it and never to frame it. That policy would also blank
+the interactive API reference, which needs scripts and styles, so exactly two paths
+(`/api/v1/docs` and `/api/v1/redoc`, compared with `in`, not `startswith`) get a longer
+`DOCS_CSP`. Even that one allows only the CDN hosts the two pages load from and a single
+inline script by its SHA-256 hash; a test recomputes that hash from the served page, so a
+FastAPI upgrade that changes the template fails a test instead of breaking the page in
+production.
+
 The innermost layer is a **pure ASGI** middleware — no `Request` object, no `call_next`, just
-the three ASGI callables, and a wrapped `send` that notices whether the response has started:
+the three ASGI callables, and a wrapped `send` that notices whether the response has started
+(`RequestBodyLimitMiddleware` is the same shape, wrapping `receive` instead to count the
+body as it arrives):
 
 ```python
 # 📁 backend/app/middleware/unhandled_error_middleware.py
@@ -1281,6 +1313,9 @@ app.add_middleware(
         "X-RateLimit-Limit",
         "X-RateLimit-Remaining",
         "X-RateLimit-Window",
+        # The audit log export's entry count, which the dashboard compares
+        # with the rows it received before it saves the file.
+        "X-Total-Count",
     ],
 )
 ```
@@ -1294,8 +1329,9 @@ sends a bearer header, not cookies, so cross-origin responses carry no
 > **Watch Out!** `BaseHTTPMiddleware` has known interactions with `BackgroundTasks` and
 > `contextvars`; the request-id middleware's `ContextVar` works because the binding happens
 > inside `dispatch` on the same task that runs the endpoint. Most of the stack uses
-> `BaseHTTPMiddleware` for readability; the two layers that need to see raw ASGI messages —
-> `UnhandledErrorMiddleware` and `RelativeSlashRedirectMiddleware` — are pure ASGI.
+> `BaseHTTPMiddleware` for readability; the layers that need to see raw ASGI messages —
+> `UnhandledErrorMiddleware`, `RequestBodyLimitMiddleware` and
+> `RelativeSlashRedirectMiddleware` — are pure ASGI.
 
 > **Did You Know?** `backend/app/middleware/` still holds `logging_middleware.py`,
 > `error_middleware.py` and `metrics_middleware.py`. `main.py` neither imports nor registers
@@ -1338,9 +1374,9 @@ applies.)
 
 - Middleware wraps everything; `dispatch(request, call_next)` or pure ASGI `__call__(scope,
   receive, send)`; the last registered is the outermost.
-- Experimently's eight layers, outermost first: CORS → RequestID → Prometheus →
-  SecurityHeaders → TrustedHost → RateLimit → RelativeSlashRedirect → UnhandledError →
-  router. Every refusal and every 500 passes back out through CORS, the request id and the
+- Controlvar's nine layers, outermost first: CORS → RequestID → Prometheus →
+  SecurityHeaders → TrustedHost → RateLimit → RelativeSlashRedirect → RequestBodyLimit →
+  UnhandledError → router. Every refusal and every 500 passes back out through CORS, the request id and the
   security headers.
 - Normalise labels (UUIDs → `{id}`) before recording metrics.
 - Short-circuit responses use the same `{"detail": ...}` shape; success responses carry

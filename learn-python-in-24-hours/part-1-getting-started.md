@@ -4,23 +4,20 @@
 
 [← Back to Contents](./README.md)
 
-This Part introduces the Python needed to follow the backend examples. Hour 1 explains the
-language's execution and type model. Hour 2 covers values and operators, including a unit mismatch
-from the repository. Hours 3 and 4 cover control flow and functions.
-
-Activate the repository's virtual environment and run the examples in a Python shell. Inspect the
-value and type of each result before moving on.
+This Part is Python from nothing: what the language is and why a platform is written in it
+(Hour 1), the values it computes with and the one unit mismatch that lives in this repo
+(Hour 2), how a program decides and repeats (Hour 3), and how work is packaged into functions
+(Hour 4). Open a shell — `python` with the repository's virtualenv active — and type every
+example. Python is a language you learn at the prompt.
 
 ---
 
-<a id="hour-1--why-python-the-method-that-didnt-exist"></a>
-
-## Hour 1 — Python in the backend
+## Hour 1 — Why Python? The method that didn't exist
 
 ### What & why
 
-Python is a high-level, dynamically typed language. Its interpreter compiles source to bytecode
-and executes it. These properties have practical consequences for how backend code is written:
+Python is a **high-level, dynamically typed, interpreted** language. Three words, three
+consequences:
 
 - **High-level**: you write `total += variant.traffic_allocation` and never think about
   memory, pointers or integer widths. The language manages objects for you.
@@ -31,17 +28,17 @@ and executes it. These properties have practical consequences for how backend co
 - **Interpreted**: there's no separate compile step. `python script.py` reads, compiles to
   bytecode in memory, and runs. The feedback loop is seconds.
 
-Python provides numerical libraries such as NumPy, SciPy and pandas alongside web libraries such
-as FastAPI and SQLAlchemy. This suits a backend that combines request handling, database access
-and statistical calculation. Much numerical work runs in compiled library code; request paths
-also spend time waiting for storage. Dynamic typing still allows mistakes to reach runtime, so the
-repository uses annotations and validation at important boundaries. `mypy` is configured in
-`pyproject.toml`, but it is not run by a CI job at the reviewed revision; annotations remain a
-convention rather than a fully enforced static-checking gate (Hour 12).
+Why does a production experimentation platform choose it? Because the backend's job is
+_glue with judgement_: parse requests, query a database, run a statistical test, decide.
+Python has the best ecosystem in the world for the "judgement" part — NumPy, SciPy, pandas —
+and a mature web stack (FastAPI, SQLAlchemy) for the glue. The costs — it's slower than Go
+or Java per line, and dynamic typing lets mistakes wait — are real, and the platform pays
+them deliberately: hot paths are short database reads, heavy maths is NumPy (which is C
+underneath), and functions are type-annotated so a checker like `mypy` can catch what the
+interpreter won't. (Annotations are the convention, not a gate: `mypy` is configured in
+`pyproject.toml` but no CI job runs it. Hour 12.)
 
-<a id="the-method-that-didnt-exist"></a>
-
-#### Case study: an invalid counter-service call
+#### The method that didn't exist
 
 Here is the dynamic-typing cost, concretely, from this codebase. The multi-armed bandit
 scheduler reads per-variant counts from a DynamoDB counter service:
@@ -164,9 +161,7 @@ Then, with the venv active, import something real and look at it:
 
 ---
 
-<a id="hour-2--values-types-and-variables-and-the-01-vs-0100-trap"></a>
-
-## Hour 2 — Values, types, variables and units
+## Hour 2 — Values, types and variables (and the 0–1 vs 0–100 trap)
 
 ### What & why
 
@@ -190,9 +185,7 @@ Operators are what you'd expect, plus a few worth learning on day one: `//` (flo
 `%` (modulo — the bucket operator in this codebase), `**` (power), and `is`/`is not` for
 identity.
 
-<a id="the-01-vs-0100-trap"></a>
-
-#### Proportions and percentages
+#### The 0–1 vs 0–100 trap
 
 Types tell you _what kind_ of value, not _what unit_. `traffic_allocation` is an `int` in
 the API and the database, meaning a **percentage 0–100**; the Lambda functions under
@@ -354,10 +347,10 @@ traffic_allocation`.
 
 ### What & why
 
-Python uses indentation to delimit blocks. A colon introduces the block, and the indented
-statements form its body; the repository's formatter uses four spaces. Changing indentation can
-change which statements execute under a condition or loop, even when the result remains valid
-syntax. Check indentation when copying or moving code.
+Python's control flow is indentation-delimited: a colon opens a block, and the block is
+whatever's indented beneath it (four spaces, enforced by `ruff format`). There are no braces and no
+`end`. That makes structure visible at a glance and makes a misindented line a logic
+change, not a syntax error — worth knowing when you paste code.
 
 - `if` / `elif` / `else` — chained conditions; the first true branch runs.
 - `for x in iterable:` — iterates _values_, not indices. `for i, x in enumerate(xs)` when
@@ -386,16 +379,23 @@ to bottom without nesting:
             raise ValueError(f"Cannot assign users to experiment with status: {experiment.status}")
 
         # Check for existing assignment (sticky assignment)
-        existing_assignment = (...)
+        existing_assignment = self._stored_assignment(user_id, experiment_id)
 
         if existing_assignment:
-            ...
-            return assignment_dict
+            logger.debug(f"Using existing assignment in experiment {experiment_id}")
+            return self._sticky_result(
+                user_id, experiment_id, existing_assignment, track_exposure, context
+            )
 
         # Eligibility gate for new users: holdout -> mutual exclusion -> targeting
-        eligibility = self.check_eligibility(user_id, experiment, context)
+        eligibility = self.check_eligibility(
+            user_id, experiment, context, holdout_check=holdout_check
+        )
         if not eligibility["eligible"]:
-            return self._ineligible_result(user_id, experiment, eligibility)
+            ...
+            result = self._ineligible_result(user_id, experiment, eligibility)
+            ...
+            return result
 ```
 
 `if existing_assignment:` is truthiness on an ORM object (truthy) or `None` (falsy). `if not
@@ -459,13 +459,17 @@ Written as `if not percentage:` this would be _correct by accident_ for `0` and 
 
 ```python
 # 📁 backend/tests/integration/api/test_tracking_api.py
-def _users_by_holdout_membership(count_in: int, count_out: int):
-    """Fresh user ids split by the deterministic holdout bucket."""
+def _users_by_holdout_membership(holdout, count_in: int, count_out: int):
+    """Fresh user ids split by ``holdout``'s own bucket (its ``hash_salt``).
+
+    Each holdout buckets with its own salt since #445, so the split is the
+    holdout's, not the legacy constant's.
+    """
     inside, outside = [], []
     while len(inside) < count_in or len(outside) < count_out:
         user_id = _user()
-        bucket = GlobalHoldoutService._get_holdout_bucket_static(user_id)
-        if bucket < HOLDOUT_PERCENTAGE:
+        bucket = holdout_bucket(user_id, holdout.hash_salt)
+        if bucket < holdout.holdout_percentage:
             if len(inside) < count_in:
                 inside.append(user_id)
         elif len(outside) < count_out:
@@ -474,13 +478,13 @@ def _users_by_holdout_membership(count_in: int, count_out: int):
 ```
 
 A `while` that runs until both lists are full — generating ids and sorting them by the real
-hash. `inside, outside = [], []` is tuple assignment; `return inside, outside` returns a
+hash, salted the way that holdout salts it. `inside, outside = [], []` is tuple assignment; `return inside, outside` returns a
 tuple the caller unpacks.
 
 > **Watch Out!** `x or default` is the falsy-default idiom, and it's a bug whenever `0`
 > (or `""`, or `[]`) is a legitimate value. `flag.rollout_percentage or 0` is safe only
 > because the default _is_ zero. For "use the default only when missing," write
-> `x if x is not None else default`. The TypeScript book calls the same trap `||` vs `??`.
+> `x if x is not None else default`. The TypeScript Part of the [React book](../learn-react-nextjs-in-24-hours/README.md) calls the same trap `||` vs `??`.
 
 > **By the Way.** Python 3.10 added `match`/`case` (structural pattern matching). This
 > codebase, which supports 3.11, barely uses it — `if`/`elif` chains over enums are the house
@@ -653,18 +657,18 @@ Multiple returns as a tuple, unpacked by the caller:
 
 ```python
 # 📁 backend/app/services/global_holdout_service.py
-    def is_user_in_holdout(self, user_id: str) -> Tuple[bool, int, int]:
+    def is_user_in_holdout(
+        self, user_id: str, holdout=_LOOK_UP
+    ) -> Tuple[bool, int, int]:
         ...
         return (is_in, holdout.holdout_percentage, bucket)
 ```
 
 ```python
 # 📁 backend/app/services/assignment_service.py
-        (
-            in_holdout,
-            holdout_percentage,
-            bucket,
-        ) = self.global_holdout_service.is_user_in_holdout(user_id)
+        if holdout_check is None:
+            holdout_check = self.global_holdout_service.is_user_in_holdout(user_id)
+        in_holdout, holdout_percentage, bucket = holdout_check
 ```
 
 A function that _takes_ a function — the scheduler runner receives the tick to call:

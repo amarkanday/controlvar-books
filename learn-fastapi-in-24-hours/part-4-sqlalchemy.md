@@ -4,13 +4,13 @@
 
 [← Part III](./part-3-dependencies-and-auth.md) · [Contents](./README.md) · [Part V →](./part-5-beyond-requests.md)
 
-SQLAlchemy maps application objects to PostgreSQL tables and manages their database sessions.
-Hours 14 and 15 cover models, schema selection, relationships and cascades. Hours 16 and 17 examine
-session lifetimes, connection pools and query patterns, including JSONB and raw SQL. Hour 18 covers
-Alembic migrations and database bootstrap.
-
-Inspect the SQL emitted by the examples in addition to their Python results. That is particularly
-useful when reviewing relationship loading or a query that behaves differently under load.
+SQLAlchemy is the layer between Python objects and PostgreSQL rows, and it's the layer where
+"it works on my laptop" most often diverges from "it works under load and in tests." This Part
+covers the declarative models and the schema convention that lets tests and the app share one
+server (Hour 14), relationships and what cascades when (Hour 15), the session's lifecycle and
+the pool behind it (Hour 16), how the codebase queries — including JSONB and the rare raw SQL
+(Hour 17) — and how the schema evolves with Alembic and the bootstrap (Hour 18). Keep `psql`
+open next to Python; the fastest way to understand an ORM is to watch the SQL it emits.
 
 > **Version note.** SQLAlchemy 2.0.54. The codebase uses the **legacy `Query` API**
 > (`db.query(Model).filter(...)`) throughout rather than 2.0's `select()`; both work in 2.x,
@@ -22,10 +22,12 @@ useful when reviewing relationship loading or a query that behaves differently u
 
 ### What & why
 
-A declarative model maps a Python class to a table. It declares the table name, typed columns,
-constraints and relationships; `__table_args__` supplies indexes and the schema. Experimently's
-models inherit from `Base`, whose metadata collects the tables, and `BaseModel`, a mixin providing
-a UUID primary key, timestamps and `to_dict()`.
+A **declarative model** is a Python class that maps to a table: `__tablename__`, `Column`s
+with types and constraints, relationships to other models, and a `__table_args__` tuple for
+indexes, check constraints and — crucially here — the **schema**. Every model in
+Controlvar inherits from two things: `Base` (the declarative base whose `MetaData`
+collects every table) and `BaseModel`, a mixin that contributes a UUID primary key,
+`created_at`/`updated_at`, and a `to_dict()` helper.
 
 #### Why UUIDs, why a mixin, why an explicit schema
 
@@ -263,7 +265,7 @@ A `relationship()` gives a model an attribute that loads related rows through a 
 (one-to-one with `uselist=False`), `user.roles` (many-to-many through an association table).
 Three decisions come with every relationship:
 
-1. **How is the other side declared?** Experimently uses `back_populates` on _both_ models,
+1. **How is the other side declared?** Controlvar uses `back_populates` on _both_ models,
    never `backref`. It's more typing and it makes each model file self-describing: you can
    read `Variant` and know it has an `experiment` without opening `Experiment`.
 2. **What happens on delete?** Two layers again: the ORM's `cascade="all, delete-orphan"`
@@ -405,8 +407,8 @@ variants before and after: `db.delete(exp); db.flush(); db.query(Variant).filter
 
 ### What & why
 
-A SQLAlchemy `Session` tracks loaded and newly added objects, records changes and writes them
-within a database transaction. Services commonly use four operations:
+A `Session` is a unit of work: it holds the objects you've loaded or added, tracks changes,
+and turns them into SQL inside a transaction. Four verbs cover 95% of what services do:
 
 | Verb            | Does                                                                                              |
 | --------------- | ------------------------------------------------------------------------------------------------- |
@@ -916,7 +918,7 @@ the revisions it is at in an `alembic_version` table (schema-qualified here). `u
 applies what's missing; `revision --autogenerate` diffs the models' metadata against the
 database and drafts a script.
 
-Experimently's graph has a shape most tutorials never show you: **two heads**.
+Controlvar's graph has a shape most tutorials never show you: **two heads**.
 
 - The **core chain** lives in `backend/app/db/migrations/versions/`.
 - The **`modules` branch** lives in `modules/backend/app/db/migrations/versions/`. Its first

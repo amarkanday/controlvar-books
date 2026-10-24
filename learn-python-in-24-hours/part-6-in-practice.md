@@ -4,10 +4,11 @@
 
 [← Part V](./part-5-concurrency.md) · [Contents](./README.md)
 
-The final four lessons apply Python to recurring backend tasks. Hour 21 covers hashing, randomness
-and deterministic results. Hour 22 introduces the NumPy and SciPy operations used by the statistics
-services. Hour 23 covers pytest and the repository's test conventions. Hour 24 brings the coding
-conventions together as a review reference.
+The last four hours are the Python this platform actually depends on beyond the language:
+the standard library's hashing and randomness modules and the discipline of determinism
+(Hour 21), the NumPy/SciPy layer under every statistic (Hour 22), `pytest` and the testing
+idioms the codebase expects (Hour 23), and — finally — the style guide that collects every
+convention from the previous twenty-three hours into a review checklist (Hour 24).
 
 ---
 
@@ -44,8 +45,8 @@ its docstring; the ones this book has met:
 | SDK hash utility          | the same function, as a float in `[0, 1)`                             | every SDK; pinned by `tests/sdk-contract/golden-vectors.json` |
 | Flag rollout              | `MD5("{user}:{flag.key}")`, whole 128-bit digest, `% 100`              | `feature_flag_service._evaluate_percentage_rollout` |
 | Rule rollout              | `MD5("{user}:{rule.id}")`, whole digest, `% 100`                       | `rules_engine.should_include_in_rollout` |
-| Bandit routing            | `MD5("{user}:{experiment.id}:bandit")`, whole digest, `% 10000`        | `endpoints/tracking.py` |
-| Holdout                   | `MD5("{user}:{HOLDOUT_SALT}")`, first 4 bytes LE, `% 100`              | `global_holdout_service` |
+| Bandit routing            | `MD5("{user}:{experiment.id}:bandit")`, whole digest, `% 10000`        | `services/bandit_routing.py` |
+| Holdout                   | `MD5("{user}:{holdout.hash_salt}")`, first 4 bytes LE, `% 100`          | `global_holdout_service.holdout_bucket` |
 | Mutual-exclusion group    | `MD5("{user}:{salt}")`, first 4 bytes LE, ÷ 2³²                        | `mutual_exclusion_service` |
 
 They're all deterministic and uniform; they're just not the same function, and the salts
@@ -114,17 +115,15 @@ contract function:
 
 ```python
 # 📁 backend/app/services/global_holdout_service.py
-    @staticmethod
-    def _get_holdout_bucket_static(user_id: str) -> int:
-        """Get holdout bucket for a user (0-99). Static version."""
-        combined = f"{user_id}:{HOLDOUT_SALT}".encode("utf-8")
-        hash_bytes = hashlib.md5(combined, usedforsecurity=False).digest()[:4]
-        hash_int = struct.unpack("<I", hash_bytes)[0]
-        return hash_int % 100
+def holdout_bucket(user_id: str, salt: str) -> int:
+    combined = f"{user_id}:{salt}".encode("utf-8")
+    hash_bytes = hashlib.md5(combined, usedforsecurity=False).digest()[:4]
+    hash_int = struct.unpack("<I", hash_bytes)[0]
+    return hash_int % 100
 ```
 
 ```python
-# 📁 sdk/python/experimentation/hashing.py
+# 📁 sdk/python/controlvar/hashing.py
 _HASH_DIVISOR = 4294967296  # 2 ** 32
 
 
@@ -225,8 +224,8 @@ production validators demand:
 >>> int(d.hexdigest(), 16) % 100                                  # whole-digest bucket
 >>> struct.unpack("<I", d.digest()[:4])[0] % 100                  # first-4-bytes bucket — different!
 >>> struct.unpack("<I", d.digest()[:4])[0] / 2**32                # the SDK float
->>> from backend.app.services.global_holdout_service import GlobalHoldoutService
->>> from sdk.python.experimentation.hashing import consistent_hash   # if sdk/python is importable; else copy the function
+>>> from backend.app.services.global_holdout_service import holdout_bucket
+>>> from sdk.python.controlvar.hashing import consistent_hash   # from the repo root; else copy the function
 >>> secrets.token_hex(16), len(secrets.token_hex(16))
 >>> hmac.compare_digest("abc", "abc"), hmac.compare_digest("abc", "abd")
 >>> hashlib.blake2b(b"exp|2026-09-11|10000", digest_size=8).digest()
@@ -374,7 +373,7 @@ The same idea shaped for the bandit, with `bincount` instead of a loop of means:
 
 ```python
 # 📁 backend/app/services/bandit_service.py
-        rng = make_rng(ThompsonSampling.resolve_seed(seed, n_samples))
+        rng = make_rng(ThompsonSampling.resolve_seed(seed, n_samples, alpha, beta))
         draws = rng.beta(alpha, beta, size=(n_samples, n_variants))
 
         # For each sample pick the arm with the maximum draw
@@ -451,13 +450,24 @@ stored.
 # 📁 backend/app/services/sequential_testing_service.py
         Z_n = delta / math.sqrt(V_n)
         ratio = V_n / (V_n + tau_squared)
-        lambda_ratio = math.sqrt(ratio) * math.exp(tau_squared * Z_n ** 2 / (2.0 * (V_n + tau_squared)))
+        log_lambda = 0.5 * math.log(ratio) + tau_squared * Z_n**2 / (
+            2.0 * (V_n + tau_squared)
+        )
+        lambda_ratio = math.exp(min(log_lambda, _LOG_FLOAT_MAX))
 ```
 
-> **Watch Out!** NumPy scalars leak. `np.float64(0.05) == 0.05` is `True`, but
-> `json.dumps(np.float64(0.05))` raises and `isinstance(np.float64(1), float)` is `True`
-> while `isinstance(np.int64(1), int)` is `False`. The codebase wraps every returned number
-> in `float(...)` or `.tolist()` for this reason. Do the same.
+The statistic is a product, `sqrt(ratio) * exp(...)`, but the code adds in log space and
+only exponentiates at the end, after capping the log at the largest value a `float` can
+hold: an overwhelming difference would otherwise make `math.exp` raise `OverflowError`.
+Doing arithmetic on logs and exponentiating once is the standard way to keep a product of
+very large and very small factors finite.
+
+> **Watch Out!** NumPy scalars leak. `np.float64` happens to subclass `float`
+> (`isinstance(np.float64(1), float)` is `True`, and `json.dumps` accepts it), but
+> `isinstance(np.int64(1), int)` is `False` and `json.dumps(np.int64(1))` raises
+> `TypeError: Object of type int64 is not JSON serializable`; so does `np.float32`. The
+> codebase wraps returned numbers in `float(...)` or `.tolist()` so the type never depends on
+> which NumPy scalar the arithmetic happened to produce. Do the same.
 
 > **Did You Know?** The versions are pinned together for a reason: `numpy==1.26.4` because
 > `scipy==1.17.1` needs ≥ 1.26 and NumPy 2.x is a separate major bump; `pandas==2.3.3`
@@ -529,9 +539,9 @@ five features this codebase leans on:
 Plus the harness facts from the FastAPI book: the venv, `APP_ENV=test TESTING=true` (the
 current name for the first is `ENVIRONMENT=test`; `APP_ENV` still works and logs a
 deprecation warning), a database per process, no truncation, unique data, `-p no:cov -q` for
-speed. Running everything collects some 16,300 tests at the reference commit (13,227 under
-`backend/tests`, 3,075 under `modules/backend/tests`; measured with
-`pytest --collect-only -q`).
+speed. Running everything collects 24,868 tests at v0.36.4 (21,487 under
+`backend/tests`, 3,381 under `modules/backend/tests`; measured with
+`pytest --collect-only -q`, with the modules' requirements installed).
 
 ### In the wild
 
@@ -588,15 +598,26 @@ teardown after:
 def active_holdout(db_session):
     """An active GlobalHoldout at HOLDOUT_PERCENTAGE; any other active holdout is
     parked for the duration of the test and restored afterwards."""
-    parked = db_session.query(GlobalHoldout).filter(GlobalHoldout.is_active == True).all()
+    parked = (
+        db_session.query(GlobalHoldout).filter(GlobalHoldout.is_active == True).all()
+    )
     for row in parked:
         row.is_active = False
-    holdout = GlobalHoldout(name=f"tracking-holdout-{uuid.uuid4().hex[:8]}", description="Eligibility test holdout",
-                            holdout_percentage=HOLDOUT_PERCENTAGE, is_active=True)
+    holdout = GlobalHoldout(
+        name=f"tracking-holdout-{uuid.uuid4().hex[:8]}",
+        description="Eligibility test holdout",
+        holdout_percentage=HOLDOUT_PERCENTAGE,
+        is_active=True,
+    )
     db_session.add(holdout)
     db_session.commit()
     db_session.refresh(holdout)
+    yield holdout
+    db_session.rollback()
     ...
+    for row in parked:
+        db_session.merge(row).is_active = True
+    db_session.commit()
 ```
 
 `parametrize` — one body, ten cases, each named in the report:
@@ -786,7 +807,7 @@ m.get_counters` — `AttributeError`.
 
 ---
 
-## Hour 24 — Putting it together: the Experimently Python style guide
+## Hour 24 — Putting it together: the Controlvar Python style guide
 
 ### What & why
 
@@ -866,8 +887,8 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 ```
 
-No CI job, `make` target or pre-commit hook runs it, and `mypy backend/app/` reports 931
-errors in 140 files at the reference commit. So `disallow_untyped_defs = true` states the
+No CI job, `make` target or pre-commit hook runs it, and `mypy backend/app/` reports 1,010
+errors in 147 files (mypy 1.20.2, the pinned requirements, measured for this edition). So `disallow_untyped_defs = true` states the
 goal — every function in `backend/app` annotated — not something a pull request is refused
 for. Treat it as a tool you run on the file you're changing: new code should be clean under
 it, even though the tree isn't. `no_implicit_optional` means `x: int = None` is an error —
@@ -1031,9 +1052,10 @@ An array of length `n_samples`: for each sample column, the index of the variant
 largest draw — the "winner" of that Monte Carlo trial.
 
 **Q4. Why `float(np.mean(winner == i))` rather than `np.mean(...)`?**
-`np.mean` returns `np.float64`, which `json.dumps` rejects and which can surprise `==` and
-`isinstance` checks; `float()` converts to a plain Python float before the value leaves the
-function.
+`np.mean` returns an `np.float64`. That one happens to subclass `float`, so `json.dumps`
+accepts it, but its siblings (`np.int64`, `np.float32`) are rejected and none of them has a
+plain `repr`; `float()` converts to a plain Python float before the value leaves the
+function, so the type never depends on which NumPy scalar the arithmetic produced.
 
 **Q5. `MagicMock()` vs `MagicMock(spec=Experiment)` — which would have caught
 `get_counters`?**

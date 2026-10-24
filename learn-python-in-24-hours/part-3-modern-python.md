@@ -4,10 +4,12 @@
 
 [← Part II](./part-2-data-structures.md) · [Contents](./README.md) · [Part IV →](./part-4-idioms.md)
 
-As a Python application grows, module boundaries, interfaces and error handling become as important
-as individual expressions. Hours 9–11 cover imports, classes, dataclasses and enums. Hour 12 explains
-the type annotations used by Pydantic and static checkers. Hour 13 covers exceptions, including how
-to preserve error context and when a fallback can hide a programming defect.
+Parts I and II were the language a script is written in. This Part is the language a
+_codebase_ is written in: how some 78,000 lines of `backend/app` are split into modules and why the import spelling
+matters (Hour 9), classes and the three kinds of method (Hour 10), the two lightweight ways
+to give data a shape — dataclasses and enums (Hour 11), the type-hint vocabulary that
+Pydantic enforces and `mypy` can check (Hour 12), and how errors are raised, caught, chained and — most
+importantly — _not_ swallowed (Hour 13).
 
 ---
 
@@ -421,11 +423,12 @@ class TestSettings(Settings):
 > models and dataclasses are exempt (they copy per instance).
 
 > **Did You Know?** Python has no interfaces, and this codebase doesn't miss them much —
-> "anything with `.send(method, url, headers, data, timeout)`" is a `Transport` in the Python
-> SDK, and `FakeTransport` in tests satisfies it by having the method (duck typing). Where a
+> "anything with `.send(method, url, headers, body, timeout)`" is a `Transport` in the Python
+> SDK, and the SDK's own `FakeTransport` (in `controlvar/testing.py`) satisfies it by having
+> the method (duck typing). Where a
 > contract needs to be _stated_, `typing.Protocol` or an `abc.ABC` with `@abstractmethod`
 > exists. The SDK's `Transport` is a `Protocol` (`class Transport(Protocol)` in
-> `sdk/python/experimentation/transport.py`): it _states_ the `send` signature for type
+> `sdk/python/controlvar/transport.py`): it _states_ the `send` signature for type
 > checkers, yet `FakeTransport` never inherits from it — matching the method is enough. That
 > is structural typing, the checked form of duck typing.
 
@@ -779,9 +782,9 @@ method, not its result.
     ) -> Dict[str, Any]:
 ```
 
-`Union[str, UUID]` allows either input type; the implementation converts `experiment_id` to a
-string where needed. `Dict[str, Any]` describes the service's dictionary result but provides little
-information about its values. The endpoint's response model supplies the more specific structure.
+`Union[str, UUID]` says "we accept either" — and the body does `str(experiment_id)` where
+it matters. `-> Dict[str, Any]` is honest (the service returns dicts) and weak (`Any` values);
+the endpoint's response model is where the strong type lives.
 
 `Literal` and `Annotated` on settings — hints that Pydantic _enforces_:
 
@@ -869,16 +872,16 @@ matters:
     )
 ```
 
-The adapter accepts three stored shapes and normalizes them, which explains the use of `Any`
-here. Elsewhere, check whether a more specific type can describe the value before using `Any`.
+(Three stored shapes; the adapter normalises; `Any` is the honest type. Everywhere else,
+`Any` in a signature is a review comment.)
 
 > **Watch Out!** `Optional[X]` means "or `None`" — it does **not** mean "has a default."
 > `def f(x: Optional[int])` still requires `x` to be passed. Write `x: Optional[int] = None`
 > for optional-with-default. Pydantic v2 is strict about this too: `Optional[str]` without
 > `= None` is a _required_ field that may be null.
 
-> **Did You Know?** `mypy` is _not_ a gate here, and the reason is a number: at the
-> reference commit `mypy backend/app/` reports 931 errors in 140 files. The `[tool.mypy]`
+> **Did You Know?** `mypy` is _not_ a gate here, and the reason is a number: at v0.36.4
+> `mypy backend/app/` reports 1,010 errors in 147 files (mypy 1.20.2, the pinned requirements). The `[tool.mypy]`
 > settings are strict on paper (`disallow_untyped_defs = true`), the code is not there yet,
 > and a gate that fails on every pull request would be switched off. What the codebase does
 > keep is the habit: where the ORM's dynamic attributes defeat the checker, an ignore names
@@ -962,10 +965,11 @@ Four disciplines separate exception handling that helps from exception handling 
 
 #### The exception that hid the bug
 
-The broad exception handler around Hour 1's `get_counters` call allowed the typo to persist.
-Returning a fallback was intended for DynamoDB failures, but it also caught the programming error.
-When a broad handler is necessary, make its use observable through logging and metrics, and test
-it with the actual collaborator as well as the expected failure cases.
+Hour 1's `get_counters` survived because of `except Exception: logger.warning(...); return
+None`. That handler was _correct_ for its purpose (DynamoDB unavailable → fall back) and
+_catastrophic_ for a typo: it converted a programming error into a silent degradation. The
+lesson isn't "never catch broadly" — the fallback is a feature — it's "a broad catch must be
+loud (log at warning, count a metric) and must be tested with the real collaborator."
 
 ### In the wild
 

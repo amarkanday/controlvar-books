@@ -4,10 +4,12 @@
 
 [← Part V](./part-5-beyond-requests.md) · [Contents](./README.md)
 
-Hours 22 and 23 cover endpoint testing and database-backed integration tests. They explain the
-difference between testing a response in isolation and exercising the collaborators that produce
-it, including the repository's approach to per-process test databases. Hour 24 covers health checks
-and summarizes the backend conventions used throughout the book.
+The last three hours are about trust: how you know an endpoint works (Hour 22), how you test
+the paths that touch a real database without the tests trampling each other (Hour 23), and
+how the running service tells you it's healthy — plus the style guide that collects every
+convention this book has taught (Hour 24). Hour 22 opens with the incident that reshaped the
+platform's testing policy; keep it in mind whenever you're tempted to mock the thing you're
+testing.
 
 ---
 
@@ -29,7 +31,7 @@ real service rejects.
 
 #### The mocked-seam lesson
 
-That's not hypothetical. In September 2026 the platform had 5,000+ green tests and a broken
+That's not hypothetical. In September 2026 the platform had thousands of green tests and a broken
 public tracking API: the endpoint's `EventCreate` didn't match the service, the experiments
 endpoints returned shapes their response models refused, the safety service read a table
 nobody wrote to, and the bandit scheduler called a method that didn't exist on the DynamoDB
@@ -151,7 +153,7 @@ class TestAssignEligibility:
     def test_holdout_users_get_control_and_are_not_recorded(
         self, admin_client, active_experiment, active_holdout, db_session
     ):
-        inside, outside = _users_by_holdout_membership(10, 10)
+        inside, outside = _users_by_holdout_membership(active_holdout, 10, 10)
 
         for user_id in inside:
             resp = admin_client.post(
@@ -185,7 +187,7 @@ Everything in that test is real except the credential: the request goes through 
 middleware, the API-key dependency (overridden to the test user by `admin_client`), the
 endpoint, `AssignmentService`, `GlobalHoldoutService`, and PostgreSQL — and the assertions
 read the tables back. The helper `_users_by_holdout_membership` generates ids and sorts them
-by the _real_ holdout hash, so the test can't pass by accident.
+by the _real_ holdout hash, salted with the fixture holdout's own `hash_salt`, so the test can't pass by accident.
 
 The fixture that builds the experiment shows the data-shape discipline the harness relies
 on — unique suffixes instead of truncation:
@@ -306,9 +308,10 @@ Run both: `python -m pytest backend/tests/integration/api/<your file> backend/te
 
 ### What & why
 
-The database test harness provides an isolated database, a schema matching the models, a controlled
-session lifetime and cleanup. Isolation prevents a test run from modifying the development database
-or interfering with another process. The conftest documents how these resources are allocated.
+A test that touches PostgreSQL needs four things the harness provides: a database that's
+_yours_ (not the dev one, not another process's), a schema that matches the models, a session
+whose lifetime you control, and cleanup that doesn't deadlock. Each was learned the hard way,
+and each is documented in the conftest itself.
 
 1. **Environment before import.** The schema name is fixed when `backend.app.models` is
    imported (`get_schema_name()` reads `APP_ENV`/`TESTING`), so the conftest sets them at the
@@ -523,12 +526,13 @@ Then write a fixture in the house style — `make_flag(**overrides)` that insert
 
 ---
 
-## Hour 24 — Observability and the production checklist: the Experimently FastAPI style guide
+## Hour 24 — Observability and the production checklist: the Controlvar FastAPI style guide
 
 ### What & why
 
-The API exposes three operational signals for different consumers. This lesson explains their
-purpose and then collects the backend conventions into a pull-request review checklist.
+An API you can't observe is an API you can't operate. Three built-in signals, each with a
+specific consumer, and then the checklist that turns twenty-three hours of conventions into
+something you can review a pull request against.
 
 - **Structured logs** (`structlog`): JSON outside development (for CloudWatch Logs
   Insights), console in development; every line carries the request id, path and method
@@ -569,7 +573,10 @@ _log_context: contextvars.ContextVar[dict] = contextvars.ContextVar("log_context
 
 
 def bind_log_context(**kwargs: Any) -> None:
-    """Merge *kwargs* into the current async-task log context."""
+    """Merge *kwargs* into the current async-task log context.
+
+    Later calls to this function for the same key will overwrite earlier ones.
+    """
     current = _log_context.get().copy()
     current.update(kwargs)
     _log_context.set(current)
@@ -647,7 +654,7 @@ then URL credentials, ARN account ids and `name=value` secrets are masked, and a
 mentions a password is dropped whole. The response also carries `profile` (`core` or
 `full`), which is how you tell, from outside, which build a process is running.
 
-### The Experimently FastAPI style guide
+### The Controlvar FastAPI style guide
 
 Everything this book taught, as review checklist items. If a pull request violates one,
 it's a comment; if it violates several, it's a conversation.

@@ -4,11 +4,13 @@
 
 [← Part IV](./part-4-idioms.md) · [Contents](./README.md) · [Part VI →](./part-6-in-practice.md)
 
-A web backend spends much of its time waiting for database, cache and network operations.
-Concurrency allows other work to proceed during those waits. Hour 18 introduces the event loop and
-`async`/`await`. Hour 19 covers background tasks, cancellation and offloading blocking operations.
-Hour 20 examines threads, locks and `ContextVar`, including the limits imposed by the interpreter's
-global lock.
+Python runs one thing at a time per thread, and the interpreter's global lock means threads
+don't run Python code in parallel. That sounds limiting and mostly isn't, because a web
+backend spends its life _waiting_ — for the database, for Redis, for a client — and waiting
+is what `async` and threads are for. This Part is the event loop and the `async`/`await`
+syntax (Hour 18), the tasks that run alongside requests and how they're cancelled and
+offloaded (Hour 19), and the threads and locks that still matter, plus the `ContextVar` that
+keeps per-request state straight (Hour 20).
 
 ---
 
@@ -860,9 +862,9 @@ def _inject_user(logger, method, event_dict):
     return event_dict
 ```
 
-A `ContextVar` default is a shared object. If it is a mutable container, changing that container
-through `get()` can expose the mutation to other tasks. Calling `set()` instead binds a value in
-the current task's context. Use the latter when storing task-specific state.
+The default is a single shared object; if it were a mutable container and code did
+`current_user_id.get()["id"] = ...`, every task would see the mutation. `set()` binds a new
+value in _this_ task's context only — which is the whole point of a `ContextVar`.
 
 ---
 
