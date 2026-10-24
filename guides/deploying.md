@@ -549,3 +549,11 @@ Each needs a named person at the moment it happens. Read-only checks print no ac
 | `cdk deploy` of the database stack on a running environment (for example to apply the 35-day backup retention that `infrastructure/cdk/stacks/environments.py` sets for staging and prod) | founder | no, but it changes the live database cluster | run `cdk diff experimentation-database-<env>` first and deploy only if it shows `BackupRetentionPeriod` and nothing else |
 | Tick `override_alarms` | the dispatcher, and the reviewer who approves it | the unwatched deployment cannot be made watched | the run name ends in `ALARMS OVERRIDDEN` |
 | Create the production account and the `prod` environment, with a reviewer other than the dispatcher | founder | yes | `gh api repos/<owner>/<repo>/environments/prod --jq .protection_rules` |
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Database compatibility and recovery](../engineering-guides/database-evolution.md)
+- [Feature-flag rollback and retirement](../engineering-guides/flag-lifecycle.md)

@@ -137,3 +137,11 @@ rules with an unknown key are now refused with a 422 (Hour 19). Files move; if a
 _patterns_ outlast the line numbers.
 
 _Now turn to [Part I](./part-1-typescript.md) and start the clock. ⏱️_
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Feature-flag lifecycle](../engineering-guides/flag-lifecycle.md)
+- [Changing Experimently safely](../engineering-guides/changing-experimently.md)

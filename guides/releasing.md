@@ -376,3 +376,10 @@ publish is a founder decision still to be made.
   configuration needs a PyPI login to read.
 - Whether the redundant 0.17.0 dispatch also re-signed the dashboard images; only the API package's versions were
   listed.
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Changing Experimently safely](../engineering-guides/changing-experimently.md)

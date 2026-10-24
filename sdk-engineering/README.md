@@ -93,3 +93,12 @@ Specialize:                                    ├─ Experimentation Statistics
 ```
 
 _Turn to [Part I](./part-1-the-contract.md). 🔌_
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Measurement and experiment design](../engineering-guides/measurement.md)
+- [Distributed correctness](../engineering-guides/distributed-correctness.md)
+- [Security engineering](../engineering-guides/security-engineering.md)

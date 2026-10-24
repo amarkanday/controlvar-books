@@ -93,3 +93,12 @@ Specialize:                                    ├─ Experimentation Statistics
 ```
 
 _Turn to [Part I](./part-1-local-stack.md). 🛠️_
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Distributed correctness](../engineering-guides/distributed-correctness.md)
+- [Database evolution and performance](../engineering-guides/database-evolution.md)
+- [Privacy and data lifecycle](../engineering-guides/privacy-data-lifecycle.md)

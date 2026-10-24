@@ -510,3 +510,11 @@ symbol; the patterns outlast the line numbers.
 - [ ] ran StreamPulse's rollout story end-to-end and can explain each step
 - [ ] ran `make core-build` once and know what it proves
 - [ ] one specialization book started
+
+## Related engineering field guides
+
+These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
+its original reference commit. See the collection index for scope and verification details.
+
+- [Task-based learning routes](../engineering-guides/README.md)
+- [Changing Experimently safely](../engineering-guides/changing-experimently.md)
