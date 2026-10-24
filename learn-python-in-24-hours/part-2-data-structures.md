@@ -4,10 +4,12 @@
 
 [← Part I](./part-1-getting-started.md) · [Contents](./README.md) · [Part III →](./part-3-modern-python.md)
 
-Lists, tuples, dictionaries and sets appear throughout the backend, often as intermediate forms
-between an API request and a database operation. Hours 5–7 explain how these containers differ,
-when to use each one and how comprehensions construct them. Hour 8 covers strings, formatting and
-regular expressions, with examples that turn user-supplied names into keys.
+Python has four built-in containers and one text type, and a production backend is mostly
+moving data between them and a database. This Part is lists and tuples — ordered sequences,
+mutable and not (Hour 5); dictionaries — the shape of every JSON payload and every JSONB
+column (Hour 6); sets and the comprehension syntax that builds any container in one
+expression (Hour 7); and strings, f-strings and the regular expressions that turn a name into
+a key (Hour 8). Keep typing in the shell.
 
 ---
 
@@ -39,23 +41,26 @@ records"; dataclasses (Hour 11) take over when the record grows beyond two or th
 
 ### In the wild
 
-Building, filtering and walking the weights:
+Building and filtering the weights (`weighted_variants`), then walking them (`pick_variant`):
 
 ```python
-# 📁 backend/app/api/v1/endpoints/tracking.py
+# 📁 backend/app/services/bandit_routing.py
     # Stable ordering so the cumulative walk is reproducible across sessions.
     variants = sorted(experiment.variants or [], key=lambda v: str(v.id))
     weighted = [
-        (variant.id, _bandit_weight(raw_weights.get(str(variant.id))))
+        (variant.id, bandit_weight(raw_weights.get(str(variant.id))))
         for variant in variants
     ]
-    weighted = [(vid, w) for vid, w in weighted if w > 0.0]
+    return [(vid, w) for vid, w in weighted if w > 0.0]
+```
+
+```python
+# 📁 backend/app/services/bandit_routing.py
     total = sum(w for _, w in weighted)
     if not weighted or total <= 0.0:
         return None
-
     digest = hashlib.md5(
-        f"{user_id}:{experiment.id}:bandit".encode(), usedforsecurity=False
+        f"{user_id}:{experiment_id}:bandit".encode(), usedforsecurity=False
     ).hexdigest()
     bucket = int(digest, 16) % 10_000 / 10_000
 
@@ -89,7 +94,9 @@ Slicing to bound a string, and tuple returns:
 
 ```python
 # 📁 backend/app/services/global_holdout_service.py
-    def is_user_in_holdout(self, user_id: str) -> Tuple[bool, int, int]:
+    def is_user_in_holdout(
+        self, user_id: str, holdout=_LOOK_UP
+    ) -> Tuple[bool, int, int]:
         ...
         return (is_in, holdout.holdout_percentage, bucket)
 ```
@@ -108,16 +115,27 @@ A list used as a stack of results, with `sum`, `max`, `min` and `sorted` over it
 
         # Check that max stage percentage doesn't exceed the schedule max
         if max(stage_percentages) > self.max_percentage:
-            raise ValueError(f"Stage percentages cannot exceed the maximum of {self.max_percentage}%")
+            raise ValueError(
+                f"Stage percentages cannot exceed the maximum of {self.max_percentage}%"
+            )
 
-        # Check that stage orders are correct
-        stage_orders = [stage.stage_order for stage in self.stages]
-        if sorted(stage_orders) != list(range(min(stage_orders), max(stage_orders) + 1)):
+        # Check that stage orders are sequential without gaps: n distinct
+        # orders whose highest is n - 1 above their lowest.
+        stage_orders = sorted(stage.stage_order for stage in self.stages)
+        if (
+            len(set(stage_orders)) != len(stage_orders)
+            or stage_orders[-1] - stage_orders[0] != len(stage_orders) - 1
+        ):
             raise ValueError("Stage orders must be sequential without gaps")
 ```
 
-`list(range(lo, hi + 1))` builds `[lo, lo+1, ..., hi]`; comparing it to `sorted(orders)`
-checks "consecutive, no gaps, no duplicates" in one line.
+"No gaps, no duplicates" is checked without building anything: `n` orders are consecutive
+exactly when they are all different (`len(set(...))` equals `len(...)`) and the highest is
+`n - 1` above the lowest. An earlier version compared `sorted(orders)` with
+`list(range(lo, hi + 1))`, which builds a list as long as the _span_, so a stage order of a
+few billion meant a few billion list slots. The fix keeps the same accept/refuse answers and
+adds a bound: `stage_order` is capped at `MAX_STAGE_ORDER` (1000) on every request model, and
+a larger value answers 422 naming the field.
 
 > **Watch Out!** `xs.sort()` sorts in place and returns `None`; `sorted(xs)` returns a new
 > list. `result = xs.sort()` is a classic bug. Likewise `xs.append(x)` returns `None` —
@@ -138,7 +156,8 @@ checks "consecutive, no gaps, no duplicates" in one line.
 >>> ys = sorted([(0.4, "b"), (0.6, "a")], key=lambda p: p[1]); ys
 >>> first, *rest = [1, 2, 3]; first, rest
 (1, [2, 3])
->>> a, b = b, a if False else (1, 2)      # tuple swap idiom: a, b = b, a
+>>> a, b = 1, 2; a, b = b, a; (a, b)         # the tuple swap idiom
+(2, 1)
 >>> t = (1,); type(t), type((1))
 (<class 'tuple'>, <class 'int'>)
 >>> [(t, name) for t, name in [(30, "control"), (60, "a")] if t > 40]
@@ -163,7 +182,7 @@ find which variant buckets 24, 25 and 99 land in.
 - Tuples: ordered, immutable records; unpack them; `_` for ignored fields; `(x,)` for one.
 - The bandit router's weights are a list of `(id, weight)` tuples walked in order with a
   running cumulative sum.
-- `sorted(...)` new vs `.sort()` in place; `range(lo, hi + 1)` for consecutive checks.
+- `sorted(...)` new vs `.sort()` in place; `len(set(xs))` and `max - min` check "consecutive" without building a list.
 
 ---
 
@@ -260,8 +279,8 @@ passed by reference, so `_flatten_into` fills the caller's dict in place and ret
 `.get` chains with defaults for tolerant readers of untrusted JSON:
 
 ```python
-# 📁 backend/app/api/v1/endpoints/tracking.py
-def _bandit_weight(raw: Any) -> float:
+# 📁 backend/app/services/bandit_routing.py
+def bandit_weight(raw: Any) -> float:
     """Extract a non-negative weight from a BanditState.variant_weights entry.
 
     The scheduler stores ``{"weight": float, "successes": ..., "pulls": ...}``
