@@ -120,3 +120,14 @@ secrets. Run them with `make check` when you change a book; see [`tools/README.m
 
 Found something wrong or unclear? Open an issue with the book, the lesson and what you expected. Corrections are
 welcome as pull requests; run `make check` and paste its summary.
+
+## Licence
+
+The books are © 2024-2026 The Controlvar authors and licensed under the
+[Creative Commons Attribution 4.0 International licence](https://creativecommons.org/licenses/by/4.0/) (CC BY 4.0;
+full text in [`LICENSE`](./LICENSE)). You may share and adapt them for any purpose, including commercially, as long
+as you give credit ("The Controlvar Books, The Controlvar authors"), link to the licence and say what you changed.
+
+Code quoted from Controlvar (the blocks tagged `📁`) keeps Controlvar's own licences: Apache-2.0 for the core, the
+modules and the dashboard, MIT for the client SDKs under `sdk/`. See the
+[Controlvar repository](https://github.com/Controlvar/controlvar) for its `LICENSE` and `NOTICE`.
