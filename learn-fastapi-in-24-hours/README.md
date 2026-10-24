@@ -134,10 +134,10 @@ outlast the line numbers.
 
 _Now turn to [Part I](./part-1-foundations.md) and start the clock. ⏱️_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Security engineering](../engineering-guides/security-engineering.md)
-- [Database evolution and performance](../engineering-guides/database-evolution.md)
+- [Security engineering](../production-engineering/part-3-security-and-privacy.md#hour-7--security-engineering-through-the-request-path)
+- [Database evolution and performance](../production-engineering/part-2-reliable-systems.md#hour-6--database-evolution-and-performance)

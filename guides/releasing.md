@@ -377,9 +377,9 @@ publish is a founder decision still to be made.
 - Whether the redundant 0.17.0 dispatch also re-signed the dashboard images; only the API package's versions were
   listed.
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Changing Experimently safely](../engineering-guides/changing-experimently.md)
+- [Changing Experimently safely](../production-engineering/part-4-safe-change.md#hour-11--changing-experimently-safely)

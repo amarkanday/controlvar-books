@@ -94,11 +94,11 @@ Specialize:                                    ├─ Experimentation Statistics
 
 _Turn to [Part I](./part-1-the-contract.md). 🔌_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Measurement and experiment design](../engineering-guides/measurement.md)
-- [Distributed correctness](../engineering-guides/distributed-correctness.md)
-- [Security engineering](../engineering-guides/security-engineering.md)
+- [Measurement and experiment design](../production-engineering/part-1-experiment-design.md#hour-1--measurement-and-experiment-design)
+- [Distributed correctness](../production-engineering/part-2-reliable-systems.md#hour-4--assignments-transactions-and-retries)
+- [Security engineering](../production-engineering/part-3-security-and-privacy.md#hour-7--security-engineering-through-the-request-path)

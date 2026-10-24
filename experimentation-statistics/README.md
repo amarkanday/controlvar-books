@@ -109,10 +109,10 @@ Specialize:                                    ├─ ⭐ Experimentation Statis
 
 _Turn to [Part I](./part-1-foundations.md). 📐_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Measurement and experiment design](../engineering-guides/measurement.md)
-- [LLM evaluation engineering](../engineering-guides/llm-evaluation.md)
+- [Measurement and experiment design](../production-engineering/part-1-experiment-design.md#hour-1--measurement-and-experiment-design)
+- [LLM evaluation engineering](../production-engineering/part-1-experiment-design.md#hour-3--llm-evaluation-engineering)

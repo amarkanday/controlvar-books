@@ -94,11 +94,11 @@ Specialize:                                    ├─ Experimentation Statistics
 
 _Turn to [Part I](./part-1-local-stack.md). 🛠️_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Distributed correctness](../engineering-guides/distributed-correctness.md)
-- [Database evolution and performance](../engineering-guides/database-evolution.md)
-- [Privacy and data lifecycle](../engineering-guides/privacy-data-lifecycle.md)
+- [Distributed correctness](../production-engineering/part-2-reliable-systems.md#hour-4--assignments-transactions-and-retries)
+- [Database evolution and performance](../production-engineering/part-2-reliable-systems.md#hour-6--database-evolution-and-performance)
+- [Privacy and data lifecycle](../production-engineering/part-3-security-and-privacy.md#hour-8--data-inventories-identifiers-and-minimization)

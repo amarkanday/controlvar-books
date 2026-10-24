@@ -623,11 +623,11 @@ with the request ID; grep the API log for it.
 
 You've now used every part of the product that a customer would in their first week.
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Measurement and experiment design](../engineering-guides/measurement.md)
-- [Complete experiment walkthrough](../engineering-guides/experiment-lifecycle.md)
-- [Feature-flag lifecycle](../engineering-guides/flag-lifecycle.md)
+- [Measurement and experiment design](../production-engineering/part-1-experiment-design.md#hour-1--measurement-and-experiment-design)
+- [Complete experiment walkthrough](../production-engineering/part-1-experiment-design.md#hour-2--a-complete-experiment-from-hypothesis-to-removal)
+- [Feature-flag lifecycle](../production-engineering/part-4-safe-change.md#hour-10--feature-flag-lifecycle-create-operate-and-retire)

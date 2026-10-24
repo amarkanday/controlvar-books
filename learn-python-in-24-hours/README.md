@@ -131,9 +131,9 @@ snippet leaves lines out it says so with `...`. Counts were measured there: line
 
 _Now turn to [Part I](./part-1-getting-started.md) and start the clock. ⏱️_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Task-based learning routes after the Python foundations](../engineering-guides/README.md)
+- [Production Engineering — task routes after the Python foundations](../production-engineering/README.md)

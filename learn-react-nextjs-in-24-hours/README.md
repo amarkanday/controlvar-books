@@ -138,10 +138,10 @@ _patterns_ outlast the line numbers.
 
 _Now turn to [Part I](./part-1-typescript.md) and start the clock. ⏱️_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Feature-flag lifecycle](../engineering-guides/flag-lifecycle.md)
-- [Changing Experimently safely](../engineering-guides/changing-experimently.md)
+- [Feature-flag lifecycle](../production-engineering/part-4-safe-change.md#hour-10--feature-flag-lifecycle-create-operate-and-retire)
+- [Changing Experimently safely](../production-engineering/part-4-safe-change.md#hour-11--changing-experimently-safely)

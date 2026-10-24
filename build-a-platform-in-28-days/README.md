@@ -188,11 +188,11 @@ After this capstone, three **specialization** books go deeper on the hardest sub
 
 _Set aside four weeks. Open the repo. Turn to [Week 1](./week-1-core-loop.md). 🏗️_
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Complete experiment walkthrough](../engineering-guides/experiment-lifecycle.md)
-- [Distributed correctness](../engineering-guides/distributed-correctness.md)
-- [Changing Experimently safely](../engineering-guides/changing-experimently.md)
+- [Complete experiment walkthrough](../production-engineering/part-1-experiment-design.md#hour-2--a-complete-experiment-from-hypothesis-to-removal)
+- [Distributed correctness](../production-engineering/part-2-reliable-systems.md#hour-4--assignments-transactions-and-retries)
+- [Changing Experimently safely](../production-engineering/part-4-safe-change.md#hour-11--changing-experimently-safely)

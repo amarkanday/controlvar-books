@@ -260,10 +260,10 @@ The rules that generalise, from the app repository's `CLAUDE.md`:
 - That the Maven TXT token is Central's.
 - The Amplify app's repository connection: it needs the founder's AWS account.
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Security engineering](../engineering-guides/security-engineering.md)
-- [Privacy and data lifecycle](../engineering-guides/privacy-data-lifecycle.md)
+- [Security engineering](../production-engineering/part-3-security-and-privacy.md#hour-7--security-engineering-through-the-request-path)
+- [Privacy and data lifecycle](../production-engineering/part-3-security-and-privacy.md#hour-8--data-inventories-identifiers-and-minimization)

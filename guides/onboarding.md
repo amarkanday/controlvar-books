@@ -511,10 +511,10 @@ symbol; the patterns outlast the line numbers.
 - [ ] ran `make core-build` once and know what it proves
 - [ ] one specialization book started
 
-## Related engineering field guides
+## Related reading — Production Engineering
 
-These task-based guides use a newer, explicitly pinned app snapshot; this book or guide retains
-its original reference commit. See the collection index for scope and verification details.
+The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
+book or guide retains its original reference commit. See the book README for scope and verification.
 
-- [Task-based learning routes](../engineering-guides/README.md)
-- [Changing Experimently safely](../engineering-guides/changing-experimently.md)
+- [Production Engineering — contents and task routes](../production-engineering/README.md)
+- [Changing Experimently safely](../production-engineering/part-4-safe-change.md#hour-11--changing-experimently-safely)

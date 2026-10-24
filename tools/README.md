@@ -56,3 +56,11 @@ reported as a note; remove it.
 
 Change a gate, then break the thing it guards and watch it fail, in a fresh clone after `git add -A`: plant one
 defect per rule shape, run the gate, see it fail; remove it, see it pass. A gate seen only passing is not a gate.
+
+## Book-specific source manifests
+
+`production-engineering-sources.json` records the reviewed app revision, date and source paths for
+each Part of the Production Engineering book. It is review metadata, not a new automated gate.
+The book's README documents its scoped check command using a `REF` override; the older books keep
+the global reference and their own verification notices. Update a Part's source links and manifest
+together when reviewing it against a newer app revision.
