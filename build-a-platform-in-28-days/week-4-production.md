@@ -4,7 +4,7 @@
 
 [← Week 3](./week-3-hard-parts.md) · [Contents](./README.md)
 
-> Verified against Controlvar v0.36.4 (`79f8ed18`).
+> Verified against Controlvar `main` at `09d815ea` (after v0.43.2).
 
 Three weeks of _how it works_. This week is _how you know it works, and how it gets to
 production_: the test pyramid and the lesson the team learned about mocked seams, the dashboard's
@@ -37,10 +37,10 @@ Day 28 hands you the whole map and asks you to draw it from memory.
 ### What & why
 
 Controlvar has several times more test code than application code: `backend/tests` is about
-314,000 lines against about 78,000 in `backend/app` (counted with `cat | wc -l`, Python only).
-Counting `def test_` functions gives about 11,000 under `backend/tests`, 240 more beside the
-Lambda handlers, and about 2,100 in the optional modules' own suite; counting `it(` and `test(`
-calls gives about 1,800 dashboard test cases. These are static counts of test *functions*;
+434,000 lines against about 86,000 in `backend/app` (counted with `cat | wc -l`, Python only).
+Counting `def test_` functions gives about 14,100 under `backend/tests`, 240 more beside the
+Lambda handlers, and about 2,200 in the optional modules' own suite; counting `it(` and `test(`
+calls gives about 2,600 dashboard test cases. These are static counts of test *functions*;
 parametrised tests run more cases than that. Each layer answers a different question:
 
 | Layer               | Where                                    | Question it answers                                         | Runs in                                                  |
@@ -328,8 +328,9 @@ Six pieces carry the architecture:
    `protected`) decides whether a page gets the shell and the auth gate.
 4. **`services/*.ts`** — one object per resource (`ExperimentsService`, `FeatureFlagsService`,
    `ResultsService`, `AdminService`, …) with typed methods that mirror the API's routes
-   one-to-one. Core `frontend/src/services/` holds admin, api, bandit, docs, experiments,
-   featureFlags, modules, password, results and segments.
+   one-to-one. Core `frontend/src/services/` holds admin, api, bandit, docs, eligibility,
+   exclusionGroups, experiments, featureFlags, holdouts, modules, password, results,
+   rolloutSchedules and segments.
 5. **`hooks/useApi.ts`** — `data/loading/error/refetch` around any fetcher, with a mounted
    guard.
 6. **The modules seam** — `contexts/ModulesContext.tsx` (`ModulesProvider`) asks the API which
@@ -354,11 +355,20 @@ The fetch wrapper's contract is written at the top of the file:
  *   `ApiError { status, detail, code? }` for non-2xx responses.
  * - A 401 clears the stored token and redirects to `/login?next=<path>`
  *   (skipped on `/login` itself and for requests sent without auth).
+ * - A request whose response headers have not arrived within `timeoutMs`
+ *   (default 30 s) is aborted and throws `ApiError { status: 0, timedOut }`.
+ *   Reading the body is not timed.
  *
  * `apiFetch` always calls the global `fetch` at call time so tests can keep
  * mocking `global.fetch`.
  */
 ```
+
+The timeout is newer than the rest: `apiFetch` used to have no deadline, so a stalled API left
+the dashboard on a spinner for ever. Now it gives up after 30 seconds, and a write that timed
+out (anything but GET, HEAD and OPTIONS) says it may or may not have been carried out and asks
+you to reload and check — the request may have reached the server even though the answer never
+came back, which is the dashboard's version of the `event_id` problem on Day 5.
 
 (Under `next dev` with `NEXT_PUBLIC_API_URL` unset, `apiBase()` falls back to
 `http://localhost:8000`; production builds never do.) Its error type turns FastAPI's three
@@ -556,7 +566,14 @@ The dashboard is a static export (no server components), and the pages tests are
 `AuthContext.hasRole()` over the `UserMe` returned by `/auth/me` (`role`, `is_superuser`).
 A nav item carries `roles` (the Audit Log item lists all four) or `superuser: true` (the Admin
 item, because `role` and `is_superuser` are independent and the admin API checks the second);
-`RequireAuth` accepts `roles` and `superuser` props for page-level gating.
+`RequireAuth` accepts `roles` and `superuser` props for page-level gating. In the full profile
+the permission helpers that decide what a page offers ask one question more: a custom role or
+direct grant can give a user
+permissions their built-in role lacks, so `EffectivePermissionsContext` reads the signed-in
+user's own map from `GET /api/v1/rbac/users/{id}/permissions`, and each permission helper
+answers `is_superuser || role allows || the map holds the pair` — the API's own rule
+(`utils/effectivePermissions.ts`). With no map (a core build, or a failed fetch) only the role
+lists apply, so the dashboard is never more permissive than the API.
 
 **Q. Where's the OpenAPI type generation?**
 There isn't one — types in `src/types/*.ts` are hand-written to match the schemas.
@@ -577,9 +594,14 @@ the API's CORS defaults.
 
 ### What & why
 
-Branch protection on `main` requires **20 status checks** (the list is `REQUIRED_CHECKS` in `scripts/configure-repo.sh`, which writes it to branch
-protection with `strict` on, so a branch must be up to date with `main` to merge). They come from about a dozen workflows, and each exists because of a specific
-class of regression:
+Branch protection on `main` requires **20 status checks**. The list is `REQUIRED_CHECKS` in
+`scripts/configure-repo.sh`, and the protection body that script writes is the one `main` has:
+`strict` **off** (a branch need not be up to date with `main` to merge) and no required review
+rule. The script changes the check *names* and nothing else: before it writes, it compares live
+protection with what it would write and refuses, writing nothing, if `strict`, the review rule
+or any other flag differs, because those are a maintainer's decision, not the script's. The
+checks come from about a dozen workflows, and each exists because of a specific class of
+regression:
 
 | Check                                        | Workflow                    | Catches                                                                 |
 | -------------------------------------------- | --------------------------- | ----------------------------------------------------------------------- |
@@ -606,7 +628,12 @@ class of regression:
 `conventional-title` runs on every pull request too, but it is **not** required: a prose title
 can merge, and then it silently drops out of the changelog (see "Releasing" below). Neither is
 Doc Examples (`doc-examples.yml`), which runs the examples in the app's own documentation. CodeQL
-has a workflow of its own.
+has a workflow of its own. And a pull request from a **fork** meets one more check, Contributor
+Guard (`contributor-guard.yml`): a fork may change files only in the areas open to outside
+contributors — not workflows, repository scripts, the tests that pin the CI checks, dependency
+and build files or infrastructure — and `scripts/contributor_guard.py` says which and why. It
+runs on `pull_request_target`, so it reports before anyone approves the fork's runs, and it
+runs `main`'s copy of the script and checks out nothing of the pull request.
 
 **`pr-qa-gate.yml`** has twelve jobs: _Detect docs-only change_, Unit Tests, Module Tests, Base
 Requirements Only, Smoke Tests, Frontend Tests, SDK Contract Tests, core-build, full-build, SDK
@@ -899,7 +926,9 @@ The image's contract is in the Dockerfile header:
 ```
 
 The literal `CMD` is `uvicorn backend.app.main:app --host 0.0.0.0 --port 8000`; the entrypoint
-appends `--workers ${WEB_CONCURRENCY:-1}` and the proxy flags. Its contract is in its header:
+appends `--workers ${WEB_CONCURRENCY:-1}` unless the caller passed `--workers`, and always
+appends the proxy flags, last, so they win over any the caller passed. Its contract is in its
+header:
 
 ```bash
 # 📁 backend/docker-entrypoint.sh
@@ -918,9 +947,11 @@ appends `--workers ${WEB_CONCURRENCY:-1}` and the proxy flags. Its contract is i
 #      of the container does not re-seed. SEED_FORCE=true re-runs them.
 #      Every seed is development-only: SEED=<any of them> is refused,
 #      before step 1, unless ENVIRONMENT is development or test.
-#   4. exec "$@" — by default uvicorn; `--workers ${WEB_CONCURRENCY:-1}` and the
-#      proxy flags are appended when the command is uvicorn and the caller did
-#      not pass them explicitly.
+#   4. exec "$@" — by default uvicorn. When the command is uvicorn,
+#      `--workers ${WEB_CONCURRENCY:-1}` is appended unless the caller passed
+#      --workers, and the proxy flags (--proxy-headers, and
+#      --forwarded-allow-ips with the list backend/app/core/proxy_trust.py
+#      builds) are always appended, after any the caller passed, so they win.
 #
 # Steps 1-3 can be skipped (step 0 cannot): RUN_MIGRATIONS=false, SEED= (empty),
 # WAIT_FOR_DB=false. The script runs with `set -euo pipefail`: a failed
@@ -933,6 +964,19 @@ and it migrates on start. On AWS the API task sets `RUN_MIGRATIONS=false` and `S
 and the Deploy workflow's migration task is the only thing that writes the schema: a bootstrap
 refuses a database a newer release migrated, so an older revision started by a replacement, a
 scale-out or a rollback would otherwise exit instead of serving.
+
+"Always appended, so they win" is a security decision, not tidiness. `--forwarded-allow-ips`
+decides whose `X-Forwarded-For` uvicorn believes, and the entrypoint's own comment shows what
+`*` used to do: with a forged hop in the header, `*` resolved the client to the **forgery**,
+because uvicorn then takes the leftmost entry, the one the client wrote. The list is now built
+at start-up by `proxy_trust.py` (loopback, the container's own networks, plus
+`FORWARDED_ALLOW_IPS`, Day 9), and an empty list stops the container with exit 78 rather than
+believing nobody. On AWS the load balancer is not on the API tasks' own network, so the task
+definition sets `FORWARDED_ALLOW_IPS` to the VPC's range; and because a Fargate stack last
+deployed from an older checkout would give the new image none — every request would then
+appear to come from the load balancer, and share its rate limit — the Deploy workflow refuses
+such a task definition before it changes anything
+(`scripts/refuse_api_revision_without_forwarded_allow_ips.py`).
 
 Two more details are worth knowing before they bite. The **OpenSSL probe** right after the
 preflight: on some
@@ -1462,7 +1506,17 @@ rate_limit_rejections_total: Counter = Counter(
 )
 ```
 
-plus the scheduler series Day 17 mentioned, and two Day 9's rate limiter publishes
+The `endpoint` label is where cardinality hides. `PrometheusMetricsMiddleware` labels a
+request with the **template of the route it matched** (`/api/v1/feature-flags/user/{user_id}`),
+read from what routing recorded in the scope, never from the path the client sent, and
+`unmatched` for anything that reached no route (a 404, a trailing-slash redirect, a 429 or a
+refused `Host` answered before routing). An earlier version took the path and replaced UUID and
+numeric segments with a regex, which left every other path a client could invent — a flag key,
+a user id — as a new label value. The rate-limit series are labelled by the limit that matched
+(Day 9), for the same reason. The template comes from a FastAPI scope key that is not public
+API; if an upgrade drops it, those routes fall back to `unmatched` and a named test fails.
+
+The registry also carries the scheduler series Day 17 mentioned, and two Day 9's rate limiter publishes
 (`rate_limit_redis_fallback_active`, a gauge that reads 1 while a process counts per process
 because Redis failed, and `rate_limit_redis_fallbacks_total`) and an `audit_write_failures_total`
 counter, which is the only place a failed audit entry is visible once the change it described has
@@ -1609,8 +1663,8 @@ arrow — the test of whether the architecture is in your head rather than in th
 │  feature_flags.py ──► FeatureFlagService (Day 15): inactive? → rule % →          │
 │                       md5(user:flag.key) % 100 → RawMetric + ErrorLog             │
 │  results.py ──► AnalysisService (Day 6): distinct assigned users, converting      │
-│                 users via event_matching → Fisher's exact on proportions → CI →   │
-│                 SRM, correction, min n (Welch only in the warehouse module)       │
+│                 users via event_matching → Fisher's exact on proportions, Welch   │
+│                 on per-user means → CIs → SRM, correction, min n                  │
 │                 + sequential / CUPED / Bayesian / bandit blocks (Day 19)          │
 │                                                                                   │
 │  lifespan (Day 8) → 5 schedulers, each tick via run_locked_tick (Day 17):         │
@@ -1649,8 +1703,8 @@ produces:
 1. SDK → `/tracking/assign` → `assignments` row.
 2. SDK → `/tracking/track` → `events` row with `variant_id`.
 3. Dashboard → `/results/{id}` → `p_value` (and the three honesty checks).
-4. Client error → `/tracking/errors` → safety tick → `rollout_percentage` change (at 0% the flag
-   is also turned off for everyone and its rollout schedule paused) →
+4. Client error → `/tracking/errors` → safety tick → `rollout_percentage` change (any rollback
+   pauses the flag's rollout schedule; at 0% the flag is also turned off for everyone) →
    `safety_rollback_records` row.
 5. Pull request → 20 required checks → release → signed image → Deploy: migration task →
    blue/green → smoke.
@@ -1666,9 +1720,11 @@ day whose arrow you missed is the day to reread — that's what the table of con
   the contract harness or the demo apps.
 - **[Platform Operations](../platform-operations/README.md)** if you'll run it — compose, CDK,
   Fargate, observability, releases.
-- The app's **[user guide](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/guides/user-guide.md)**
-  to see the product as a product manager does, and its
-  **[self-hosting pages](https://github.com/Controlvar/controlvar/tree/v0.36.4/docs/self-hosting)**
+- The app's **[user guide](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/guides/user-guide.md)**
+  to see the product as a product manager does, its
+  **[How events count](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/guides/how-events-count.md)**
+  for which of your events reach a result, and its
+  **[self-hosting pages](https://github.com/Controlvar/controlvar/tree/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/self-hosting)**
   for the day you run it yourself.
 
 ---

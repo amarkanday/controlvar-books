@@ -11,13 +11,17 @@ across replicas, a safety net that rolls a flag back when the crash rate spikes,
 engine that lets you peek at results without lying to yourself, and sixteen SDKs that all speak
 one contract. By Day 21 you'll narrate a crash spike turning into an automatic rollback.
 
-> **Which code this chapter reads.** Every quoted file was checked against Controlvar v0.36.4
-> (`79f8ed18`). Three things in it are newer than the first edition of this chapter and are
-> covered where they belong: flag and experiment targeting rules refuse unknown keys at every
-> level and can name **segments** (Day 16), a ruleset that cannot be evaluated is abandoned
-> rather than guessed at (Days 15 and 16), and error reports count toward automatic rollback only
-> when a server-side key sent them (Day 18). The edge bootstrap and OpenFeature flag listings
-> are gone (Day 20).
+> **Which code this chapter reads.** Every quoted file was checked against Controlvar `main` at
+> `09d815ea` (after v0.43.2). Several things in it are newer than the first edition of this
+> chapter and are covered where they belong: a flag can serve a **string, number or JSON value**,
+> not only on and off (Day 15); a rollout schedule has stricter rules, one active schedule per
+> flag among them (Day 15); every scheduler tick does its database work in a **worker thread**
+> (Day 17); `/results` analyses revenue, count, duration and custom metrics as **means**
+> (Day 19, after Day 6); flag and experiment targeting rules refuse unknown keys at every level
+> and can name **segments** (Day 16), a ruleset that cannot be evaluated is abandoned rather than
+> guessed at (Days 15 and 16), and error reports count toward automatic rollback only when a
+> server-side key sent them (Day 18). The edge bootstrap and OpenFeature flag listings are gone
+> (Day 20).
 
 > **The one sentence to carry through Week 3.** _Everything "clever" in the platform is a
 > deterministic function over the same two tables plus a small amount of persisted state — a
@@ -29,11 +33,11 @@ one contract. By Day 21 you'll narrate a crash spike turning into an automatic r
 
 | Day | Topic                              | The one thing it's really about                                     |
 | --- | ---------------------------------- | ------------------------------------------------------------------- |
-| 15  | Feature flags                      | `enabled` + `reason`, and a hash on `flag.key` instead of an id     |
+| 15  | Feature flags                      | `enabled`, `value` and `reason`, and a hash on `flag.key`, not an id |
 | 16  | The rules engine & adapter         | Three storage shapes, one engine, and `expand_context`'s aliases    |
 | 17  | Schedulers & the advisory lock     | Five loops, one `run_locked_tick`, and the naive-datetime bug       |
 | 18  | Safety & auto-rollback             | Error logs ÷ evaluations over 15 minutes; 0% turns the flag off     |
-| 19  | The statistics engine              | Fisher first; sequential, CUPED, Bayesian, bandits beside it        |
+| 19  | The statistics engine              | Fisher or Welch first; sequential, CUPED, Bayesian, bandits beside it |
 | 20  | SDKs & the contract                | Six endpoints, server decides (local evaluation is the beta exception), golden vectors, fan-out |
 | 21  | **Capstone:** StreamPulse rollback | A crash spike through errors → safety → scheduler → flag → SDK      |
 
@@ -48,6 +52,13 @@ answer has to be explainable, because the person debugging "why don't I see the 
 needs to know whether it was the kill switch, a targeting rule, or the rollout dice. So the
 flag service returns not just `enabled` but a **`reason`** — `targeting_rule`, `rollout`,
 `inactive` or `error` — and the SDKs surface it.
+
+"On or off" is the default answer, not the only one. A flag has a **`value_type`** —
+`boolean` (the default), `string`, `number` or `json` — fixed when it is created, and two
+values: **`on_value`** for the users it is on for and **`off_value`** for everyone else,
+including everyone while the flag is off. A `string` flag serving `"blue"` or `"green"`, or a
+`json` flag serving a configuration object, is still decided by exactly the same `enabled`;
+the value is just what that decision serves.
 
 Three properties shape the design:
 
@@ -79,6 +90,14 @@ def _evaluate_flag_by_key(db: Session, flag_key: str, user_id: str, context: Opt
     archived, ...) evaluates to ``enabled: false`` with ``reason: "inactive"``
     rather than 404: the client should treat it as "off", not as an error.
     Only an unknown key is a 404.
+
+    ``value`` is what the flag serves this user (#1497): its ``on_value`` when
+    ``enabled``, its ``off_value`` otherwise, so every way a flag is off --
+    inactive, archived, no match, outside the percentage, ``reason: "error"``
+    -- serves the off value; a boolean flag's ``value`` is ``enabled``. A
+    stored value outside the value rules is answered with no ``value`` key
+    (``flag_values.served_value``). ``config`` is always ``None``: the value
+    travels in ``value``, never in ``config``.
     """
     db_flag = db.query(FeatureFlag).filter(FeatureFlag.key == flag_key).first()
     if not db_flag:
@@ -88,10 +107,22 @@ def _evaluate_flag_by_key(db: Session, flag_key: str, user_id: str, context: Opt
     evaluation = feature_flag_service.evaluate_flag_detailed(db_flag, user_id, context)
     record_flag_evaluation(flag_key, "enabled" if evaluation["enabled"] else "disabled")
 
-    # ``config`` has always been ``None`` here (the flag dict has no ``value``);
-    # kept for backwards compatibility with existing SDKs.
-    return {"key": flag_key, "enabled": evaluation["enabled"], "config": None, "reason": evaluation["reason"]}
+    answer: Dict[str, Any] = {"key": flag_key, "enabled": evaluation["enabled"]}
+    servable, value = served_value(db_flag, evaluation["enabled"])
+    if servable:
+        answer["value"] = value
+    answer["value_type"] = flag_value_type(db_flag)
+    answer["config"] = None
+    answer["reason"] = evaluation["reason"]
+    return answer
 ```
+
+So the answer is `{key, enabled, value, value_type, config, reason}`. Notice what is **not**
+in the decision: `value` is read *after* `enabled` is known, by one small function,
+`served_value`, and nothing in `evaluate_flag_detailed` below knows a flag has a value at all.
+That is what let typed values arrive without touching targeting, rollout, safety or the
+ruleset's bucketing. `config` stays `None`, as it always was, so an SDK written before values
+existed still reads the same shape.
 
 The `context` query parameter is URL-encoded JSON (the SDKs send `user.attributes` this way;
 `_parse_context_param` returns a 422 if it isn't a JSON object). The service does the
@@ -267,27 +298,56 @@ The lifecycle around evaluation is small, and since 0.17.0 it has a strict contr
 
 - **Create.** `POST /feature-flags` makes a flag that is **off** unless the body sends
   `"is_active": true`. A field the API does not read answers 422 (`extra="forbid"`), an explicit
-  `null` on `key`, `name`, `is_active`, `rollout_percentage` or `default_value` answers 422,
-  `status` is read-only (send `is_active` instead), `default_value` accepts only `false` for now,
-  and a duplicate key answers 409. A GET body can be sent back unchanged, unless its
+  `null` on `key`, `name`, `is_active`, `rollout_percentage`, `default_value`, `value_type`,
+  `on_value` or `off_value` answers 422, `status` is read-only (send `is_active` instead), and a
+  duplicate key answers 409. A GET body can be sent back unchanged, unless its
   `targeting_rules` are ones a save now refuses (Day 16).
+- **Values.** `value_type` is set on create and read-only afterwards ("Create a new flag to
+  serve another type"). A boolean flag stores neither value and reads `true`/`false`; a
+  `string`, `number` or `json` flag sends both, of its type (a `json` value is an object or an
+  array, never `null`), different from each other, at most 10 levels deep and 8,192 bytes of
+  compact JSON, with every number finite and within ±(2⁵³ − 1) so that Python and JavaScript
+  compare it identically. Every refusal is a 422 at its own field, naming the field and never
+  the value. The rules live in one module, `backend/app/core/flag_values.py`, so that the
+  API's write checks and the evaluate route's reading of a stored row cannot disagree.
+  `default_value` is still accepted, but only as `false`, and is deprecated in favour of
+  `off_value`.
 - **On and off.** `POST /feature-flags/{id}/activate` and `/deactivate` (the kill switch), and
   `PUT` with `is_active`. An **archived** flag refuses every request that would turn it on with
   400 ("unarchive it before turning it on"); `POST /feature-flags/{id}/unarchive` (beta) brings
   it back as INACTIVE, never ACTIVE, so turning it on stays a separate step.
-- **Change.** `PUT` changes `rollout_percentage` or `targeting_rules`;
+- **Change.** `PUT` changes `rollout_percentage`, `targeting_rules` or, for a string, number
+  or json flag, its two values (checked against the stored type);
   `POST /feature-flags/bulk-toggle` changes many flags at once (a plain POST; the SSE audit
   stream is a separate route, `GET /audit-logs/stream`).
 - **Rollout schedules.** A `RolloutSchedule` with ordered `RolloutStage`s (5% → 25% → 50% →
-  100%), each `time_based`, `metric_based` or `manual`, advanced by the rollout scheduler or by
-  `POST /rollout-schedules/stages/{id}/advance`. Percentages must be non-decreasing across
-  stages; active schedules can't have stages deleted. A schedule can be **paused**, by hand or
-  by a safety rollback (Day 18); a paused schedule is never advanced, by a tick or by hand,
-  until `POST /rollout-schedules/{id}/activate` resumes it.
+  100%), each `time_based` or `manual` (`metric_based` is accepted but never starts by itself),
+  advanced by the rollout scheduler or by `POST /rollout-schedules/stages/{id}/advance`.
+  Percentages must be non-decreasing across stages; active schedules can't have stages deleted.
+  A schedule can be **paused**, by hand or by a safety rollback (Day 18); a paused schedule is
+  never advanced, by a tick or by hand, until `POST /rollout-schedules/{id}/activate` resumes
+  it. The rules are strict, and each one is a 409 or a 422 that changes nothing:
+  - **One active schedule per flag.** Activating or resuming a second answers 409, so two
+    schedules never both set the same flag's percentage.
+  - **Stages start in order, and a started stage keeps its place.** Advancing a pending stage
+    while another is in progress, or before every earlier one has completed, answers 409. A
+    stage in progress keeps its `target_percentage` and `stage_order` (changing either is a
+    409); a new or moved stage goes after every stage that has started. Every change re-checks
+    the targets against each other and against `max_percentage`: a create that breaks the
+    order is a 422, and an add, an edit or a lowered maximum that would is a 409.
+  - **Stages change through their own routes.** `PUT /rollout-schedules/{id}` refuses a body
+    that contains `stages` at all — `null` and `[]` included — with 422; a stage is added with
+    `POST .../stages` and changed with `PUT .../stages/{stage_id}`. An `end_date` not after the
+    `start_date` is a 422.
+  - **A stage's clock is its own.** A stage records `started_at` when it actually starts; a
+    time-based stage completes `trigger_configuration.duration` hours (a number from 0 to 8,760,
+    24 by default) after that, and `min_stage_duration` (0 to 8,760 hours, or `null`) is
+    measured from it too. Editing a stage in progress no longer restarts its clock.
 
-Who may do any of this is a role question, not an ownership one: ADMIN and DEVELOPER may
+Who may do any of this is a permission question, not an ownership one: ADMIN and DEVELOPER may
 create, change and delete any flag; ANALYST and VIEWER may read flags and change none, even one
-they created (Week 2, Day 11).
+they created, unless a custom role or direct grant (full profile) gives them that action
+(Week 2, Day 11).
 
 ### Build It
 
@@ -328,10 +388,26 @@ docker compose exec postgres psql -U postgres -d experimentation -c \
   "select metric_type, count(*), round(avg(value)::numeric,2) as avg_value from experimentation.raw_metrics where feature_flag_id='$FID' group by 1"
 ```
 
+Last, a flag that serves a value. Create a string flag at 50%, evaluate it for a few users,
+and watch `value` follow `enabled`; then try to send it a number:
+
+```bash
+curl -s -X POST $API/feature-flags/ -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key":"buy_button_colour","name":"Buy button colour","is_active":true,"rollout_percentage":50,"value_type":"string","on_value":"green","off_value":"blue"}' > colour.json
+FLAG=buy_button_colour
+for U in user-1 user-2 user-3 user-4; do ev; done   # value "green" exactly where enabled is true
+CID=$(python -c 'import json; print(json.load(open("colour.json"))["id"])')
+curl -s -X PUT $API/feature-flags/$CID -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"on_value": 7}'                         # → 422 at on_value, which does not repeat the 7
+```
+
 ### Key takeaways
 
 - A flag decision is `inactive?` → first matching rule's percentage, else global percentage →
   `md5(user_id:flag.key) % 100 < percentage`; the response carries `reason`.
+- The decision is a boolean; the **value** is read after it: `on_value` when enabled,
+  `off_value` otherwise (`true`/`false` for a boolean flag). `value_type` is fixed at create,
+  and the value rules are one module, `core/flag_values.py`.
 - Rules pick the percentage; the shared hash picks the users — so rule cohorts and global
   cohorts coincide at equal percentages.
 - Rollout up is additive, rollout down removes the newest users first; there's no per-user
@@ -342,6 +418,8 @@ docker compose exec postgres psql -U postgres -d experimentation -c \
 - Kill switch = `deactivate` → `inactive` with 200; archived → `inactive` too, and refuses to
   turn on until unarchived; unknown key → 404.
 - A new flag is off unless created with `"is_active": true`; unknown fields answer 422.
+- A flag has at most one ACTIVE rollout schedule; stages start in order, and a started stage
+  keeps its target and its place.
 
 ### Q&A
 
@@ -357,11 +435,14 @@ re-buckets every user. Renaming a flag's key (the API allows it) reshuffles its 
 same reason.
 
 **Q. Can a flag return a value other than a boolean?**
-No. The model still has a `variants` JSONB column, but flag responses no longer carry
-`variants`, `metrics`, `rules` or `last_evaluated` (0.17.0), the evaluate response's `config` is
-always `None`, and the new `default_value` field accepts only `false` for now. The React SDK's
-`useVariant` returns a variant _string_ only because it's built on `useFeatureFlag`'s value.
-Treat flags as booleans; use an experiment when you need arms.
+Yes: create it with `value_type` `string`, `number` or `json` and its two values, and the
+evaluate answer's `value` carries the one this user gets. The JavaScript SDK reads it with
+`getStringValue`, `getNumberValue` and `getJsonValue`, the Python SDK with `get_string_value`,
+`get_number_value` and `get_json_value`; each takes a default and returns it, rather than
+raising, when the request fails or the flag serves another type. What a flag still is not, is an
+experiment: it has two values, not arms, and no analysis. The model's old `variants` JSONB
+column is not read, and the evaluate response's `config` is always `None`. Use an experiment
+when you need arms and a result.
 
 **Q. What's a `FeatureFlagOverride`?**
 An unused table. The model (a per-user forced `value`, optional `reason` and `expires_at`,
@@ -496,8 +577,13 @@ unknown key at every level, native groups nested more than 10 levels deep, a nat
 with more than 1,000 rules, groups and conditions (and dashboard-shape flag rules with more than
 1,000 groups and conditions in all), list operators with more than 1,000 items, and
 a rule `rollout_percentage` that is not an integer from 0 to 100. Experiments get the same
-checks through `validate_experiment_targeting`. One consequence for clients: a GET body whose
-stored rules a save would now refuse cannot be PUT back unchanged.
+checks through `validate_experiment_targeting`. The list has kept growing in one direction: a
+rule the evaluator would **never match** is refused rather than stored, so an operator,
+comparison, distance unit or time window the engine does not apply, a value it cannot read,
+and a `between` whose bounds it cannot read are all 422s now. One consequence for clients: a GET
+body whose stored rules a save would now refuse cannot be PUT back unchanged. Stored rules are
+not re-judged; after an upgrade, `python -m backend.scripts.check_targeting_rules` lists the
+ones a save would refuse (it reads and never writes).
 
 The engine walks groups recursively with `and`/`or`/`not` and applies operators through one
 dispatch function:
@@ -826,7 +912,8 @@ three guarantees:
    get the lock skips the tick.
 2. **Run history** — every executed tick is persisted through
    :meth:`SchedulerHealthService.record_run` (``scheduler_runs`` table), which
-   feeds ``GET /api/v1/scheduler/health``.
+   feeds ``GET /api/v1/scheduler/health``. The write runs in a worker thread
+   (:func:`run_in_worker`), never on the event loop's thread.
 3. **Prometheus signal** — ``scheduler_last_success_timestamp{name}``,
    ``scheduler_tick_duration_seconds{name}`` and
    ``scheduler_ticks_total{name,status}`` from :mod:`backend.app.core.metrics`.
@@ -860,7 +947,7 @@ async def run_locked_tick(name: str, tick: Callable[[], Awaitable[Any]], *, engi
             # Shutdown: release the lock (context manager) and propagate
             # without recording a bogus "failed" run.
             raise
-        except Exception as exc:  # noqa: BLE001 - recorded then re-raised
+        except Exception as exc:
             status = STATUS_FAILED
             error = str(exc) or exc.__class__.__name__
             exc_to_raise = exc
@@ -873,12 +960,69 @@ async def run_locked_tick(name: str, tick: Callable[[], Awaitable[Any]], *, engi
         prom.record_scheduler_success(name)
 
     if record:
-        _persist_run(name, started_at, completed_at, status, result, error)
+        # In a worker thread, like the tick bodies (#1690): the write checks a
+        # connection out of the pool, and when every connection is held by a
+        # request waiting for this event loop, a checkout made on the loop's
+        # own thread waits the whole pool timeout and stops the API answering
+        # for that long -- and then the run record is lost as well.
+        await run_in_worker(
+            functools.partial(
+                _persist_run, name, started_at, completed_at, status, result, error
+            ),
+            label=f"{name} run record",
+        )
 
     if exc_to_raise is not None:
         raise exc_to_raise
     ...
 ```
+
+That comment is the most expensive lesson in this chapter, and it is worth slowing down for.
+The schedulers are `asyncio` tasks on the **same event loop** that serves every HTTP request,
+and their bodies were `async def` functions making ordinary synchronous SQLAlchemy calls. That
+hurt in two ways. While a tick ran its queries, the loop answered nothing else: the metrics
+tick, aggregating a million `raw_metrics` rows, was measured holding it for about 3.7 seconds,
+and with one API worker (the Compose default) every evaluation, tracking call and readiness
+probe waited. Worse, under sustained load every pooled connection was held by a request, and
+each of those requests was waiting for the event loop to run its next step. A tick that then
+asked the pool for a connection *on the loop's own thread* blocked, so the loop could not run
+the requests that would have returned connections, and the API stopped answering anything until
+the pool's timeout expired — about 30 seconds at a time. Nothing was wrong with any single
+query. The fix is structural: every tick's database work, and the run record, runs in a worker
+thread, and the loop only awaits it. Four of the five ticks and the run record go through one
+helper (the bandit tick hands a plain function to `asyncio.to_thread`):
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+async def run_in_worker(work: Callable[[], Any], *, label: str) -> Any:
+    """
+    Run *work* in a worker thread; the event loop awaits it (#1690).
+
+    For a tick whose body is synchronous (SQLAlchemy queries, HTTP sends): run
+    on the event loop, it stops the API answering anything else until it
+    finishes. *work* must be a plain callable. A coroutine function cannot be
+    handed over as it is -- ``asyncio.to_thread`` on one only creates the
+    coroutine and never runs it, and the tick is recorded as a success that
+    did nothing -- so wrap it to create and run the coroutine inside the
+    thread, on a private event loop: ``lambda: asyncio.run(body())``.
+    ...
+    """
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, functools.partial(contextvars.copy_context().run, work)
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await _wait_for_worker(worker, label)
+        raise
+```
+
+Two details in it are traps worth knowing. `asyncio.to_thread` on a *coroutine function*
+creates the coroutine in the thread and never runs it, so a tick "succeeds" having done nothing;
+the docstring names the wrapper that avoids it. And on cancellation (a shutdown), the helper
+**waits for the thread to finish** before re-raising: `run_locked_tick` releases the advisory
+lock when the tick returns, so returning early would let another replica's tick run beside a
+thread that is still running.
 
 The lock itself is small and careful:
 
@@ -962,19 +1106,28 @@ class ExperimentScheduler:
         while self.is_running:
             try:
                 # One tick under the advisory lock; records the run and
-                # skips when another replica holds the lock.
-                await run_locked_tick(SCHEDULER_NAME, self.process_scheduled_experiments)
+                # skips when another replica holds the lock. Its database
+                # work runs in a worker thread.
+                await run_locked_tick(
+                    SCHEDULER_NAME, self.process_scheduled_experiments
+                )
+
+                # Wait for the next interval
                 await asyncio.sleep(self.interval_minutes * 60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in experiment scheduler: {str(e)}")
+                logger.error(f"Error in experiment scheduler: {e!s}")
                 # Wait a bit before trying again
                 await asyncio.sleep(60)
 ```
 
-The tick opens its **own** `SessionLocal()` (no request, no `get_db`), does its queries,
-commits, and returns `{"items_processed", "items_failed", "metadata"}` for the run record.
+The tick's database work runs in one worker thread with its **own** `SessionLocal()` (no
+request, no `get_db`): it does its queries, commits, and returns `{"items_processed",
+"items_failed", "metadata"}` for the run record. What stays on the loop is what belongs to it:
+the experiment tick drops the cached detail of each experiment it started or completed there,
+because that uses the process-wide Redis pool, which belongs to the loop, and then sends the
+notifications, each send in a worker thread of its own.
 `asyncio.sleep` between ticks means the interval is "after the previous tick finished", not
 "every N minutes on the clock" — fine for work that is idempotent and due-based. The experiment
 scheduler is built at import with the class default of 15; the lifespan sets its
@@ -1132,7 +1285,12 @@ print(naive <= aware)"
   `scheduler_runs` + Prometheus counters/histogram.
 - A replica that doesn't get the lock skips; a database outage skips; a tick exception is
   recorded then re-raised to the loop's own backoff.
-- Ticks open their own `SessionLocal()` and return `{items_processed, items_failed, metadata}`;
+- A tick's database work never runs on the event loop's thread: on it, a synchronous query
+  stops every request, and a pool checkout under load can stall the API for the whole pool
+  timeout. `run_in_worker` runs it in a thread and, on cancellation, waits for the thread before
+  the lock is released.
+- Ticks open their own `SessionLocal()` (in the worker thread) and return
+  `{items_processed, items_failed, metadata}`;
   one failing item is rolled back in its own savepoint and the rest of the tick stands.
 - A paused rollout schedule is never advanced; a paused experiment resumes only at a scheduled
   `resume_at`; a Bayesian decision never stops an experiment.
@@ -1153,9 +1311,11 @@ None. The module exists, but every loop does its own simple backoff: after an ex
 and sleeps 60 seconds before the next tick.
 
 **Q. What happens on shutdown mid-tick?**
-`stop()` cancels the task; `run_locked_tick` catches `CancelledError`, lets the context
-manager release the lock, and re-raises without recording a bogus failed run. An in-flight
-database transaction is rolled back by the session close in the tick's `finally`.
+`stop()` cancels the task. The cancellation reaches `run_in_worker`, which does **not** return
+at once: it waits for the worker thread to finish its work, then re-raises. Only then does
+`run_locked_tick` see the `CancelledError`, let the context manager release the lock, and
+re-raise without recording a bogus failed run. The order matters: a lock released while the
+thread was still writing would let another replica's tick run beside it.
 
 **Q. Two workers in one container (`WEB_CONCURRENCY=2`) — does the lock still work?**
 Yes; it's a database lock, so any two processes anywhere coordinate. The platform still
@@ -1163,8 +1323,9 @@ documents one worker per container because other per-process state (the login lo
 tracker, the in-memory rate-limit fallback) isn't shared.
 
 **Q. Where do I see that a tick ran, or failed?**
-`GET /api/v1/scheduler/health` (and the run history endpoints under `/scheduler`), backed by
-`scheduler_runs`; the Admin → Scheduler dashboard page; and the Prometheus series
+`GET /api/v1/scheduler/health` (and `GET /api/v1/scheduler/{name}/history`, whose `limit` takes
+1 to 1,000 and answers 422 outside that), backed by `scheduler_runs`; the Admin → Scheduler
+dashboard page; and the Prometheus series
 `scheduler_ticks_total{name,status}` / `scheduler_last_success_timestamp{name}` on
 `/metrics`. Alert on the latter going stale (Week 4).
 
@@ -1207,10 +1368,12 @@ The design decisions:
      so engineers (the `employee` rule) and the first 5% of buckets keep seeing it while the
      crash is investigated.
    - A target of **0 turns the flag off**: its status becomes INACTIVE and its global percentage
-     0, so every user gets `enabled: false, reason: "inactive"`, rule-matched users included.
+     0, so every user gets `enabled: false, reason: "inactive"`, rule-matched users included —
+     and, for a string, number or json flag, its `off_value`.
 4. **A rollback pauses the schedule.** Every ACTIVE rollout schedule of the flag is set to
-   PAUSED in the same transaction, so the rollout scheduler cannot raise the percentage again on
-   its next tick. Resuming is a person's decision (`POST /rollout-schedules/{id}/activate`).
+   PAUSED in the same transaction (a flag has at most one ACTIVE schedule now, Day 15, but the
+   code does not rely on it), so the rollout scheduler cannot raise the percentage again on its
+   next tick. Resuming is a person's decision (`POST /rollout-schedules/{id}/activate`).
 5. **Don't roll back twice.** The error window stays "hot" for up to 15 minutes after a
    rollback. One function, `rollback_change`, decides whether a rollback would change anything;
    when it would not, the scheduler writes no record and sends no notification.
@@ -1344,7 +1507,11 @@ promise):
                     # If auto-rollback is enabled and safety check fails, trigger rollback
                     settings = await safety_service.async_get_safety_settings()
 
-                    if settings.enable_automatic_rollbacks and not safety_check.is_healthy:
+                    if (
+                        settings.enable_automatic_rollbacks
+                        and not safety_check.is_healthy
+                    ):
+                        ...
                         # Find what metric triggered the rollback
                         trigger_reason = "Automatic rollback due to safety issues"
                         failing = next(
@@ -1626,13 +1793,27 @@ _shape_ of each in the codebase and how it plugs into the loop.
 **The primary result first**, because every block sits beside it. `GET /results/{id}` counts,
 per variant, the distinct users assigned and the **users who converted** (a user with ten
 purchase events is one conversion; `count_converting_users` in
-`backend/app/services/event_matching.py`), and analyses **every metric as a proportion** with
-**Fisher's exact test** on the 2×2 table of converting and non-converting users
-(`binomial_metric_result` in `backend/app/services/sufficient_stats_analysis.py`;
-`statistical_test_used: "fisher_exact"`). The confidence level (0.80 to 0.99; a request's
-`confidence_level` if it sends one, otherwise the experiment's stored value, 0.95 unless set
-otherwise) sets both the significance threshold and the interval width. Welch's t-test for
-means exists only in the optional warehouse module (below); it is not what `/results` runs.
+`backend/app/services/event_matching.py`). A **conversion** metric is a proportion, compared
+with **Fisher's exact test** on the 2×2 table of converting and non-converting users
+(`binomial_metric_result`, `statistical_test_used: "fisher_exact"`). A **revenue, count,
+duration or custom** metric is a **mean per assigned user**, zeros included, compared with
+**Welch's t-test** (`per_user_mean_metric_result`, `statistical_test_used: "welch_t_test"`).
+Both live in `backend/app/services/sufficient_stats_analysis.py`, and both give each treatment
+its difference, its relative lift and its incremental impact, each with an interval (Day 6).
+The confidence level (0.80 to 0.99; a request's `confidence_level` if it sends one, otherwise
+the experiment's stored value, 0.95 unless set otherwise) sets both the significance threshold
+and the interval width, and the metric's `lower_is_better` sets which direction wins.
+
+The module's name is the design: "Metric results from per-variant sufficient statistics", and
+its docstring adds, "it reads no database". A proportion follows from two numbers per arm (the
+units and the units that converted); a mean from a unit count and two sums (`mean_metric_result`
+takes sums of `y − k` and `(y − k)²`, centred on the grand mean `k` "so that a large offset
+(order values in the thousands, say) does not cancel the variance away", and
+`per_user_mean_metric_result` reduces each arm's per-user values to them). So `/results`, which
+computes the counts and values from `events`, and the warehouse module (below), which gets
+them back from your warehouse, run the same `binomial_metric_result` and the same
+`mean_metric_result`: one implementation, two data sources. (The difference and impact
+intervals are added by the `/results` wrappers; a warehouse mean run does not carry them.)
 
 **Sequential testing (beta).** The peeking problem: if you test at α = 0.05 every day, the
 chance of _ever_ seeing p < 0.05 under the null climbs far above 5%. The mixture SPRT produces a
@@ -1756,12 +1937,15 @@ other arms' adjusted effects, because they share θ. A comparison that cannot be
 with an `unavailable_reason` instead of numbers (`fewer_than_2_units`, `no_variation`,
 `no_residual_variation`, `not_a_proportion_metric`, `no_control_variant`, and so on).
 `variance_reduction_config.method` selects: `none` (θ exactly 0, the unadjusted effect),
-`cuped`, `cuped_plus` (computed as `cuped`; each row says what was computed), or `winsorization`
-(clipping, for mean metrics). The numbers are labelled `ga` in `analysis_status`; the route
-`GET /results/{id}/cuped` itself is still marked `x-stability: beta`, because its response may
-still change shape (mean metrics, #439). A covariate that is the same for everyone in every arm
-(nobody did the event, or everybody did) gives θ = 0 and an honest "no adjustment" rather than a
-manufactured saving.
+`cuped`, `cuped_plus` (computed as `cuped`; each row says what was computed), or
+`winsorization` — which is accepted and stored, and **clips nothing**: no results view applies
+it, a revenue metric's numbers are the same as with `none`, and the app's limitations page says
+so rather than letting the setting imply otherwise. The CUPED view computes conversion metrics
+only; a mean metric is listed with `unavailable_reason: "not_a_proportion_metric"`. The numbers
+are labelled `ga` in `analysis_status`; the route `GET /results/{id}/cuped` itself is still
+marked `x-stability: beta`, because its response may still change shape. A covariate that is the
+same for everyone in every arm (nobody did the event, or everybody did) gives θ = 0 and an
+honest "no adjustment" rather than a manufactured saving.
 
 **Bayesian.** Each arm's conversion rate gets a `Beta(α, β)` posterior — conjugate to the
 binomial, so the update is addition — and the questions "P(this arm is best)" and "expected
@@ -1870,25 +2054,33 @@ lifespan. Later, a DynamoDB count that had fallen behind replaced the complete P
 the `_at_least_as_complete` comparison is the fix. The PostgreSQL source is what makes bandits
 work in a core deployment, which has no counters module at all.
 
+A third bug was quieter: the bandit always treated a converting user as a success, so an
+experiment whose primary metric is an error or a churn event (`lower_is_better: true`) moved
+traffic *toward* the arm with more errors. The counts now pass through `_as_rewards` first,
+which, for a lower-is-better primary metric, counts the users who did **not** convert as the
+successes. The same flag decides the winner and the recommendation on `/results` (Day 6), so
+the two can no longer disagree about which way is good.
+
 > **Watch Out!** The bandit changes _who gets what_ while the experiment runs, which breaks
 > the fixed-allocation assumptions of the Day 6 statistics (and SRM will, correctly, warn —
 > the observed split is _supposed_ to drift from the configured one). A bandit experiment is
 > for _optimising_ during the run, not for a clean causal estimate; read its "recommendation"
 > with that in mind.
 
-**What is not there yet.** Two analyses you may meet in the API are deliberately not
-available, and say so rather than return made-up numbers:
+**What is not there yet.** Two things you may meet in the API are deliberately not available,
+and say so rather than return made-up numbers:
 
 - **Post-stratification.** `POST /results/{id}/post-stratification` answers **501** for every
   experiment: no per-user stratum data exists to stratify on. (`POST /results/{id}/fdr-correction`,
   Benjamini-Hochberg over a set of p-values, beside it, does work.)
-- **Means from your own warehouse.** The optional `warehouse` module (full profile only, every
-  route beta, under `/api/v1/warehouse/analysis`) runs an experiment's metrics in your Snowflake,
-  BigQuery or Athena account and analyses proportions and means from the per-variant counts and
-  sums it returns; that is where Welch's t lives. At the reference commit **no connector is
-  enabled**: the connector code ships, but creating a connection answers 422
-  `connector_disabled` until each connector has passed a check against a real warehouse account,
-  and no operator setting overrides that.
+- **Athena, in the warehouse module.** The optional `warehouse` module (full profile only, every
+  route beta, under `/api/v1/warehouse/analysis`) runs an experiment's metrics in your own
+  warehouse and analyses proportions and means from the per-variant counts and sums it returns,
+  with the same `sufficient_stats_analysis` functions `/results` uses. A connector is enabled
+  only once it has passed a check against a real warehouse account, recorded in
+  `ENABLED_CONNECTORS` in `modules/backend/app/warehouse/connectors.py`: **Snowflake and
+  BigQuery** are enabled; the Amazon Athena code ships, but creating an Athena connection answers
+  422 `connector_disabled`, and no operator setting overrides that.
 
 ### Build It
 
@@ -1924,8 +2116,9 @@ each variant's `alpha − 1` is its converting **users**, not its conversion eve
 
 ### Key takeaways
 
-- The primary result: converting users ÷ assigned users per variant, Fisher's exact test for
-  every metric, at the requested `confidence_level`.
+- The primary result: converting users ÷ assigned users per variant with Fisher's exact test
+  for a conversion metric; the mean per assigned user with Welch's t-test for a revenue, count,
+  duration or custom one; both from per-arm sums, at the requested `confidence_level`.
 - Four advanced methods, four services, each a block beside the primary result, each
   configured on the experiment row; a `beta` analysis (sequential) says why in
   `analysis_notice`.
@@ -1937,9 +2130,10 @@ each variant's `alpha − 1` is its converting **users**, not its conversion eve
 - Bayesian: Beta-Binomial posteriors, Monte Carlo PtBB and expected loss, seeded per
   `(experiment, day, n)`; `STOP_WINNER` needs P(best) ≥ 0.975 and a small expected loss.
 - Bandits: PostgreSQL converting users unless DynamoDB counters are at least as complete, then
-  `BanditState`, then priors; `/assign` routes new users by the weights.
-- Post-stratification answers 501; means and Welch's t are warehouse-module only, and no
-  warehouse connector is enabled yet.
+  `BanditState`, then priors; a lower-is-better primary metric flips the reward; `/assign`
+  routes new users by the weights.
+- Post-stratification answers 501; winsorization is stored and clips nothing; of the warehouse
+  connectors, Snowflake and BigQuery are enabled and Athena is not.
 
 ### Q&A
 
@@ -1951,8 +2145,9 @@ are assigned (a repeat-purchase metric); with a brand-new audience the covariate
 almost everyone, θ is 0, and it changes nothing.
 
 **Q. Does enabling sequential testing change the primary result?**
-No. The primary block is still the fixed-horizon Fisher test at the requested confidence level;
-the sequential block is additional, with its own `can_stop`. The dashboard shows both so the
+No. The primary block is still the fixed-horizon test (Fisher for a proportion, Welch for a
+mean) at the requested confidence level; the sequential block is additional, with its own
+`can_stop`. The dashboard shows both so the
 trade is visible.
 
 **Q. Why `tau_squared = 0.001` by default?**
@@ -1965,10 +2160,12 @@ small effects at the cost of slower stopping for large ones. It's in
 weights are deterministic functions of the counts (ε-greedy's exploration share is an even
 split, not a coin flip), so they record `NULL` seed provenance.
 
-**Q. My revenue metric shows a conversion rate, not a mean. Is that a bug?**
-No, it is the design at the reference commit: `/results` treats every metric as a proportion
-of users who converted. Analysing a mean needs per-user sums, which the platform computes only
-from a warehouse in the beta warehouse module, and no warehouse connector is enabled yet.
+**Q. My revenue metric's mean is tiny. Is that a bug?**
+Probably not: it is revenue per **assigned** user, and most assigned users buy nothing, so
+their 0 is in the mean. A 3% conversion rate and a €40 basket make a mean near €1.20. The
+conversion metric beside it gives the share who bought; the revenue metric answers whether the
+change made money across everyone it was shown to. If the number looks like *revenue per buyer*
+instead, check the metric's type: only `conversion` is analysed as a share of users.
 
 ---
 
@@ -1984,23 +2181,27 @@ states it in one table:
 | Purpose                                 | Method and path                                                                      | Response                                                                          |
 | --------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
 | Assign a user to an experiment (sticky) | `POST /api/v1/tracking/assign` `{experiment_key, user_id, context?}`                 | `{experiment_key, user_id, variant_id, variant_name, is_control, configuration, assigned, reason}`  |
-| Evaluate a flag                         | `GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…&context=<url-encoded JSON>` | `{key, enabled, config, reason}`                                                  |
+| Evaluate a flag                         | `GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…&context=<url-encoded JSON>` | `{key, enabled, value, value_type, config, reason}`                               |
 | All flags for a user                    | `GET /api/v1/feature-flags/user/{user_id}`                                           | `{flag_key: boolean, …}`                                                          |
-| Track one event                         | `POST /api/v1/tracking/track`                                                        | stored event                                                                      |
-| Track up to 100 events                  | `POST /api/v1/tracking/batch` `{events: [...]}`                                      | `{success_count, failure_count, errors}`                                          |
+| Track one event                         | `POST /api/v1/tracking/track` (`event_id?` among its fields)                         | stored event, with `duplicate` and `event_id`                                     |
+| Track up to 100 events                  | `POST /api/v1/tracking/batch` `{events: [...]}`                                      | `{success_count, failure_count, duplicate_count, errors}`                         |
 | A user's assignments                    | `GET /api/v1/tracking/assignments/{user_id}`                                         | list                                                                              |
 
 `assigned` and `reason` matter more than they look. A user who is not eligible — in the global
 holdout, excluded by a mutual-exclusion group, or not matched by the experiment's targeting —
 still gets HTTP 200 with the **control** variant, so the app renders the default experience, but
 with `assigned: false` and `reason` `holdout`, `mutual_exclusion` or `targeting`; no assignment
-row and no exposure are recorded, so the SDK should send no events for that experiment. The
+row and no exposure are recorded, so the SDK should send no events for that experiment. An
+experiment that is not ACTIVE answers every user the same way, with its status as the `reason`
+(`draft`, `paused`, `completed`, `archived`), so only an unknown key, or an experiment with no
+control variant, is still a 404. The
 Python SDK's `Assignment` carries both fields (and leaves them `None` against an older server
 that does not send them, rather than guessing `False`).
 
 And three rules: **the server decides** (with one opt-in, beta exception for flags, below),
-**cache per user + key** (never cache failures), and **key-less events fan out** to every
-cached assignment and evaluated flag for that user.
+**cache per user + key** (never cache failures), and **key-less events fan out** to the
+experiments and flags the SDK answered for that user (in the JavaScript, Python and React SDKs,
+every one answered in the last 24 hours, cached or not; in the others, the cached ones).
 
 #### Why "the server decides" had to be re-established
 
@@ -2017,17 +2218,30 @@ The reference client is the Python one. Its request core is small enough to read
 
 ```python
 # 📁 sdk/python/controlvar/client.py
-    def _request(self, method: str, path: str, *, body=None, query=None) -> Any:
-        """Perform one API call and return the decoded JSON body (``None`` if empty).
+    def _exchange(self, method: str, path: str, *, body=None, query=None) -> Response:
+        """Send one API call and return its response, whatever the status.
 
         Retries exactly once on 429, sleeping for ``Retry-After`` (capped at
         :data:`MAX_RETRY_AFTER_SECONDS`). Raises :class:`ExperimentationError`
-        for any non-2xx response, network failure or undecodable body.
+        for a network failure. Sends nothing, and raises
+        :class:`ExperimentationError` with ``status`` ``None``, for a body
+        holding NaN or an infinite number, which JSON has no value for (and for
+        a circular reference: ``json.dumps`` refuses both with ``ValueError``).
+        ...
         """
         url = self.api_url + path
         if query:
             url += "?" + urlencode(query, quote_via=quote)
-        data = None if body is None else json.dumps(body, default=_json_default).encode("utf-8")
+        data = None
+        if body is not None:
+            ...
+            try:
+                encoded = json.dumps(body, default=_json_default, allow_nan=False)
+            except ValueError as exc:
+                raise ExperimentationError(
+                    f"{method} {path} was not sent: its body holds a value JSON cannot represent ({exc})"
+                ) from exc
+            data = encoded.encode("utf-8")
 
         response = self._send(method, url, data)
         if response.status == 429:
@@ -2035,9 +2249,19 @@ The reference client is the Python one. Its request core is small enough to read
             logger.debug("429 from %s %s; retrying once after %.1fs", method, path, wait)
             self._sleep(wait)
             response = self._send(method, url, data)
+        return response
 
+    def _request(self, method: str, path: str, *, body=None, query=None) -> Any:
+        """Perform one API call and return the decoded JSON body (``None`` if empty).
+        ...
+        """
+        response = self._exchange(method, path, body=body, query=query)
         if response.status < 200 or response.status >= 300:
-            raise ExperimentationError(f"{method} {path} failed with HTTP {response.status}", status=response.status, body=response.text())
+            raise ExperimentationError(
+                f"{method} {path} failed with HTTP {response.status}",
+                status=response.status,
+                body=response.text(),
+            )
         ...
 
     def get_assignment(self, experiment_key: str, user_id: str, user_attributes=None) -> Assignment:
@@ -2048,9 +2272,19 @@ The reference client is the Python one. Its request core is small enough to read
         body: Dict[str, Any] = {"experiment_key": experiment_key, "user_id": user_id}
         if user_attributes is not None:
             body["context"] = dict(user_attributes)
-        data = self._request("POST", "/api/v1/tracking/assign", body=body)
+        try:
+            data = self._request("POST", "/api/v1/tracking/assign", body=body)
+        except ExperimentationError as exc:
+            # A 404: a key-less track() must no longer reach this experiment.
+            if exc.status == 404:
+                self._attributed.forget_experiment(user_id, experiment_key)
+            raise
         ...
-        self._assignments.set(user_id, experiment_key, assignment)
+        new = self._assignments.set_new(user_id, experiment_key, assignment)
+        self._attributed.record_experiment(user_id, assignment.experiment_key, assignment.reason)
+        ...
+        if new and assignment.assigned is True:
+            self._exposed(user_id, assignment)
         return assignment
 
     def get_variant(self, experiment_key: str, user_id: str, user_attributes=None) -> str:
@@ -2066,6 +2300,20 @@ Two API surfaces on purpose: `get_assignment` _raises_ (for callers who need to 
 `get_variant` _swallows_ and returns `"control"` (for callers rendering a page). `track` never
 raises. A `Transport` interface (`UrllibTransport` by default, `FakeTransport` in tests)
 keeps the client dependency-free and unit-testable without a server.
+
+Three newer lines in that excerpt each carry a rule. `allow_nan=False`: Python's `json` writes
+`NaN` and `Infinity` by default, which is not JSON, and the server now refuses such a value with
+422; the client refuses to send it at all. `_attributed` is the record behind the key-less
+fan-out: the experiments and flags this client answered for the user in the last 24 hours,
+whether or not the answer is still cached (a fan-out that read only the cache silently stopped
+reaching an experiment when its cache entry expired); an experiment the server says no longer
+exists is forgotten, and one whose latest answer was a status (`draft`, `paused`…) gets no
+fan-out entry. And `_exposed` calls the `on_exposure` hook, **once**, only when the server
+answered `assigned: true` for a fresh request — a cached answer calls nothing — so an app can
+log exposures to its own analytics without double-counting. Seven SDKs have such a hook
+(JavaScript, Python, React, React Native, Go, Java, .NET), and the live contract makes each of
+them build a new client with a hook, assign the contract experiment twice, and report exactly
+one call (`EXPOSURE_SDKS` in `run_live_contract.py`).
 
 The cross-SDK hash, pinned by `tests/sdk-contract/golden-vectors.json`, is the
 first-four-bytes little-endian function the server assigns experiment variants with
@@ -2115,23 +2363,41 @@ The React SDK wraps the same client in a provider and hooks:
 // 📁 sdk/react/src/hooks/useExperiment.ts
 export function useExperiment(experimentKey: string): ExperimentAssignment {
   const { client, user } = useExperimentation();
-  const [state, setState] = useState<ExperimentAssignment>(() =>
-    defaultAssignment(experimentKey, { loading: true })
+  const bootstrap = useBootstrap();
+  const [seed] = useState<Seed<ExperimentAssignment> | null>(() => {
+    const value = bootstrap.experiments.get(experimentKey);
+    return value ? { key: experimentKey, user, value } : null;
+  });
+  const [state, setState] = useState<ExperimentAssignment>(
+    () => seed?.value ?? defaultAssignment(experimentKey, { loading: true })
   );
+  // The bootstrapped assignment while the hook still shows it; cleared by its
+  // own answer and by a change of key or user.
+  const seeded = useRef(seed);
 
   useEffect(() => {
     let cancelled = false;
-    setState(defaultAssignment(experimentKey, { loading: true }));
+    const kept =
+      seeded.current && seeded.current.key === experimentKey && seeded.current.user === user
+        ? seeded.current.value
+        : null;
+    if (!kept) {
+      seeded.current = null;
+      setState(defaultAssignment(experimentKey, { loading: true }));
+    }
 
     client
       .assignExperiment(user, experimentKey)
       .then(assignment => {
-        if (!cancelled) setState(assignment);
+        if (!cancelled) {
+          seeded.current = null;
+          setState(assignment);
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           const error = err instanceof Error ? err : new Error(String(err));
-          setState(defaultAssignment(experimentKey, { error }));
+          setState(kept ? { ...kept, error } : defaultAssignment(experimentKey, { error }));
         }
       });
 
@@ -2145,7 +2411,12 @@ export function useExperiment(experimentKey: string): ExperimentAssignment {
 ```
 
 Control defaults while loading, cancellation on unmount, re-assignment when the user or key
-changes (safe because the server is sticky). `useFeatureFlag`, `useMultipleFlags`,
+changes (safe because the server is sticky). The `bootstrap` lines are newer, and solve the
+flicker of a server-rendered page: the server asks for the user's answers once
+(`ServerClient.bootstrap()`), the page is rendered with them, and the provider hands them to
+the hooks, which start from that answer with `loading: false` instead of the control. The hook
+still asks the server, as always; if that request fails it keeps the bootstrapped answer, with
+`error` set, rather than snapping back to the control. `useFeatureFlag`, `useMultipleFlags`,
 `useTrackEvent`, `withExperimentation` and a `ServerClient` for SSR complete the surface;
 `ExperimentationProvider` memoises the client on config primitives so an inline config object
 doesn't recreate it every render.
@@ -2194,11 +2465,22 @@ Day 15 function), with no request per evaluation. Four rules keep it honest:
 - **When unsure, ask.** A local answer must be exactly what `GET /feature-flags/evaluate/{key}`
   would say for that ruleset version. When the SDK cannot be sure — an operator outside the
   local list, the legacy rule shape, a number or string outside the local domain — it makes the
-  same request it makes in server mode, and the result says `source: server`.
+  same request it makes in server mode, and the result says `source: server`. The same holds
+  once the SDK has **stopped** evaluating locally — a 401, 403 or 404 or an unknown format
+  discarded the ruleset, it is older than `max_stale_seconds`, or the flag became remote: it
+  asks the server. An earlier version first read its evaluation cache, which held the local
+  answers, so for up to the cache lifetime (300 s by default) it kept answering locally after it
+  had stopped; the tests that should have caught it cleared the cache before asserting.
 - **The promise is tested, not asserted.** `tests/sdk-contract/ruleset-vectors.json` is
-  generated by running the server's own evaluator (2,191 cases); each SDK must answer the 1,294
-  marked `must_local` locally with exactly the server's answer and send every other case to the
-  server.
+  generated by running the server's own evaluator (2,242 cases over 161 flags); each SDK must
+  answer the 1,333 marked `must_local` locally with exactly the server's answer and send every
+  other case to the server. The ruleset carries each flag's value type and two values too, so a
+  string, number or JSON flag is answered locally like a boolean one. And because a *published*
+  SDK release keeps running long after the server changes, a second gate,
+  `test_published_ruleset.py`, downloads every published release that evaluates locally (pinned
+  by URL and digest in `published-sdks.json`) and feeds it the ruleset the server sends today: a
+  release that would silently drop the new document, and so never see a later kill switch,
+  fails it.
 - **Safety keeps its denominator.** The SDK reports how many evaluations it made, per flag, to
   `POST /api/v1/tracking/evaluations` (beta, same scoped key), and those counts join the
   `raw_metrics` sum that Day 18 divides errors by.
@@ -2224,7 +2506,7 @@ Run the offline vectors and one live smoke:
 # offline: each SDK's own exported hash against the golden vectors
 python tests/sdk-contract/hash_contract.py --list
 python tests/sdk-contract/hash_contract.py python js edge react-native go   # js/edge: build them first
-python -m pytest tests/sdk-contract -q -o addopts=""
+python -m pytest tests/sdk-contract -q -o addopts=""   # needs the network and node: it downloads the published SDKs
 
 # live: start the API (make db && make dev), seed it, then run the Python and JS SDKs strictly
 python backend/scripts/seed_sdk_contract.py
@@ -2255,8 +2537,12 @@ fan-out list to what `sdk/python/controlvar/client.py::track` does.
   status table is honest about which have run.
 - No stack deploys the `backend/lambda/` handlers, and the assignment Lambda is gone; the
   FastAPI app is the one server-side implementation.
-- The SDKs are versioned on their own and called beta (0.1.x); the JavaScript, Python and Go
-  SDKs install from a registry, the rest from a clone of the repository.
+- The SDKs are versioned on their own, all below 1.0 and called beta (the JavaScript and Python
+  SDKs are at 0.3.0, most others at 0.1.0); at the reference commit the JavaScript and Python
+  SDKs install from npm and PyPI and the Go module with `go get`, and the docs of every other
+  SDK say "Not yet published" and build it from a clone.
+- Typed flag values reach the SDKs too: the JavaScript and Python SDKs read them with typed
+  getters, locally or from the server, and return the caller's default on a type mismatch.
 
 ### Q&A
 
@@ -2267,12 +2553,16 @@ Sixteen small hand-written ports of one reference design, checked by one harness
 judged cheaper to maintain than sixteen generated ones plus wrappers.
 
 **Q. Can I `pip install` or `npm install` them?**
-Three of them, yes: `npm install @controlvar/js-sdk`, `pip install controlvar` and
-`go get github.com/controlvar/controlvar/sdk/go`, at 0.1.x and called beta, like the OpenFeature
-providers that wrap them. (The Python package is `controlvar`; it was `experimently` before the
-rename, and the SDK README says to uninstall the old name first.) Every other SDK installs from a
-clone of the repository, and `docs/sdk-guide.md` says how. To work on one, `pip install -e
-./sdk/python`, or build `sdk/js` with `npm ci && npm run build`.
+At the reference commit, three of them: `npm install @controlvar/js-sdk@0.3.0`,
+`pip install controlvar==0.3.0` and `go get github.com/controlvar/controlvar/sdk/go`, all called
+beta. (The Python package is `controlvar`; it was `experimently` before the rename, and the SDK
+README says to uninstall the old name first.) Release tags of the form
+`sdk/<name>/v<version>` exist for more of them (the React, OpenFeature, Java and .NET SDKs among
+them, at 0.1.0), and the release workflow can push to npm, Maven Central and NuGet, but each of
+those SDKs' pages
+in the app's docs still says "Not yet published" and builds it from a clone; read the page for
+the version you run. To work on one, `pip install -e ./sdk/python`, or build `sdk/js` with
+`npm ci && npm run build`.
 
 **Q. What does the SDK cache, and for how long?**
 Successful assignments and flag evaluations, keyed by `(user_id, key)`, for
@@ -2281,7 +2571,9 @@ and call `clear_cache()`.
 
 **Q. Can I use OpenFeature?**
 Yes: `sdk/openfeature` (JS) and `sdk/openfeature-python` are providers over the same client,
-and they evaluate through the ordinary `GET /api/v1/feature-flags/evaluate/{key}`. There are no
+and they evaluate through the ordinary `GET /api/v1/feature-flags/evaluate/{key}`, sending the
+evaluation context's attributes and resolving string, number and object values from the flag's
+`value`. There are no
 OpenFeature-specific server routes any more: the evaluate and bulk-evaluate routes were removed
 in 0.11.0, and `GET /api/v1/openfeature/flags` and `GET /api/v1/edge/bootstrap` were removed in
 the release after 0.17.0 (they answer 404; the edge SDK, like the others, calls the evaluate and
@@ -2310,9 +2602,13 @@ this week.
   1  Internal + 5%      show the flag at 5% with the ``employee equals true`` rule
   2  25%                advance the rollout schedule to stage 2 → flag at 25%
   3  Incident           run traffic.py --incident android12 for 90 s, then the safety check;
-                        while the check is still healthy, run it again (at most 5 rounds)
-  4  Rollback           wait for the safety scheduler to roll back to 5% (or roll back by hand
-                        when automatic rollbacks are off); the rollback pauses the schedule
+                        while the check is still healthy, run it again (at most 5 rounds); with
+                        automatic rollbacks on, the incident goes on until the flag is rolled
+                        back (still at most 5 rounds in all)
+  4  Rollback           wait for the safety monitor to roll back to 5%, printing the error rate
+                        and each of its passes; roll back by hand only after two of its passes ran
+                        without a rollback, or when none runs for 6 minutes (and at once when
+                        automatic rollbacks are off); the rollback pauses the schedule
   5  Fix shipped        add ``app_version semver_gte 3.2.1 → 100%`` next to the employee rule
   6  50%                resume the paused schedule and advance to stage 3 (after the
                         15-minute error window has cleared)
@@ -2337,10 +2633,13 @@ normalises the rule (Day 16), `expand_context` makes `employee` answer `user.emp
 `md5(device:streampulse_player_v2) % 100 < 5`, `reason: rollout`. Every evaluation writes a
 `raw_metrics` row (Day 15).
 
-**Step 2 — 25%.** The story advances stage 2 via `POST /rollout-schedules/stages/{id}/advance`
-(or the rollout scheduler would, when `start_date` passes — `_as_utc` makes that comparison
-safe, Day 17). `_activate_stage` sets `rollout_percentage = 25`. Buckets 5–24 turn on;
-buckets 0–4 keep it (monotone rollout).
+**Step 2 — 25%.** The seed's stages are time-based, and only a manual stage can be advanced by
+hand (advancing a time-based one answers 400, Day 15), so the story first switches the stage to
+a manual trigger — a trigger can still change on a stage that has started — and says so, then
+advances it with `POST /rollout-schedules/stages/{id}/advance`: completing stage 1 starts stage
+2 at once. (In production the rollout scheduler would start it when its `start_date` passed —
+`_as_utc` makes that comparison safe, Day 17.) `RolloutService.manually_advance_stage` sets the
+flag's `rollout_percentage = 25`. Buckets 5–24 turn on; buckets 0–4 keep it (monotone rollout).
 
 **Step 3 — Incident.** `traffic.py --incident android12` makes Android-12 devices in the
 rollout report crashes: `POST /tracking/errors/batch` with the **StreamPulse server key**

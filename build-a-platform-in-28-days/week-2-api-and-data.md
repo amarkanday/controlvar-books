@@ -876,26 +876,29 @@ AI_INTERPRET_PATH_PREFIX = "/api/v1/ai/interpret/"
 AI_INTERPRET_RATE_LIMIT: Tuple[int, int] = (10, 60)  # 10 req/min, every id together
 
 
-def resolve_rate_limit(
+def resolve_rate_limit_bucket(
     path: str, sdk_limit_per_minute: int = DEFAULT_SDK_RATE_LIMIT_PER_MINUTE
-) -> Tuple[int, int]:
+) -> Tuple[str, Tuple[int, int]]:
     """
-    Return ``(max_requests, window_seconds)`` for a request path.
+    Return ``(bucket, (max_requests, window_seconds))`` for a request path.
 
     Exact entries in ``RATE_LIMIT_CONFIG`` win, then the export prefix, then
     the AI interpretation prefix, then SDK path prefixes, then
-    ``DEFAULT_RATE_LIMIT``.
+    ``DEFAULT_RATE_LIMIT``. ``bucket`` names the rule that matched: the
+    ``RATE_LIMIT_CONFIG`` key, or ``EXPORT_BUCKET``, ``AI_INTERPRET_BUCKET``,
+    ``SDK_BUCKET`` or ``DEFAULT_BUCKET``. The rate-limit metrics are labelled
+    with it, so it comes from this one function and never from the path.
     """
     exact = RATE_LIMIT_CONFIG.get(path)
     if exact is not None:
-        return exact
+        return path, exact
     if path.startswith(EXPORT_PATH_PREFIX):
-        return EXPORT_RATE_LIMIT
+        return EXPORT_BUCKET, EXPORT_RATE_LIMIT
     if path.startswith(AI_INTERPRET_PATH_PREFIX):
-        return AI_INTERPRET_RATE_LIMIT
+        return AI_INTERPRET_BUCKET, AI_INTERPRET_RATE_LIMIT
     if any(path.startswith(prefix) for prefix in SDK_PATH_PREFIXES):
-        return (int(sdk_limit_per_minute), 60)
-    return DEFAULT_RATE_LIMIT
+        return SDK_BUCKET, (int(sdk_limit_per_minute), 60)
+    return DEFAULT_BUCKET, DEFAULT_RATE_LIMIT
 ```
 
 The SDK tier exists because of ShopLab: a single server-side SDK, or an office behind one NAT,
@@ -913,15 +916,35 @@ minute. A row for a path that is a prefix of other paths would shadow them; that
 route is an exact entry, and why the file's comment notes that a trailing slash is answered by
 FastAPI's 307 redirect to the exact path. `SDK_RATE_LIMIT_PER_MINUTE` in
 `Settings` feeds `sdk_limit_per_minute` — a scalar in `Settings`, a table in the module, and a
-pure function joining them that the tests can call without a server.
+pure function joining them that the tests can call without a server. (`resolve_rate_limit`,
+which returns just the limit, is now the limit half of this function.)
+
+The `bucket` it returns is the other half of a lesson. The rate-limit metrics used to be
+labelled with the path the client sent, so every flag key and every experiment id became a new
+label value: a client could grow the metric's cardinality without bound just by asking for
+paths. Now the label is the *rule* that matched, a closed set. Keep the two ideas apart, though:
+the label is the rule, but the **counter** a request is charged to is still per path.
+`rate_limit_key` is `client_ip:path` for every route except the two shared prefixes (the export
+routes and the AI interpretation routes), so the SDK tier's 6,000 a minute is per address *and
+per path*: each flag's `/feature-flags/evaluate/<key>` has a budget of its own.
 
 Which _client_ a request is charged to matters as much as the limit. The limiter uses
-`request.client.host` and nothing else. uvicorn runs with `--proxy-headers` and
-`--forwarded-allow-ips` set to the private address ranges by default (`FORWARDED_ALLOW_IPS`
-overrides it), so it has already resolved the real client from `X-Forwarded-For` before any
-middleware runs. An earlier version read the header itself and took the _leftmost_ entry —
-the one the client wrote — so a client that sent a fresh address on every request got a fresh
-bucket every time, including against the login limit.
+`request.client.host` and nothing else, because uvicorn has already resolved the real client
+from `X-Forwarded-For` before any middleware runs — but only for proxies it trusts. The
+entrypoint (Day 25) starts uvicorn with `--proxy-headers` and `--forwarded-allow-ips` set to a
+list that `backend/app/core/proxy_trust.py` builds when the container starts: loopback, plus
+every network the container is directly attached to (read from `/proc/net/route` and
+`/proc/net/if_inet6`; in Compose that is the project network, so the dashboard container and a
+TLS proxy on the same host are on it), plus every entry of `FORWARDED_ALLOW_IPS`. The setting
+**adds** to that list and cannot take anything away. The default used to be all the private
+address ranges, which let anything on a private network vouch for any client address; now a
+proxy anywhere else (a load balancer, an ingress controller) must be named, and the chart and
+the CDK stack set the variable. An entry uvicorn could not use (`10.0.0.1/8`, with host bits
+set, or a typo) is refused at start-up rather than silently never matching, `*` is refused
+everywhere, and `0.0.0.0/0` in staging and production. An earlier version of the limiter read
+the header itself and took the _leftmost_ entry — the one the client wrote — so a client that
+sent a fresh address on every request got a fresh bucket every time, including against the
+login limit.
 
 Where the counters live matters too. `RedisRateLimiter` counts in Redis (`INCR` + `EXPIRE`), and
 when Redis fails it does not stop serving: it falls back to an in-memory sliding window **per
@@ -1307,25 +1330,37 @@ def get_api_key(
 (`eptk_` + 32 hex chars from `secrets.token_hex(16)`), which returns `(model, plaintext)` —
 and `POST /api-keys` is the only place the plaintext is ever shown. The compose demo bakes
 fixed keys into the demo images (`eptk_demo_shoplab_…`) so the storefront works without a
-manual step; in every other case the key comes from the dashboard's Admin → API keys page.
+manual step; in every other case the key comes from the dashboard, where every signed-in user
+has a **Your API keys** page for their own keys and administrators also have Admin → API Keys.
 
-#### Key scopes: one is enforced
+#### Key scopes: two are enforced
 
 `api_keys.scopes` is a comma-separated string, and every reader goes through one parser,
 `backend/app/core/api_key_scopes.py`: split on commas, strip, drop empties, then **exact,
 case-sensitive** membership (`"read, sdk:ruleset "` grants `sdk:ruleset`; `"SDK:RULESET"` and
-`"sdk:ruleset-ro"` do not). Exactly one scope name is enforced today, **`sdk:ruleset`**: it
-admits a key to the server-side surface: `GET /api/v1/sdk/ruleset`,
-`POST /api/v1/tracking/evaluations` and `POST /api/v1/tracking/assign/batch`. Every other scope name is a label.
+`"sdk:ruleset-ro"` do not). Two scope names are enforced today, and every other scope name is a
+label:
+
+- **`sdk:ruleset`** admits a key to the server-side SDK surface: `GET /api/v1/sdk/ruleset`,
+  `POST /api/v1/tracking/evaluations` and `POST /api/v1/tracking/assign/batch`.
+- **`mcp:read`** lets a key *read* where a sign-in is otherwise required, on exactly four
+  operations: the flag list, the experiment list, one experiment, and its results (below).
 
 ```python
 # 📁 backend/app/api/sdk_scope.py
-def require_sdk_ruleset_key(
+async def require_sdk_ruleset_key(
     db: Session = Depends(deps.get_db),
     api_key_header: str = Depends(deps.API_KEY_HEADER),
     _owner: User = Depends(deps.get_api_key),
 ) -> APIKey:
-    """Return the presented ``APIKey`` row if it carries ``sdk:ruleset``."""
+    """Return the presented ``APIKey`` row if it carries ``sdk:ruleset``.
+
+    Reads on the request's session; does no blocking work.
+    """
+    ...
+    api_key = (
+        db.query(APIKey).filter(APIKey.key == hash_api_key(api_key_header)).first()
+    )
     ...
     refusal = scope_refusal(db, api_key)
     if refusal is not None:
@@ -1348,23 +1383,24 @@ def scope_refusal(db: Session, api_key: APIKey) -> Optional[str]:
     if not has_scope(api_key.scopes, SDK_RULESET_SCOPE):
         return MISSING_SCOPE_DETAIL
     owner = db.query(User).filter(User.id == api_key.user_id).first()
-    if (
-        owner is None
-        or not owner.is_active
-        or not check_permission(owner, ResourceType.FEATURE_FLAG, Action.UPDATE)
-    ):
+    if owner is None or not owner.is_active or not may_use_server_key(owner):
         return OWNER_ROLE_DETAIL
     return None
 ```
 
-It layers on `get_api_key` (401 for a missing or unknown key), then decides on the _presented_
-key itself — another key of the same user carrying the scope grants nothing — and answers 403
-without the scope. The ruleset is every flag's full targeting, so the scope works only while the
-key's owner can change flags (ADMIN, DEVELOPER or a superuser), checked on every request so it
-follows role changes; and `POST /api-keys` refuses to create an `sdk:ruleset` key for anyone
-else. The same rule fits batch assignment, because ADMIN, DEVELOPER and superusers are exactly
-who can change experiments too (a test pins the two role lists equal), and the 403 texts are
-the same on every route.
+It layers on `get_api_key` (401 for a missing or unknown key), then re-hashes the header and
+decides on the _presented_ key itself — another key of the same user carrying the scope grants
+nothing — and answers 403 without the scope. The ruleset is every flag's full targeting, so the
+scope works only while the key's owner can change flags, checked on every request so it follows
+role changes. That rule is one function, `may_use_server_key`, which is just
+`check_permission(user, FEATURE_FLAG, UPDATE)`: ADMIN, DEVELOPER or a superuser, and in the full
+profile anyone whose custom role or direct grant gives `feature_flag (update)` (Day 11).
+`POST /api-keys` uses the same function to refuse an `sdk:ruleset` key to anyone else. Batch
+assignment asks one question more: `require_batch_assign_key` also needs the owner to be able to
+change **experiments**, and refuses with a third 403 text before anything is written. (Before
+custom roles took effect, the built-in roles that could change flags and experiments were the
+same three, so one check sufficed; a grant of one without the other is what made the second
+check necessary.)
 
 The extracted `scope_refusal` has a second caller worth knowing about:
 `presented_key_is_server_key` applies the same rules but refuses nothing, and the error-report
@@ -1374,6 +1410,41 @@ flags) stores `source = "server"` and the report counts toward the flag's error 
 toward automatic rollback (Day 18); any other key, such as the one in a browser or mobile app,
 stores `"client"`, and safety monitoring does not count it. An app whose errors should count
 sends them to its own server, which forwards them with a server-side key.
+
+#### `mcp:read`: a key that reads as its owner
+
+The Controlvar MCP server (`sdk/mcp`, a separate program an AI assistant such as Claude Code
+starts on your computer) answers questions like "which flags are on?" by calling the API with
+your own key. Those reads live on routes that otherwise take a sign-in, so the four operations
+get a dependency of their own:
+
+```python
+# 📁 backend/app/api/read_scope.py
+"""
+The ``mcp:read`` scope: four read operations also accept a scoped API key.
+
+:func:`get_current_reader` is the user dependency of exactly these route
+registrations (``backend/tests/smoke/test_mcp_read_routes.py`` pins the set):
+
+* ``GET /api/v1/feature-flags/`` (and its twin without the slash, which is not
+  in the OpenAPI document);
+* ``GET /api/v1/experiments/``;
+* ``GET /api/v1/experiments/{experiment_id}``;
+* ``GET /api/v1/experiments/{experiment_id}/results``.
+
+Every other route is unchanged; the routes that create, change or delete flags or
+experiments, and those that manage users, still take a sign-in only.
+...
+"""
+```
+
+The contract in that docstring is ordered with care. A request with a bearer token is judged on
+the token alone, exactly as before, even when the token is invalid and the key is valid; only a
+request with no token (and no active dev bypass) reads the key. The key is validated as
+`get_api_key` validates it, the scope is checked on the presented key only, and then the
+**owner is returned**: the route's own role checks run unchanged, so the key sees exactly what
+its owner's role can see. The scope carries no role rule of its own, and a smoke test pins the
+four registrations, so a fifth cannot quietly start accepting keys.
 
 > **Watch Out!** `core/security.py` also has a `decode_token()` that returns _constant stub
 > claims_ and raises `RuntimeError` unless `TESTING` is set. It exists only so legacy tests can
@@ -1412,6 +1483,12 @@ SCOPED=$(curl -s -X POST $API/api-keys -H "Authorization: Bearer $TOKEN" -H 'Con
   -d '{"name":"server","scopes":["sdk:ruleset"]}' | python -c 'import sys,json; print(json.load(sys.stdin)["key"])')
 curl -s -o /dev/null -w "%{http_code}\n" $API/sdk/ruleset -H "X-API-Key: $PLAIN"    # 403
 curl -s -o /dev/null -w "%{http_code}\n" $API/sdk/ruleset -H "X-API-Key: $SCOPED"   # 200
+
+# and the read scope, on a route that otherwise needs a sign-in
+READER=$(curl -s -X POST $API/api-keys -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"reader","scopes":["mcp:read"]}' | python -c 'import sys,json; print(json.load(sys.stdin)["key"])')
+curl -s -o /dev/null -w "%{http_code}\n" $API/experiments/ -H "X-API-Key: $PLAIN"    # 403
+curl -s -o /dev/null -w "%{http_code}\n" $API/experiments/ -H "X-API-Key: $READER"   # 200
 ```
 
 Then find the SHA-256 of your new key in the database — and note that the plaintext is
@@ -1434,10 +1511,12 @@ docker compose exec postgres psql -U postgres -d experimentation -c "select name
   where it doesn't.
 - Login lockout is 10 failures / 15 min → 423 + `Retry-After`; the message never reveals
   which of address/password/status was wrong.
-- One scope is enforced, `sdk:ruleset`, on the server-side SDK routes (the ruleset, the local
-  evaluation counts, batch assignment), and only while the key's owner can change flags; it also
-  decides whether an error report counts toward rollback. The dev bypass exists only when `DEV_AUTH_BYPASS=true` _and_
-  `ENVIRONMENT ∈ {development, test}`; staging and production refuse to start with it.
+- Two scopes are enforced. `sdk:ruleset` gates the server-side SDK routes (the ruleset, the
+  local evaluation counts, batch assignment), only while the key's owner can change flags, and
+  decides whether an error report counts toward rollback. `mcp:read` lets a key read the flag
+  list, the experiment list, one experiment and its results as its owner. The dev bypass exists
+  only when `DEV_AUTH_BYPASS=true` _and_ `ENVIRONMENT ∈ {development, test}`; staging and
+  production refuse to start with it.
 
 ### Q&A
 
@@ -1447,10 +1526,12 @@ FastAPI's security machinery. `get_current_user` needs to see "no token" to deci
 dev bypass (return `dev-admin`) and a 401.
 
 **Q. Can an API key call `/experiments/`?**
-No. Those endpoints depend on `get_current_active_user` (bearer). SDK routes depend on
-`get_api_key`. A key reaches the tracking, evaluate and error-reporting paths because of _which
-dependency the endpoint declares_, not because of a scope string; the one scope that is
-enforced, `sdk:ruleset`, is an extra gate on top of that for the server-side SDK routes.
+To read, with the `mcp:read` scope: `GET /experiments/`, `GET /experiments/{id}` and its
+`/results` declare `get_current_reader`, which accepts a bearer token or such a key. To change
+anything, no: every other experiment route depends on `get_current_active_user` (bearer). SDK
+routes depend on `get_api_key`. A key reaches the tracking, evaluate and error-reporting paths
+because of _which dependency the endpoint declares_, not because of a scope string; the two
+scopes that are enforced are extra gates on top of that.
 
 **Q. How do I log in on the dashboard with Cognito locally?**
 You mostly don't; the local provider is the development default. The Cognito path is tested
@@ -1491,6 +1572,8 @@ ownership.** For feature flags and for experiments alike:
 - **ADMIN and DEVELOPER** read, create, change and delete _any_ flag and _any_ experiment —
   including scheduling, starting, pausing, completing, archiving and deleting one.
 - **ANALYST and VIEWER** read any of them and change none — **not even one they created.**
+  (In a full build a custom role or a direct grant can give one of them, say, `feature_flag
+  (update)`; it then covers *any* flag, never just their own.)
 - The creator is recorded as `owner_id` and shown in the dashboard. It is not an access rule.
 
 The old rule was "may update by role, _or_ owns it". The second half gave write access to
@@ -1500,9 +1583,23 @@ person could do. A deployment is single tenant, and it wants the team's roles to
 (Isolating teams from each other is the `workspaces` module's job, keyed on membership — not
 on who happened to create a row.)
 
-The table is **code, not data**. Custom roles and direct grants exist in the optional `rbac`
-module (under `/api/v1/rbac`, in a full build), but the base matrix is a Python dict you can
-read in ten seconds and that can't be misconfigured by a migration.
+The table is **code, not data**: a Python dict you can read in ten seconds and that can't be
+misconfigured by a migration. In a full build the optional `rbac` module (under `/api/v1/rbac`)
+adds two kinds of data on top of it, **custom roles** and **direct grants** (a grant can carry
+an expiry), and both take effect on the user's next request. They are deliberately narrow:
+
+- **They only add.** There is no deny; to restrict someone, give them a lower built-in role.
+- **They hold eleven permissions and nothing else**: create, read, update, delete and list on
+  experiments and on feature flags, and read on the audit log. A role or grant that would store
+  any other pair is refused with a 422 of type `not_grantable`, and nothing is written.
+  Administration — users, roles, other people's keys, holdouts, safety settings — stays with
+  the built-in role or the superuser bit.
+
+The set is `GRANTABLE` in `core/permissions.py`, and its comment carries the warning that
+matters: widening it "activates, at once, every pair already stored in an active custom role or
+direct grant that holds it". Assignments and grants made before custom roles took effect grant
+nothing (the module's migration `modules_0004_rbac_activation` gave them no activation time);
+they are made again to count.
 
 #### Why "READ before UPDATE"
 
@@ -1561,14 +1658,30 @@ def check_permission(user: Any, resource: ResourceType, action: Action) -> bool:
         # Default to Viewer role if there's any issue
         role = UserRole.VIEWER
 
-    # Check role permissions
-    return has_permission(role, resource, action)
+    # Check role permissions. A user whose role is None gets nothing here.
+    if has_permission(role, resource, action):
+        return True
+
+    # Then what the user's custom roles and direct grants hold (full profile;
+    # always empty in the core profile). Asked only when the role says no, so
+    # a check the role allows reads nothing more.
+    return _pair(resource, action) in granted_permissions(user)
 ```
 
 The interesting cell is `ANALYST × REPORT`: analysts can't touch experiments but have full
 control of reports — the role is "reads everything, writes analyses". The `VIEWER` default in
 `check_permission` is deliberate: an object with no `role` attribute (a mock, a malformed
 row) gets the least privilege, not an exception.
+
+The last line is the whole custom-role mechanism, and it is shaped by the two profiles.
+`granted_permissions` asks a **provider** that the `rbac` module registers; in a core build
+nothing registers one and the answer is always empty, so the core never imports the module.
+It answers only for a user that is a row bound to a SQLAlchemy session (a `SimpleNamespace` or a
+mock gets nothing, which is why the shell exercise below still prints the bare matrix), asks the
+provider once per user per session, keeps the answer in `session.info`, and filters it to
+`GRANTABLE`. A request has its own session, so a grant made by one request is seen by the next.
+And a provider that raises is **not** caught: the check that would have been refused becomes an
+error rather than a silent yes.
 
 #### Feature flags: one decision
 
@@ -1601,16 +1714,22 @@ def can_act_on_feature_flag(
     """Whether *user* may take *action* on a feature flag owned by *owner_id*.
 
     The one decision for every per-flag route.  A superuser may always act.
-    Otherwise the role must hold *action* on feature flags in ROLE_PERMISSIONS --
-    that check comes first, so owning a flag never lets a read-only role change
-    it -- and then the scope table decides whose flags the permission covers.
+    When the built-in role holds *action* on feature flags in ROLE_PERMISSIONS,
+    the scope table decides whose flags the permission covers.  Otherwise a
+    custom role or direct grant of ``feature_flag (<action>)`` (full profile)
+    admits any flag, without reading the scope table (access is by
+    permission, not ownership); without one the answer is no, so owning a flag
+    never lets a read-only role change it.
     ...
     """
     if getattr(user, "is_superuser", False):
         return True
-    if not check_permission(user, ResourceType.FEATURE_FLAG, action):
-        return False
-    role = getattr(user, "role", UserRole.VIEWER)
+    try:
+        role = getattr(user, "role", UserRole.VIEWER)
+    except (AttributeError, TypeError):
+        role = UserRole.VIEWER
+    if not has_permission(role, ResourceType.FEATURE_FLAG, action):
+        return _pair(ResourceType.FEATURE_FLAG, action) in granted_permissions(user)
     table = FEATURE_FLAG_SCOPE if scope_table is None else scope_table
     scope = table.get(role, {}).get(action, Scope.OWN)
     if scope is Scope.ANY:
@@ -1618,10 +1737,14 @@ def can_act_on_feature_flag(
     return owner_id is not None and str(owner_id) == str(getattr(user, "id", None))
 ```
 
-The role matrix is checked **first**, so owning a flag never lets a read-only role change it.
-Then `FEATURE_FLAG_SCOPE` says whose flags the permission covers — `ANY` for every role today.
-The table exists for the day someone wants per-flag restrictions (a flag locked to its owner,
-an approval step); that is where they would go, not into `ROLE_PERMISSIONS`. A route calls it
+The role matrix is checked **first**, so owning a flag never lets a read-only role change it:
+where the built-in role says no, the only way in is a custom role or direct grant of that very
+action, and ownership is never consulted. Then `FEATURE_FLAG_SCOPE` says whose flags the
+built-in role's permission covers — `ANY` for every role today. The table exists for the day
+someone wants per-flag restrictions (a flag locked to its owner, an approval step); that is
+where they would go, not into `ROLE_PERMISSIONS`. Its comment is honest about the gap that
+leaves: a grant holder is admitted to any flag *before* the table is read, so a per-flag lock
+added there "would not bind them" and must also be checked on the grant path. A route calls it
 inline, against the flag it loaded:
 
 ```python
@@ -1833,10 +1956,12 @@ it instead. Then read the tests that pin all of this:
 ### Key takeaways
 
 - Four roles × seven resources × five actions in one dict; superuser bypasses it; missing role
-  → `VIEWER`.
-- Access is by role, never by ownership: ADMIN and DEVELOPER change any flag and any
-  experiment; ANALYST and VIEWER change none, including their own. The owner is recorded and
-  shown.
+  → `VIEWER`. In the full profile, custom roles and direct grants add to it — only add, and
+  only the eleven `GRANTABLE` pairs — through `granted_permissions`, asked only when the role
+  says no.
+- Access is by permission, never by ownership: ADMIN and DEVELOPER change any flag and any
+  experiment; ANALYST and VIEWER change none, including their own, unless a custom role or grant
+  gives them that action, on any flag. The owner is recorded and shown.
 - Flags: `can_act_on_feature_flag(user, owner_id, action)` is the one decision, on every
   mutating route, pinned by a smoke test. Experiments: `get_experiment_read_access` and
   `get_experiment_change_access(experiment, user, action)`.
@@ -1848,10 +1973,14 @@ it instead. Then read the tests that pin all of this:
 ### Q&A
 
 **Q. Where do custom roles and direct grants fit?**
-In the optional `rbac` module: `/api/v1/rbac` adds custom roles, direct permission grants and an
-"effective permissions" resolver on top of the static matrix, with its tables created by the
-`modules` migration branch (Day 13). A core build has no `/rbac` at all. The matrix is the floor;
-custom roles extend it. Most deployments never touch it.
+In the optional `rbac` module: `/api/v1/rbac` manages custom roles, direct permission grants
+(optionally expiring) and an "effective permissions" view, with its tables created by the
+`modules` migration branch (Day 13), and the dashboard's Roles page defines roles. Every
+permission check in `core/permissions.py` — `check_permission`, `can_act_on_feature_flag`,
+`can_read_all_audit_logs` — answers yes when the built-in role does, and otherwise when an
+active custom role or unexpired grant holds the pair. A core build has no `/rbac` at all, and
+there the answer is the matrix alone. The matrix is the floor; custom roles extend it, and never
+past the eleven grantable permissions.
 
 **Q. Then why does `check_ownership` still exist?**
 Only two helpers in `deps.py` still call it: the unused flag helpers above, and
@@ -1878,7 +2007,7 @@ is the whole story.
 ### What & why
 
 Day 3 introduced the five core tables. Today is about the _mechanics_ that make every one of
-the model classes (40 in the core, more in the modules) behave the same way: the declarative
+the model classes (41 in the core, more in the modules) behave the same way: the declarative
 base with a schema, the mixin that adds ids and timestamps, foreign keys that must name the
 schema explicitly, `JSONB` for the flexible parts, relationships with cascades, the
 index/constraint tuple every model returns from `__table_args__` — and the seam that keeps a
@@ -1975,9 +2104,29 @@ class FeatureFlag(Base, BaseModel):
     )
     targeting_rules = Column(JSONB)  # Rules for flag enablement
     rollout_percentage = Column(Integer, default=0, nullable=False)  # Gradual rollout
+    # Deprecated in favour of ``off_value`` ...
+    # every row holds false; evaluation does not read it.  ``server_default`` is
+    # load-bearing: the previous release's image inserts rows without naming
+    # this column, and the database fills it.
     default_value = Column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # The flag's value type (boolean, string, number or json) and the two values
+    # a string, number or json flag serves: ``on_value`` to the users it is on
+    # for, ``off_value`` to everyone else (#1497).  A boolean flag keeps both
+    # NULL.  ``check_flag_values`` in ``__table_args__`` holds the combinations;
+    # the API writes them through ``backend.app.core.flag_values``'s rules and
+    # the evaluate route serves them.  ``server_default`` is load-bearing, as
+    # for ``default_value``.  ``none_as_null``: Python ``None``
+    # is stored as SQL NULL, not as JSON ``null``, which the check refuses.
+    value_type = Column(
+        String(16),
+        nullable=False,
+        default="boolean",
+        server_default=text("'boolean'"),
+    )
+    on_value = Column(JSONB(none_as_null=True), nullable=True)
+    off_value = Column(JSONB(none_as_null=True), nullable=True)
     variants = Column(JSONB)  # For multivariate flags
     tags = Column(JSONB)  # For categorization
 
@@ -2022,11 +2171,21 @@ class FeatureFlag(Base, BaseModel):
                 "rollout_percentage >= 0 AND rollout_percentage <= 100",
                 name="check_rollout_percentage",
             ),
+            CheckConstraint(FLAG_VALUES_CHECK_SQL, name=FLAG_VALUES_CHECK),
             {"schema": schema_name},
         )
 ```
 
 Points to notice:
+
+- **The value columns are a lesson in where a rule lives.** The combinations a flag may store
+  (a boolean flag with both values NULL; any other type with both values present, of its JSON
+  type, and different) are a database `CHECK` (`check_flag_values`), so no writer can store a
+  bad pair; the finer rules — size, depth, portable numbers — are one Python module
+  (`core/flag_values.py`) that the API checks first, so a bad request is a 422 that names the
+  field rather than a 500 from the database. And `JSONB(none_as_null=True)` exists because
+  SQLAlchemy would otherwise store Python `None` as the JSON value `null`, which is not SQL
+  `NULL`: an ORM write of a boolean flag would then break the check it is meant to satisfy.
 
 - **`relationship(..., back_populates=...)` on both sides.** Every relationship is declared on
   both models with matching `back_populates`, never `backref`. It's more typing and it means
@@ -2045,11 +2204,13 @@ Points to notice:
   the boundary, and importing the core without the module would raise
   `NoReferencedTableError`. The module's own model appends the constraint (with `use_alter`)
   when module models load. The core never reads the column.
-- **`default_value` has a `server_default`.** The ORM `default=False` is enough for this
-  release's inserts. The `server_default` is for the _previous_ release's image, which does not
-  know the column: during a deploy, or after an image-only rollback, its inserts don't name it
-  and the database fills it. Without it those inserts fail on `NOT NULL`. That is what
-  "backwards-compatible" means in practice (Day 13).
+- **`default_value` and `value_type` have a `server_default`.** The ORM defaults are enough
+  for this release's inserts. The `server_default` is for the _previous_ release's image, which
+  does not know the column: during a deploy, or after an image-only rollback, its inserts don't
+  name it and the database fills it. Without it those inserts fail on `NOT NULL`. That is what
+  "backwards-compatible" means in practice (Day 13). (`default_value` itself is deprecated now
+  in favour of `off_value`: every row holds `false`, evaluation does not read it, and the API
+  still accepts it, as `false` only.)
 - **Index names are schema-prefixed** (`f"{schema_name}_feature_flag_owner_status"`) because
   index names are global within a PostgreSQL schema and the app and test schemas would
   otherwise collide when both live in one database during migration work.
@@ -2170,9 +2331,10 @@ print(CreateTable(FeatureFlag.__table__).compile(dialect=postgresql.dialect()))
 PY
 ```
 
-Look for `default_value BOOLEAN DEFAULT false NOT NULL`, the `check_rollout_percentage`
-constraint, the `owner_id` foreign key with `ON DELETE SET NULL` — and a `workspace_id UUID` with
-no foreign key at all. Then count relationships and confirm every one has a partner:
+Look for `default_value BOOLEAN DEFAULT false NOT NULL`, `value_type VARCHAR(16) DEFAULT
+'boolean' NOT NULL`, the `check_rollout_percentage` and `check_flag_values` constraints, the
+`owner_id` foreign key with `ON DELETE SET NULL` — and a `workspace_id UUID` with no foreign key
+at all. Then count relationships and confirm every one has a partner:
 
 ```bash
 git grep -n "relationship(" backend/app/models | wc -l
@@ -2240,8 +2402,8 @@ So the revisions live on two branches:
 
 - the **core chain**, in `backend/app/db/migrations/versions/`;
 - the **`modules` branch**, in `modules/backend/app/db/migrations/versions/`
-  (`modules_0001_rbac`, `modules_0002_warehouse_analysis`), which forks off the core revision
-  `a7b8c9d0e1f2` and carries `branch_labels = ("modules",)`.
+  (`modules_0001_rbac` through `modules_0004_rbac_activation`), which forks off the core
+  revision `a7b8c9d0e1f2` and carries `branch_labels = ("modules",)`.
 
 A full checkout therefore has **two heads**, and that is the normal state, not a problem to
 fix. Delete `modules/` and you have a core checkout with one head and a consistent chain. Three
@@ -2302,6 +2464,13 @@ And every new migration must be **backwards-compatible**: expand, then contract.
 and after an image-only rollback the _previous_ release's code runs against the _new_ schema, so
 a migration adds (a nullable column, a column with a `server_default`, a new table) and never
 drops or renames something the previous release still uses. The drop waits for a later release.
+
+Sometimes the right expand step is the one *without* a default. `modules_0004_rbac_activation`
+adds `activated_at` to the custom-role assignments and grants, nullable, "no default and no
+backfill, on purpose": `DEFAULT now()` would give every stored row an activation time it was
+never given, and so would switch on, at upgrade, every grant made while custom roles did not
+yet take effect. The previous release's INSERTs do not name the column and still work; their
+rows simply have no activation time, which is the honest answer.
 
 ### How Controlvar does it
 
@@ -2509,8 +2678,8 @@ docker compose exec postgres createdb -U postgres scratch
 ALEMBIC="python -m alembic -c backend/app/db/alembic.ini"
 python -m backend.app.db.bootstrap        # fresh → create_all + stamp heads + first admin
 $ALEMBIC heads                            # two lines in a full checkout, e.g.
-                                          #   4c2c09a2b3e8 (head)
-                                          #   modules_0002_warehouse_analysis (modules) (head)
+                                          #   7b6b4b4fe246 (head)
+                                          #   modules_0004_rbac_activation (modules) (head)
 $ALEMBIC current                          # the same two, as recorded in alembic_version
 $ALEMBIC history | head -5
 
@@ -2787,7 +2956,9 @@ running on demo secrets.
 a flag they created themselves. What happens?**
 The developer is allowed: `can_act_on_feature_flag(user, flag.owner_id, Action.UPDATE)` finds
 UPDATE in the role matrix and scope `ANY`. The viewer is refused with 403: the role lacks UPDATE,
-and that check comes first, so owning the flag is irrelevant.
+and that check comes first, so owning the flag is irrelevant. (In a full build, a custom role or
+direct grant of `feature_flag (update)` would let that viewer change *any* flag, theirs or not;
+ownership is irrelevant either way.)
 
 **6. Why does `create_experiment` call `db.flush()` before adding variants?**
 `SessionLocal` is `autoflush=False`, so the experiment's UUID isn't guaranteed to be
@@ -2880,7 +3051,8 @@ next start.
 ```
 
 ADMIN and DEVELOPER pass on any flag, and so does any superuser; ANALYST and VIEWER are refused
-with 403, on their own flags too. `owner_id` comes from the stored row, never from a response
+with 403, on their own flags too, unless a custom role or grant gives them `feature_flag
+(update)`. `owner_id` comes from the stored row, never from a response
 dict. The test that fails is `backend/tests/smoke/test_flag_change_routes_guarded.py`
 (`test_the_inventory_is_exact`): every mutating route under `/feature-flags` must be classified,
 so add `("POST", "/api/v1/feature-flags/{flag_id}/lock"): FLAG_RULE` to its `INVENTORY`. (A
