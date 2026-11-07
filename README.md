@@ -36,9 +36,10 @@ assumes.
 
 ## The library
 
-Eight books in two groups, and a short guide for contributors. The **core path** takes you from zero to reading
+Nine books in three groups, and a short guide for contributors. The **core path** takes you from zero to reading
 and extending the whole system; the **specializations** go deep on the subsystems that make the product what it
-is; **Before You Change Controlvar** is the one to read before your first pull request.
+is; **Before You Change Controlvar** is the one to read before your first pull request; and **Using AI Tools
+Effectively** shows how to get work you can trust from AI coding agents.
 
 **Core path, in order:**
 
@@ -79,6 +80,14 @@ is; **Before You Change Controlvar** is the one to read before your first pull r
    to make a first change: the codebase map, running the stack, where each decision lives, the tests and gates a
    pull request must pass, how changes are planned and reviewed, one real fix from issue to release, and the
    changes whose effects land far from where they are made. It links to the lessons above that go deeper.
+
+**Working with AI coding tools, alongside any of the others:**
+
+10. **[Using AI Tools Effectively](./using-ai-tools-effectively/README.md)**: getting work you can trust from AI
+    coding agents, taught through how Controlvar is built: the instruction file the agents work from, the roles
+    that plan and review before any code is written, how to brief an agent, how to check its claims and
+    tamper-test its checks, how to review its work round after round, the safety rails, one real pull request
+    from issue to release, and the work that belongs to a script or a person instead.
 
 ## How every book works
 
