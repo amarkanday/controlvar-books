@@ -13,7 +13,7 @@ different way of running the same images with the same entrypoint — so this Pa
 foundation, not the warm-up. Have a checkout open and Docker running; every Try It Yourself
 below works on a laptop.
 
-> **Verified against** Controlvar v0.36.4 (`79f8ed18`). One codebase, Apache-2.0 throughout, built in two **profiles**: **core** (`backend/`
+> **Verified against** Controlvar `09d815ea` (`main` after v0.43.2). One codebase, Apache-2.0 throughout, built in two **profiles**: **core** (`backend/`
 > only) and **full** (adds the optional modules under `modules/`). The profile is decided by
 > whether `import modules` succeeds in the image, and `modules-manifest.txt` is the authority on
 > what is a module.
@@ -255,14 +255,21 @@ is a different contract, and it opens by saying so:
 # README.md beside this file says how to run it and lists its settings.
 ```
 
-The settings live in `deploy/compose/README.md` ([the app's copy at v0.36.4](https://github.com/Controlvar/controlvar/blob/v0.36.4/deploy/compose/README.md)).
+The settings live in `deploy/compose/README.md` ([the app's copy at this book's pin](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/deploy/compose/README.md)),
+and `deploy/compose/.env.example` lists every one the file reads.
 Five have no default and compose refuses to start, naming the first one that is unset or empty:
 `PUBLIC_BASE_URL` (the URL people open), `SECRET_KEY`, `FIRST_SUPERUSER` (the first
 administrator's email), `FIRST_SUPERUSER_PASSWORD` and `POSTGRES_PASSWORD`. The optional ones:
 `AUDIT_HMAC_KEY` (needed by the `full` profile), `EXPERIMENTLY_PROFILE` (`core` or `full`),
 `HTTP_BIND` / `HTTP_PORT` (where the dashboard listens, `127.0.0.1:8080` by default, for a TLS
-reverse proxy to sit in front of) and `POSTGRES_SERVER` (an external database instead of the
-bundled one; then start only `docker compose up -d api web`).
+reverse proxy to sit in front of), `FORWARDED_ALLOW_IPS` (a TLS proxy on another machine whose
+`X-Forwarded-For` the API should believe; empty for a proxy on the same host, Hour 3) and
+`POSTGRES_SERVER` (an external database instead of the bundled one, with its `TimeZone` set to
+UTC; then start only `docker compose up -d api web`). Four more each switch a feature on and are
+empty by default, an empty key counting as no key: `WAREHOUSE_CREDENTIALS_KEYS` (warehouse
+analysis, full profile) and the three LLM providers' keys, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`
+and `GEMINI_API_KEY`. Put them in `.env` beside the file: a key exported in some other terminal
+never reaches the container.
 
 The "required" is enforced by compose itself, with the `${VAR:?message}` form — there is no
 default to forget to change:
@@ -274,7 +281,7 @@ name: experimently-selfhost
 services:
   ...
   api:
-    image: ghcr.io/controlvar/controlvar:${EXPERIMENTLY_PROFILE:-core}-0.36.4 # x-release-please-version
+    image: ghcr.io/controlvar/controlvar:${EXPERIMENTLY_PROFILE:-core}-0.43.2 # x-release-please-version
     # Published for linux/amd64 only (#181): an arm64 host runs it emulated.
     platform: linux/amd64
     environment:
@@ -285,13 +292,18 @@ services:
       PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?required: the URL people open, e.g. https://controlvar.example.com}"
       SECRET_KEY: "${SECRET_KEY:?required: generate with openssl rand -hex 32}"
       ...
+      # Proxies whose X-Forwarded-For the API believes besides the dashboard
+      # container and the gateway of this project's network, which it always
+      # believes: a TLS proxy on another machine. Empty by default.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-}
+      ...
       RUN_MIGRATIONS: "true"
       # No seeds in production: the demo seed creates a user with a published
       # password.
       SEED: ""
   ...
   web:
-    image: ghcr.io/controlvar/controlvar-web:${EXPERIMENTLY_PROFILE:-core}-0.36.4 # x-release-please-version
+    image: ghcr.io/controlvar/controlvar-web:${EXPERIMENTLY_PROFILE:-core}-0.43.2 # x-release-please-version
     ...
     ports:
       - "${HTTP_BIND:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
@@ -301,18 +313,71 @@ Four things to notice. The project name is fixed (`experimently-selfhost`, a nam
 rename on purpose) so it never adopts the development stack's containers and volumes, and so the
 volume names are the same on every host. The image tags are literal versions that the release
 process moves (`core-X.Y.Z` / `full-X.Y.Z`, the `x-release-please-version` marker) — no floating
-tag. The images are public on GHCR (`ghcr.io/controlvar/controlvar` and
+tag. The Compose README's rule is that the image lines "name the images of this file's own
+release", so the version you pin is the one in the `compose.yml` of the release you install: at
+this book's pin that is 0.43.2, the last release cut before it, and every release rewrites both
+lines. The images are public on GHCR (`ghcr.io/controlvar/controlvar` and
 `ghcr.io/controlvar/controlvar-web`), signed with cosign keyless signatures, and built for
 amd64 only. And `deploy/compose/generate-env.sh` writes the `.env` once — it refuses to overwrite
 an existing one, because a second run would rotate `SECRET_KEY`, and write a
 `FIRST_SUPERUSER_PASSWORD` and a `POSTGRES_PASSWORD` the existing database no longer accepts. The
 `compose-production.yml` CI workflow boots this file the way a self-hoster does, on every pull
-request that touches it or the images.
+request that touches it or the images, and reads two facts back from the logs without sending a
+request: the API's start line names exactly the subnet Docker gave the project's network, and a
+client on the same host reaches the dashboard as that network's gateway (both explained in
+Hour 3).
 
 `PUBLIC_BASE_URL` is required for a reason beyond links: the API answers only for that host
 name. When `ALLOWED_HOSTS` is unset it is derived from `PUBLIC_BASE_URL`'s host, and a request
 with any other `Host` header is refused with 400 before a handler sees it — so your reverse proxy
 must forward the `Host` header unchanged.
+
+#### Backing it up, and restoring
+
+The production file's README has a backup procedure, and its first sentence is the design: "A
+backup is two files, taken together: a dump of the database and your `.env`." The dump is
+useless without the `.env`, because `SECRET_KEY` signs every sign-in token and `AUDIT_HMAC_KEY`
+signs the full profile's audit records, and `generate-env.sh` on a new host would make different
+ones. Redis is not backed up at all: it holds counters and caches the API rebuilds, and the API
+runs without it.
+
+```bash
+# 📁 deploy/compose/README.md
+mkdir -m 700 -p ~/controlvar-backups
+docker compose -p experimently-selfhost exec -T postgres \
+  sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' \
+  > ~/controlvar-backups/controlvar.dump
+cp .env ~/controlvar-backups/controlvar.env
+```
+
+Three details carry the weight. Every command names the project, `-p experimently-selfhost`, so
+it can never act on the development stack's containers. `pg_dump` runs _inside_ the `postgres`
+service with that container's own user and database (the single quotes stop the host's shell
+expanding `$POSTGRES_USER`), and only its output crosses to the host. And `-m 700`, because the
+folder holds the secrets.
+
+Restoring is where the migration rules of Hour 3 bite. The README says to restore into a fresh
+stack of the **same image tag** the dump came from: an older image refuses a database a newer
+release migrated, so you restore first and upgrade afterwards, the usual way.
+
+```bash
+# 📁 deploy/compose/README.md
+cp ~/controlvar-backups/controlvar.env .env
+docker compose -p experimently-selfhost up -d --wait postgres
+docker compose -p experimently-selfhost exec -T postgres \
+  sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --exit-on-error' \
+  < ~/controlvar-backups/controlvar.dump
+docker compose -p experimently-selfhost up -d --wait
+```
+
+The order is the lesson. Only Postgres starts first, so its database is still empty when the dump
+goes in; had the API started first, its bootstrap would already have created a schema and a first
+administrator there, and the dump would land on top of them (`--exit-on-error` makes `pg_restore`
+stop at its first error instead of carrying on and leaving a half-loaded database). When the API
+does start, it finds `alembic_version` and the restored users, and creates neither. Never run this in the directory of
+a running stack: the first line replaces its `.env`. To rehearse on the same host, stop the stack
+(`docker compose -p experimently-selfhost stop` keeps its volumes) and restore under a different
+`-p` name, which starts with empty volumes.
 
 > **Watch Out!** The three secrets in the development file's header. The default `SECRET_KEY`
 > signs local JWTs (Build book Day 10); anyone who reads this public file can forge a session on
@@ -368,6 +433,9 @@ Then set `REDIS_REQUIRED=true`, `docker compose stop redis`, and watch `/health/
   "can serve"; `start_period: 300s` covers first-run seeding.
 - `PUBLIC_BASE_URL` decides which host the API answers for; CORS in staging and production lists
   only browser-SDK sites.
+- The image tag to pin is the one in the `compose.yml` of the release you run (0.43.2 at this
+  book's pin). A backup is the database dump **and** the `.env`, together; restore into the same
+  release with only Postgres started, then start the rest.
 
 ---
 
@@ -713,9 +781,11 @@ The entrypoint's contract, and its safety property:
 #      of the container does not re-seed. SEED_FORCE=true re-runs them.
 #      Every seed is development-only: SEED=<any of them> is refused,
 #      before step 1, unless ENVIRONMENT is development or test.
-#   4. exec "$@" — by default uvicorn; `--workers ${WEB_CONCURRENCY:-1}` and the
-#      proxy flags are appended when the command is uvicorn and the caller did
-#      not pass them explicitly.
+#   4. exec "$@" — by default uvicorn. When the command is uvicorn,
+#      `--workers ${WEB_CONCURRENCY:-1}` is appended unless the caller passed
+#      --workers, and the proxy flags (--proxy-headers, and
+#      --forwarded-allow-ips with the list backend/app/core/proxy_trust.py
+#      builds) are always appended, after any the caller passed, so they win.
 #
 # Steps 1-3 can be skipped (step 0 cannot): RUN_MIGRATIONS=false, SEED= (empty),
 # WAIT_FOR_DB=false. The script runs with `set -euo pipefail`: a failed
@@ -825,7 +895,8 @@ fi
 
 An unknown seed name is an error, not a warning — a typo in `SEED` should stop the
 container, not silently give you a platform with no data. Step 4 appends the worker count
-and the proxy flags only if the command is uvicorn and the caller didn't set them:
+unless the caller set one, and the proxy flags always, last, so the entrypoint's are the ones
+uvicorn keeps:
 
 ```bash
 # 📁 backend/docker-entrypoint.sh
@@ -839,9 +910,37 @@ if [ "$1" = "uvicorn" ]; then
     if [ "$has_workers" = "false" ]; then
         set -- "$@" --workers "$WEB_CONCURRENCY"
     fi
+    # --forwarded-allow-ips decides WHOSE X-Forwarded-* uvicorn believes, and
+    # `*` meant everybody's. Measured against the pinned uvicorn 0.54.0, with a
+    # client that forged a hop and an ALB that appended the real one:
+    #
+    #   X-Forwarded-For: 9.9.9.9, 203.0.113.9, 10.0.3.10
+    #                    ^forged  ^real client ^the ALB
+    #
+    #   --forwarded-allow-ips="*"      -> client = 9.9.9.9      (the forgery)
+    #   --forwarded-allow-ips=<private> -> client = 203.0.113.9 (correct)
     ...
+    # The default believes loopback and the networks this container is
+    # directly attached to: in Compose, the dashboard container and the
+    # gateway a TLS proxy on the same host arrives from. Any other proxy -- an
+    # ingress controller, a load balancer, a TLS proxy on another machine --
+    # is named in FORWARDED_ALLOW_IPS, which adds to that list;
+    # backend/app/core/proxy_trust.py builds it, and the chart and the CDK
+    # stack set the variable. A list that misses the proxy in front makes
+    # uvicorn ignore its X-Forwarded-For, so every request resolves to that
+    # proxy and shares one rate-limit count; the "trusted proxies" line says
+    # what is in use. An empty list would believe nobody, so the entrypoint
+    # refuses to start with one.
+    #
+    # A plain assignment, not `local` or `export`: those would hide the
+    # helper's exit status (78 for a refused entry) from `set -e`.
+    trusted="$(python -m backend.app.core.proxy_trust)"
+    if [ -z "$trusted" ]; then
+        log "the trusted-proxy list came back empty; refusing to start"
+        exit 78
+    fi
     set -- "$@" --proxy-headers \
-        --forwarded-allow-ips="${FORWARDED_ALLOW_IPS:-127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}" \
+        --forwarded-allow-ips="$trusted" \
         --no-server-header
 fi
 
@@ -851,15 +950,91 @@ exec "$@"
 
 `--proxy-headers` makes uvicorn read `X-Forwarded-Proto` and `X-Forwarded-For`, so the API sees
 `https` and the real client address behind nginx or a load balancer. `--forwarded-allow-ips`
-decides **whose** forwarded headers it believes: by default only loopback and the private
-(RFC 1918) ranges, which is where a reverse proxy or a load balancer inside a VPC always sits and
-where a client arriving from the internet never does. uvicorn then walks the `X-Forwarded-For`
-list from the right, skips the trusted hops, and takes the first address it does not trust as the
-client. `FORWARDED_ALLOW_IPS` overrides the list for a topology this does not fit — for example a
-proxy reached over a public address. It matters because the rate limiter keys its buckets on the
-client address: SDK paths share `SDK_RATE_LIMIT_PER_MINUTE` (default 6000 per minute per IP),
-most other routes 300, and the auth endpoints stricter still. Trust the wrong hop and every client
-looks like the proxy — one shared bucket.
+decides **whose** forwarded headers it believes, and the measured example in the comment is the
+whole reason it matters. Each proxy _appends_ the address it saw to `X-Forwarded-For`, so the left
+end of the list is whatever the client chose to send. Given a list of trusted hops, uvicorn walks
+it from the right, skips the hops it trusts, and takes the first address it does not trust as the
+client: the real one. Given `*`, it takes the leftmost: the forgery.
+
+**Whose headers, then?** Until v0.40.0 the default was every private (RFC 1918) range. It is now
+a list built when the container starts (#1580), by a small module that uses only the standard
+library:
+
+```python
+# 📁 backend/app/core/proxy_trust.py
+"""The proxies whose ``X-Forwarded-For`` the API's server believes.
+
+``backend/docker-entrypoint.sh`` starts uvicorn with
+``--forwarded-allow-ips=<list>``, and the list is what ``python -m
+backend.app.core.proxy_trust`` prints on its one line of standard output:
+
+* ``127.0.0.1`` and ``::1``;
+* every network this container is directly attached to, read from
+  ``/proc/net/route`` (IPv4) and ``/proc/net/if_inet6`` (IPv6) when it starts.
+  In Docker Compose that is the project network, so the dashboard container
+  and the gateway a TLS proxy on the same host arrives from are on it;
+* every entry of ``FORWARDED_ALLOW_IPS``, which adds to the two above and
+  cannot take anything away from them.
+```
+
+```python
+# 📁 backend/app/core/proxy_trust.py
+def build(raw: Optional[str], own: Sequence[Network]) -> str:
+    """The value for ``--forwarded-allow-ips``: loopback, *own*, then the
+    entries of *raw*, each once. ValueError if an entry is refused."""
+    items = [
+        *LOOPBACK,
+        *(str(network) for network in own),
+        *(str(entry) for entry in entries(raw)),
+    ]
+    return ",".join(dict.fromkeys(items))
+```
+
+The design moves trust from a _class_ of addresses to the hops this deployment actually has. In
+Compose the proxies in front of the API are the dashboard container and, for a TLS proxy on the
+same host, the project network's gateway: both on the container's own network, so a self-hoster
+sets nothing. Anything else is named. On AWS the load balancer sits in the VPC's public subnets,
+on none of the API task's own networks, so the Fargate stack names the VPC's range (Part II), and
+the Helm chart has its own default (`api.forwardedAllowIps`). `docs/self-hosting/proxies.md` has
+the table per install.
+
+The setting is checked, not trusted. uvicorn keeps an entry it cannot parse as a literal string
+that no peer address will ever equal, so a typo would silently stop believing the very proxy it
+was meant to name. The settings preflight (step 0) therefore refuses, with exit 78 and one line
+per entry: anything that is not
+an address or a network written with its host bits zero (`10.0.0.5/16` gets "is an address with a
+mask, which matches no proxy. Write the network, 10.0.0.0/16, or the address alone, 10.0.0.5.");
+`*` in every environment, because the list is added to and `*` cannot be; and `0.0.0.0/0` or
+`::/0` in staging and production. Then the entrypoint refuses an empty list, and every start
+prints one line saying what it believes:
+
+```text
+[entrypoint] trusted proxies: 127.0.0.1 ::1; this container's networks: 172.19.0.0/16; FORWARDED_ALLOW_IPS: (none)
+```
+
+That line is an operator's first check, and CI's: Docker Smoke and Compose Production both read
+it back. The second check is the access log. The Compose README counts API requests per address:
+
+```bash
+# 📁 deploy/compose/README.md
+docker compose logs api 2>&1 | grep '"uvicorn.access"' | grep ' /api/' \
+  | sed -E 's/.*"event": "([^ ]*):[0-9]+ - .*/\1/' | sort | uniq -c | sort -rn | head
+```
+
+Your users' addresses mean it works. One private address on every line, such as `172.18.0.1`,
+means the API sees a proxy instead: either the TLS proxy sends no `X-Forwarded-For`, or it runs on
+another machine (or connects to the host's network address rather than `127.0.0.1`) and
+`FORWARDED_ALLOW_IPS` does not list it.
+
+It matters because the rate limiter keys its counters on the client address, **and on the
+path**: `rate_limit_key()` charges `client_ip:path`. Every path gets its own counter per address
+(300 a minute by default, the sign-in endpoints far fewer), and the SDK paths get
+`SDK_RATE_LIMIT_PER_MINUTE` (6,000 a minute) per path, so each flag key or user id in an
+evaluation path is a counter of its own (batch assignment, which assigns up to 1,000 users a
+request, has its own 60 a minute). Only the export routes share one counter per address
+(10 a minute across all of them), and so do the AI interpretation routes. Trust the wrong hop and
+every client looks like the proxy: the whole user base shares one counter per path, and ordinary
+use starts answering 429.
 
 `exec` replaces the shell with uvicorn so signals reach the server — a `docker stop` sends
 SIGTERM to uvicorn, which runs the lifespan shutdown (schedulers stop cleanly), rather than
@@ -1017,6 +1192,8 @@ docker compose run --rm -e SEED=demo api true | grep "already applied"
 docker compose run --rm -e SEED=nope api true; echo "exit $?"        # unknown seed → exit 1
 docker compose run --rm -e ENVIRONMENT=production api true; echo "exit $?"   # preflight → exit 78, read the list
 docker compose run --rm -e RUN_MIGRATIONS=false -e SEED= api python -c "print('skipped bootstrap and seeds')"
+docker compose run --rm -e FORWARDED_ALLOW_IPS=10.0.0.5/16 api true; echo "exit $?"  # 78: an address with a mask
+docker compose logs api | grep 'trusted proxies'                     # what the running API believes
 # bootstrap by hand, twice — second run is "upgraded" with nothing to do
 source venv/bin/activate && make bootstrap && make bootstrap
 ```
@@ -1033,8 +1210,10 @@ database and confirm from the logs that one created and the other upgraded (foun
 - Bootstrap: fresh DB → `create_all` + `stamp heads`; existing → `upgrade heads` (two heads in a
   full checkout); refuses a database a newer release migrated; first superuser if `users` is
   empty; serialised by a blocking advisory lock.
-- Proxy headers are trusted only from loopback and private ranges unless `FORWARDED_ALLOW_IPS`
-  says otherwise; the rate limiter depends on it.
+- Proxy headers are believed from loopback, the container's own networks (read from `/proc` at
+  start) and the entries of `FORWARDED_ALLOW_IPS`, which only add; a malformed entry or `*` stops
+  the container (exit 78), and the start line says what is believed. The rate limiter counts per
+  client address and per path, so getting this wrong collapses every user into one counter.
 - One bootstrap implementation, several callers. On AWS the API never migrates: the Deploy's
   migration task is the only writer, and `cdk deploy` alone leaves no schema.
 
@@ -1081,6 +1260,15 @@ while its health checks pass. What's the first thing to check?**
 The `Host` header. The API answers only for `PUBLIC_BASE_URL`'s host (or `ALLOWED_HOSTS`); a proxy
 that rewrites `Host` to `localhost:8080` gets every request refused. Forward it unchanged.
 
+**Q8. A self-hosted dashboard works, but users who signed in once are told "Too many attempts",
+and the access-log count shows `172.18.0.1` on every line. What is wrong, and what do you change?**
+The API is not believing the proxy's `X-Forwarded-For`, so every user resolves to one address and
+shares one rate-limit counter per path. `172.18.0.1` is a Docker network gateway: the TLS proxy
+either sends no `X-Forwarded-For`, or it runs on another machine (or connects to the host's
+network address instead of `127.0.0.1`). Make the proxy send the header and, if it is elsewhere,
+put its address in `.env` as `FORWARDED_ALLOW_IPS`; the API's `trusted proxies` start line then
+shows it.
+
 **Quiz.** Why `exec "$@"` rather than just `"$@"` at the end of the entrypoint?
 → So uvicorn _replaces_ the shell as PID 1's child and receives SIGTERM directly on
 `docker stop`; the lifespan shutdown then stops the schedulers cleanly instead of the
@@ -1093,9 +1281,10 @@ container being killed after the grace period.
 **E1.1 — Self-host on one VM.** Using `deploy/compose/compose.yml`, stand up a production
 instance for `https://experiments.customer.example`: generate the `.env`, choose the profile, put
 a TLS reverse proxy in front of `127.0.0.1:8080`, set `METRICS_TOKEN`, and sign in as the first
-administrator. Then, in a scratch copy of the `.env`, delete `PUBLIC_BASE_URL` and read compose's
-refusal; and run the image directly with `ENVIRONMENT=production` and a short `SECRET_KEY` and
-read the preflight's list.
+administrator. Confirm from the API's `trusted proxies` start line and the access-log count that
+the API sees your address, not a gateway's. Then, in a scratch copy of the `.env`, delete
+`PUBLIC_BASE_URL` and read compose's refusal; and run the image directly with
+`ENVIRONMENT=production` and a short `SECRET_KEY` and read the preflight's list.
 
 **E1.2 — Split origin.** Serve the dashboard from `localhost:3000` and the API directly on
 `localhost:8000` (absolute `NEXT_PUBLIC_API_URL`); list every setting that has to change
@@ -1115,6 +1304,11 @@ up -d --scale api=3` — first drop the fixed host port in a `compose.override.y
 container cannot bind 8000) against a fresh database; inspect the logs for the bootstrap lock
 behaviour and the scheduler lock (Hour 9) behaviour; count how many containers ran each scheduler
 tick.
+
+**E1.6 — Restore drill.** On the instance from E1.1, create an experiment, take a backup with the
+README's commands, stop the stack, and restore it on the same host under another project name.
+Show that the experiment is there and that nothing was bootstrapped. Then say what happens if the
+`compose.yml` you restore with names an older release than the one the dump came from.
 
 ---
 
@@ -1167,6 +1361,15 @@ rather than trusting a number from a book: it depends on the base image and the 
 Schedulers: each tick, one container logs the tick's work and two log "lock held elsewhere, tick
 skipped"; `scheduler_ticks_total{status="skipped"}` climbs on two containers and
 `{status="success"}` on one.
+
+**S1.6** — the dump and the `.env` go to `~/controlvar-backups/`; the restore runs under
+`-p restore-drill` from a directory holding the same release's `compose.yml` and the saved `.env`.
+The proof is the experiment you created, in the restored dashboard, and the API's bootstrap log:
+"alembic_version present in schema …: running upgrade heads", not "Fresh database: creating
+schema …". It found the schema and the users, and created neither. With an older release's
+`compose.yml`, the restored database records revisions that image has no file for, so its
+bootstrap refuses with a message naming them (`may_run_alembic`, Hour 3) and the API never
+serves: restore with the dump's own release, then upgrade.
 
 ---
 
