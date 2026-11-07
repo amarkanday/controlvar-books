@@ -29,8 +29,8 @@ design rule that makes it possible is the transport seam from Hour 4: the client
 `send(method, url, headers, body, timeout) → Response`, so anything with that shape can stand
 in.
 
-The pattern pays off in three ways. Tests are fast (the Python SDK's whole suite — 210 tests
-at v0.36.4, local mode included — runs in about a second). Tests are _precise_ — "the second call made no request" is an assertion on
+The pattern pays off in three ways. Tests are fast (the Python SDK's whole suite — 469 tests
+at the pin, local mode included — runs in about a second and a half). Tests are _precise_ — "the second call made no request" is an assertion on
 `transport.calls()`, not an inference from timing. And the same fake is exported for
 integrators (`controlvar.testing`), so an application's tests can drive the real SDK
 against scripted responses instead of mocking the SDK's methods and hoping the mock matches.
@@ -135,11 +135,11 @@ Failures raise with status and are never cached:
 ```python
 # 📁 sdk/python/tests/test_client.py
     def test_404_raises_with_status_and_body(self, client, transport):
-        transport.respond(404, json={"detail": "Active experiment with key 'nope' not found"})
+        transport.respond(404, json={"detail": "No experiment has the key 'nope'."})
         with pytest.raises(ExperimentationError) as info:
             client.get_assignment("nope", "user-1")
         assert info.value.status == 404
-        assert "not found" in info.value.body
+        assert "No experiment has the key 'nope'." in info.value.body
         assert "404" in str(info.value)
 
     def test_failure_is_never_cached(self, client, transport):
@@ -248,8 +248,8 @@ serves), and for each case it runs the flag service's own
 context. Nothing in the file is written by hand.
 ```
 
-`tests/sdk-contract/ruleset-vectors.json` holds 2,191 cases over 149 flags at v0.36.4;
-1,294 are marked `must_local`. Each SDK's suite asserts both directions — every case
+`tests/sdk-contract/ruleset-vectors.json` holds 2,242 cases over 161 flags at the pin;
+1,333 are marked `must_local`. Each SDK's suite asserts both directions — every case
 is deferred or answered exactly, every `must_local` case is answered locally, and nothing
 else is — so an SDK that "plays safe" by deferring everything fails as surely as one that
 guesses:
@@ -268,11 +268,23 @@ cannot land without the corpus — and therefore the SDKs — seeing it. It is t
 idea from Hour 2 applied to a whole evaluator: one file, produced by the reference, read by
 every implementation.
 
+Flag values reached the corpus the additive way. A case of a string, number or json flag (51
+of them at the pin) carries `expected_value`, the `value` the evaluate route answers, as a key
+of its own beside `expected`. An SDK that does not read values compares `expected` exactly as
+before and never sees the new key; one that does must also give exactly that value, compared
+as JSON, whenever it answers locally. The corpus holds each value type as an active local
+flag, an active remote flag, an inactive flag and an archived flag, so every way a value can
+reach an SDK is a case.
+
 > **By the Way** — the test names are the contract, phrased as behaviours: "is sticky: the
 > second call is served from the cache without a request", "never caches a failure — the
-> next call re-fetches", "throws ExperimentationError with status 404 when the experiment is
-> not ACTIVE". When you port the SDK, port the test _names_ first; they're the checklist
-> from Hour 7, and a port whose suite has the same names is a port you can review by diff.
+> next call re-fetches", "throws ExperimentationError with status 404 when no experiment has
+> the key". That last one used to end "when the experiment is not ACTIVE"; when #1362 changed
+> the contract, the test was renamed and a new one appeared beside it, "carries assigned:
+> false and reason %s for an experiment that is not ACTIVE". A contract change you can see in
+> a diff of test names is one a reviewer cannot miss. When you port the SDK, port the test
+> _names_ first; they're the checklist from Hour 7, and a port whose suite has the same names
+> is a port you can review by diff.
 
 > **Watch Out!** A fake transport tests the client's side of the contract, not the server's.
 > If the backend changed the assign response to `variantName` (camelCase), every SDK unit
@@ -283,14 +295,22 @@ every implementation.
 ### Try It Yourself
 
 ```bash
-cd sdk/python && python -m pytest -q -o addopts="" > /tmp/py-sdk.txt 2>&1; tail -1 /tmp/py-sdk.txt   # 210 passed at v0.36.4
-cd ../js && npm ci && npx jest --silent > /tmp/js-sdk.txt 2>&1; grep '^Tests:' /tmp/js-sdk.txt      # 205 passed at v0.36.4
+cd sdk/python && python -m pytest -q -o addopts="" > /tmp/py-sdk.txt 2>&1; tail -1 /tmp/py-sdk.txt   # 469 passed at the pin
+cd ../js && npm ci && npx jest --silent > /tmp/js-sdk.txt 2>&1; grep '^Tests:' /tmp/js-sdk.txt      # 410 passed at the pin
 ```
 
 Then write a test for a rule that isn't covered yet — say, "a 2xx with an empty body from
 `/tracking/track` counts as accepted" — using `transport.route("POST",
 "/api/v1/tracking/track", status=204)` and asserting `client.track(...) is True`. Run it;
 read `_request`'s `if not response.body: return None` to see why it passes.
+
+One more, from Hour 3's story: write the test that would have caught the #1712 cache bug
+_before_ it was fixed. Answer a flag locally, make the next ruleset refresh answer 403, and,
+**without** calling `clear_cache()`, evaluate the same user and flag twice. Assert that the
+first call reaches the server and the second does not. Then find the regression tests the
+fix added in `sdk/python/tests/test_local.py` (their names start
+`test_a_refusal_that_discards_the_ruleset`) and compare. The old tests called `clear_cache()`
+first, which is exactly the state in which the bug could not appear.
 
 ### Key takeaways
 
@@ -324,17 +344,39 @@ validates the JSON, and prints a PASS/FAIL/SKIP table. And a **CI job** starts P
 Redis and the backend, seeds fixtures, and runs the runner with `--strict` for every SDK
 whose toolchain is available on Linux — as a required check on every pull request.
 
-The "one JSON line" contract is what makes sixteen SDKs testable by one Python script (445
-lines at v0.36.4): the runner never parses Go or Swift output formats, only
-JSON. Since local evaluation arrived it does two more things, both on the server's side of
-the contract. **Before** the SDKs it checks `GET /api/v1/sdk/ruleset` once: the plain key
-gets 403, the `sdk:ruleset` key gets 200 with the contract flag marked `local`, and sending
-the ETag back gets 304 (the `ruleset (server)` row). **After** the SDKs it runs each SDK's
-local smoke (the `python (local)` and `js (local)` rows) and reads the database around it,
-through the backend's own `SafetyService.get_error_metrics`: no evaluate call may have reached
-the server, and the safety denominator must have grown by exactly the number of local
-evaluations. That is why the runner now needs the backend's Python environment and the
-`POSTGRES_*` variables.
+The "one JSON line" contract is what makes sixteen SDKs testable by one Python script (998
+lines at the pin): the runner never parses Go or Swift output formats, only JSON. Around the
+SDK rows it now does several things on the server's side of the contract, reading the
+database through the backend's own code, which is why the runner needs the backend's Python
+environment and the `POSTGRES_*` variables:
+
+- **Before** the SDKs it checks `GET /api/v1/sdk/ruleset` once: the plain key gets 403, the
+  `sdk:ruleset` key gets 200 with the contract flag marked `local`, and sending the ETag back
+  gets 304 (the `ruleset (server)` row).
+- **In each SDK row**, an SDK that claims a newer feature must prove it, and one that does not
+  must not report it: `EXPOSURE_SDKS` must report exactly one exposure-hook call for the
+  contract experiment, `ATTRIBUTE_SDKS` must turn the seed's `sdk_contract_targeted` flag on
+  with `{"plan": "pro"}` (reason `targeting_rule`) and off with `{"plan": "free"}`, and
+  `EVENT_ID_SDKS` must send one event twice with one `event_id`, after which the runner counts
+  the rows in the database and requires exactly one.
+- **After the React row**, the bootstrap of Hour 6: one server render with
+  `ServerClient.bootstrap()`, then the hook's request after hydration, with exactly one
+  exposure row after the server render and exactly one more after hydration, and a check that
+  the bootstrap example in the React SDK page of the docs still has the live bootstrap's
+  fields.
+- **After the SDKs** it runs each SDK's local smoke (the `python (local)` and `js (local)`
+  rows) and reads the database around it, through `SafetyService.get_error_metrics`: no
+  evaluate call may have reached the server, and the safety denominator must have grown by
+  exactly the number of local evaluations.
+- **Last**, the published releases of Hour 12 (`PUBLISHED_LOCAL`): the released JavaScript
+  and Python SDKs, downloaded and checked by digest, run in local mode against this server; the
+  runner turns the seed's value flags off through the API, and each release must answer
+  `inactive` within one refresh, still locally.
+
+The "both directions" rule on the newer features is the one to copy. A list of SDKs that must
+show a feature is half a check: an SDK that gains the feature without joining the list is
+untested, and one that leaves the list without losing the feature is unexamined. Failing on an
+unexpected report makes the list the single record of which SDK does what.
 
 ### How Controlvar does it
 
@@ -344,7 +386,8 @@ stickiness is the server's and not the client cache's:
 
 ```python
 # 📁 sdk/python/examples/contract_smoke.py
-    client = ExperimentationClient(api_url, api_key)
+    recording = Recording()
+    client = ExperimentationClient(api_url, api_key, transport=recording)
 
     # 1. Assign twice. The cache is cleared in between so the second call really
     #    goes to the server and proves the assignment is sticky there.
@@ -370,10 +413,31 @@ stickiness is the server's and not the client cache's:
     if not client.track(user_id, "purchase", event_value=12.5, experiment_key=experiment_key):
         fail("track(purchase) with experiment_key was not accepted")
 
-    # 4. Track without a key -> fans out to the cached assignment + flag via /tracking/batch,
-    #    then an explicit 2-event batch.
+    # 4. Track without a key -> exactly one POST /tracking/batch, fanned out to the experiment and
+    #    the flag answered above, every entry stored; then an explicit 2-event batch. track()
+    #    alone would not tell: it is True for an untagged send too, and for a 2xx batch whose
+    #    entries failed.
+    mark = len(recording.calls)
     if not client.track(user_id, "page_view", properties={"page": "/smoke"}):
         fail("track(page_view) without a key was not accepted")
+    sent = recording.calls[mark:]
+    if [(method, path) for method, path, _, _ in sent] != [("POST", "/api/v1/tracking/batch")]:
+        fail(f"track(page_view) without a key sent {[f'{m} {p}' for m, p, _, _ in sent]}, expected one POST /api/v1/tracking/batch")
+    keys = [(e.get("experiment_key"), e.get("feature_flag_key")) for e in sent[0][2]["events"]]
+    if keys != [(experiment_key, None), (None, flag_key)]:
+        fail(f"the fan-out carried {keys}, expected the experiment {experiment_key!r} then the flag {flag_key!r}")
+    ...
+    # 4b. One keyed event sent twice with one fixed event_id (#1543, C4). The server is to store
+    #     it once: the runner counts the rows for this user and event name.
+    dedup_name = f"contract_dedup_{uuid.uuid4()}"
+    dedup_id = f"contract-{uuid.uuid4()}"
+    for _ in range(2):
+        if not client.track(user_id, dedup_name, experiment_key=experiment_key, event_id=dedup_id):
+            fail("track(contract_dedup) with an event_id was not accepted")
+
+    # 5. The exposure hook (#1499): a NEW client with on_exposure assigns the same user twice,
+    #    with no clear_cache() in between. The server records an exposure for the first request
+    #    (assigned: true) and the second answer comes from the cache, so the hook is called once.
     ...
     print(
         json.dumps(
@@ -387,15 +451,23 @@ stickiness is the server's and not the client cache's:
                 "flag": {"enabled": flag.enabled},
                 "track": {"ok": True},
                 "fanout": {"ok": True},
+                "event_id": {"user_id": user_id, "event_name": dedup_name, "id": dedup_id, "sends": 2},
+                "exposure": {
+                    ...
+                },
             },
             separators=(",", ":"),
         )
     )
 ```
 
-Step 4 depends on step 1 and 2 having populated the cache — the smoke tests the fan-out rule
-in the only way it can be tested: by tracking after assigning. A smoke that tracked first
-would send nothing and (correctly) report `False`.
+Step 4 depends on step 1 and 2 having answered the user — the smoke tests the fan-out rule
+in the only way it can be tested: by tracking after assigning. And its comment records a
+lesson about the smoke itself. When the fan-out changed (Hour 3), `track()` returning `True`
+stopped proving anything: an unattributed event sent with no key is also `True`. So the smoke
+wraps its transport in a recorder and checks the request itself — one `/batch`, the experiment
+then the flag, every entry stored. A test whose evidence is a boolean the code under test
+computes is only as good as that boolean's definition, and definitions change.
 
 The runner's manifest — one shell command and its required executables per SDK, with
 comments where a runtime needed a trick:
@@ -452,7 +524,7 @@ The validation — every field the JSON must carry, with the reason each one exi
 # 📁 tests/sdk-contract/live/run_live_contract.py
 EXPECTED_VARIANTS = {"control", "treatment"}
 ...
-def validate(sdk: str, payload: dict) -> list[str]:
+def validate(sdk: str, payload: dict, experiment_key: str = "sdk_contract_ab") -> list[str]:
     problems: list[str] = []
     if payload.get("sdk") != sdk:
         problems.append(f"sdk field is {payload.get('sdk')!r}, expected {sdk!r}")
@@ -470,13 +542,32 @@ def validate(sdk: str, payload: dict) -> list[str]:
         problems.append("track failed")
     if (payload.get("fanout") or {}).get("ok") is not True:
         problems.append("fan-out track failed")
+    problems.extend(_exposure_problems(sdk, payload, experiment_key))
+    problems.extend(_targeting_problems(sdk, payload))
+    problems.extend(_event_id_problems(sdk, payload))
+    return problems
+
+
+def _event_id_problems(sdk: str, payload: dict) -> list[str]:
+    """What is wrong with the smoke's ``event_id`` report (see ``EVENT_ID_SDKS``)."""
+    if sdk not in EVENT_ID_SDKS:
+        return [f"event_id reported but {sdk} is not in EVENT_ID_SDKS"] if "event_id" in payload else []
+    report = payload.get("event_id")
+    if not isinstance(report, dict):
+        return [f"event_id missing ({sdk} is in EVENT_ID_SDKS)"]
+    ...
+    sends = report.get("sends")
+    if type(sends) is not int or sends != 2:  # JSON true and 2.0 are not a count of 2
+        problems.append(f"event_id.sends={sends!r} (the same event is to be sent twice)")
     return problems
 ```
 
 `is_control` must be a _bool_ — a port that serialised it as `"false"` would fail here, which
 is a real class of bug in string-typed languages. `flag.enabled` must be `True` because the
 seeded flag is at 100%: the harness tests the flag path end to end, not just that a response
-came back.
+came back. And `type(sends) is not int` is the same care one level down: in Python
+`True == 1` and `2.0 == 2`, so a port that reported `true` or `2.0` would pass an equality
+test it should fail.
 
 And the run: last stdout line only (build tools chatter before it), stderr's last line as
 the failure detail, a per-SDK timeout that includes builds. The subprocess part lives in
@@ -512,11 +603,17 @@ def run_one(sdk: str, command: str, env: dict[str, str], timeout: int) -> tuple[
     status, detail, payload = _run_command(command, env, timeout)
     if status != "PASS":
         return status, detail
-    problems = validate(sdk, payload)
+    problems = validate(sdk, payload, env["CONTRACT_EXPERIMENT_KEY"])
+    if not problems:
+        problems = _stored_once_problems(sdk, payload)
     if problems:
         return "FAIL", "; ".join(problems)
     return "PASS", f"{payload['assign']['variant_name']} in {detail}"
 ```
+
+`_stored_once_problems` is the database half of the event-id check: the smoke says it sent
+the event twice, and only the `events` table can say whether the server stored it once. Where
+the database can answer, the runner asks it rather than taking the smoke's word.
 
 The fixtures come from one seed script — an ACTIVE experiment `sdk_contract_ab` with
 control/treatment, an ACTIVE flag `sdk_contract_flag` at 100%, and two API keys: a plain one
@@ -566,7 +663,10 @@ _failure_ (someone broke the runner image), but only the SDKs the image can run 
 so Flutter, Elixir and iOS don't produce permanent red. That list is thirteen of the sixteen
 SDKs. The job is a required check, `SDK Live Contract / sdk-live-contract (core)`; on a
 docs-only change the caller still runs and `skip` turns every step into a no-op, because a
-skipped caller would never report the required name at all.
+skipped caller would never report the required name at all. The same job has a second step,
+for this suite only: it installs and builds `sdk/mcp` and runs
+`tests/mcp-contract/run_mcp_contract.py` against the API the job booted (Hour 8 describes what
+it checks).
 
 > **Watch Out!** The smoke uses a fresh random `user_id` per run (`smoke-<uuid>`) so runs
 > don't inherit stickiness from each other — a rerun with the same user would pass the
@@ -592,15 +692,23 @@ python tests/sdk-contract/live/run_live_contract.py --sdk python --sdk js --sdk 
 # PASS go                   treatment in 1.8s
 # PASS python (local)       … local evaluations, 0 evaluate calls; denominator +…, errors +…, error rate …
 # PASS js (local)           …
+# PASS python 0.2.0 (published, local)   …
+# PASS js 0.2.0 (published, local)       …
 ```
 
-(Timings, variants and counts vary per run; the shape is what matters.)
+(Timings, variants and counts vary per run; the shape is what matters. The last two rows
+download the published releases, so they need the network.)
 
 Then break the contract deliberately: in the backend, rename `variant_name` to
 `variantName` in the assign response schema, restart, and rerun — every SDK fails with
 "assign.variant_name=None" while every SDK unit suite stays green. Revert. Then pause the
-experiment in the dashboard and rerun: "assign failed: … HTTP 404" — the smoke checks that
-the fixture is what the seed promised.
+experiment in the dashboard, and _before_ you rerun, predict which rows go red. Nothing in
+the assign path fails any more (a paused experiment answers 200 with control, Hour 1), so the
+answer is in each smoke. Two hints from code you have read: the Python smoke requires the
+key-less batch to carry the experiment and then the flag, and the 24-hour record skips an
+experiment whose latest answer was `paused`; a paused experiment records no exposure, so an
+SDK in `EXPOSURE_SDKS` cannot report one. A port that fans out over its cache and has no
+exposure hook has neither check. Run it, compare, and resume the experiment.
 
 ### Key takeaways
 
@@ -608,10 +716,13 @@ the fixture is what the seed promised.
   server-side stickiness, one JSON line, exit code.
 - The runner: manifest of commands + toolchains, health check, seeded key, last-line JSON,
   `validate()` on every field (including `is_control` being a bool), PASS/FAIL/SKIP.
-- The runner also checks the ruleset endpoint (403 / 200 / 304) and, for JS and Python,
-  that local evaluations reached the safety denominator and made no evaluate calls.
+- The runner also checks the ruleset endpoint (403 / 200 / 304); the exposure hook, the
+  attributes and the event id for the SDKs listed as having them, in both directions, with the
+  event id counted in the database; the React bootstrap; and, for JS and Python, that local
+  evaluations reached the safety denominator and that the published releases follow a kill
+  switch.
 - CI: the reusable `_platform.yml` boots the stack and seeds it; `--strict` with an explicit
-  list of 13 SDKs. Required on every PR.
+  list of 13 SDKs, then the MCP server's contract suite. Required on every PR.
 - This is the test that catches "green unit tests, wrong endpoint."
 
 ---
@@ -630,7 +741,7 @@ making one, and a **release path** that ships one SDK at a time.
 ### How Controlvar does it
 
 **What each SDK has been run against.** There are three levels of proof, and the strongest
-one is written in a workflow, not in a document. Read it from the code at v0.36.4:
+one is written in a workflow, not in a document. Read it from the code at the pin:
 
 | SDK | Live contract in CI (`pr-qa-gate.yml`) | Golden vectors (`hash_contract.py`) | Local mode |
 |---|---|---|---|
@@ -654,18 +765,22 @@ one is written in a workflow, not in a document. Read it from the code at v0.36.
 Thirteen of the sixteen run against a live backend on every pull request. The other three are
 exercised by their unit suites in the SDK unit-test workflow, and by the harness on any
 machine that has their toolchain (`--sdk ios`, `--sdk elixir`, `--sdk flutter`). The runner's
-`SKIP` status exists so that "not run here" is never misreported as "passing".
+`SKIP` status exists so that "not run here" is never misreported as "passing". The MCP
+server is not in the table: it is not an SDK, has no `contract_smoke`, and is checked by its
+own contract suite in the same job (Hours 8 and 11).
 
 The prose status table in the app's `docs/sdk-guide.md` is the second copy of this fact. It
 has drifted before — when Android and React Native joined the CI job, the table kept calling
-them "not yet" and "unit tests only" — and at v0.36.4 it agrees with the workflow again
-(Exercise E4.4 is the script that checks). When the document and the workflow disagree, the
-workflow is what ran.
+them "not yet" and "unit tests only" — and at the pin it agrees with the workflow (Exercise
+E4.4 is the script that checks). When the document and the workflow disagree, the workflow is
+what ran.
 
 **What counts as a contract change.** Anything an SDK unit test would have to change to stay
 green: a field name or type in any of the four responses; a status code's meaning (404 vs
 200-with-reason); the query/body encoding of `context`; the batch limit; a header. For local
-evaluation, also: the ruleset's `schema` integer, its `bucketing` name, and the operator list.
+evaluation, also: the ruleset's `schema` integer, its `bucketing` name, the operator list,
+and any flag entry a _published_ release cannot read — the subject of the last section of this
+Hour.
 Things that are _not_ contract changes: adding an optional response field (SDKs ignore
 unknown fields — the Python client reads with `.get`, the JS client with `data?.field`);
 adding a new `reason` value (SDKs pass it through as a string); changing rate limits (SDKs
@@ -675,7 +790,17 @@ already handle 429).
 (the server added them, old SDKs ignored them, the JavaScript and Python SDKs started
 reading them — and, being careful, read a _missing_ field as "unknown" rather than `false`).
 The other ports have not followed yet, which is what "port to the rest" in step 4 below
-looks like while it is still in progress.
+looks like while it is still in progress. Flag values are the second worked example, done at
+three layers at once: `value` and `value_type` added beside `config` on the evaluate answer,
+`value_type` / `on_value` / `off_value` added to the ruleset entries (and only to value flags,
+so a deployment without them serves the same bytes), and `expected_value` added beside
+`expected` in the corpus. At every layer an old reader sees nothing it does not know.
+
+And there is a subtler kind: a change of _meaning_ that needs no client change. Answering a
+paused experiment with 200 instead of 404 (#1362) changed what a status code means, which the
+list above calls a contract change. It shipped without an SDK release because the new answer
+was one every SDK already handled: `assigned: false` with the control variant. Before you
+call a change breaking, check whether the clients already have a path for the new answer.
 
 **The order of operations** for a real contract change, derived from how the rewiring was
 done:
@@ -749,9 +874,11 @@ ECOSYSTEMS: dict[str, str] = {
     "openfeature": "npm",
     "react": "npm",
     "react-native": "npm",
+    # The MCP server, @controlvar/mcp-server: not an SDK, released the same way.
+    "mcp": "npm",
     "go": "tag-only",
-    "java": "unwired",
-    "dotnet": "unwired",
+    "java": "maven",
+    "dotnet": "nuget",
     "ruby": "unwired",
     "php": "unwired",
     "elixir": "unwired",
@@ -761,44 +888,165 @@ ECOSYSTEMS: dict[str, str] = {
 }
 ```
 
-`pypi` and `npm` SDKs are built, tested and published by **trusted publishing** — OpenID
-Connect from the workflow, no long-lived token in any secret — from an `sdk-release`
-environment; npm packages are published with provenance. Go has nothing to upload: the tag
-_is_ the release, because `go get` resolves it. An `unwired` SDK has a real manifest but no
-publishing identity yet, so tagging one is **refused** rather than going green having
-published nothing.
+`pypi`, `npm` and `nuget` SDKs are built, tested and published by **trusted publishing** —
+OpenID Connect from the workflow, no long-lived token in any secret — from an `sdk-release`
+environment; npm packages are published with provenance. NuGet's form of it exchanges the
+workflow's OIDC token for an API key that lives about an hour. Maven Central has no trusted
+publishing, so `maven` is the one ecosystem with secrets (a Central user token and a GPG
+signing key, read only by the `maven` job), and the workflow stops short: it signs the bundle,
+uploads it to the Central Portal for validation only, waits until Central calls it
+`VALIDATED`, and leaves the final **Publish** to a person. Go has nothing to upload: the tag
+_is_ the release, because `go get` resolves it through the module proxy. An `unwired` SDK has
+a real manifest but no publishing identity yet, so tagging one is **refused** rather than
+going green having published nothing.
 
-The registry names and the versions in the manifests at v0.36.4:
+Every registry gets the same two-job shape. A build job (`npm-build`, `pypi-build`,
+`maven-build`, `nuget-build`) installs, tests and builds, and can read no secret and request no
+OIDC token; a publish job holds the environment, has no checkout, installs nothing from the
+repository, and checks the package it was handed against the tag before uploading it. So code
+from the repository never runs where the credential is, and a human approval on the
+environment, if the repository configures one, is asked for only after the tests have passed.
 
-| Directory | Registry name | Manifest version |
+What the registries serve, read from each registry's own index on 7 November 2026:
+
+| Directory | Registry name | Published |
 |---|---|---|
-| `sdk/js` | npm `@controlvar/js-sdk` | 0.1.1 |
-| `sdk/react` | npm `@controlvar/react-sdk` | 1.1.0 |
-| `sdk/edge` | npm `@controlvar/edge-sdk` | 0.2.0 |
+| `sdk/js` | npm `@controlvar/js-sdk` | 0.1.1, 0.2.0, 0.3.0 |
+| `sdk/python` | PyPI `controlvar` (imported as `controlvar`) | 0.1.1, 0.2.0, 0.3.0 |
+| `sdk/react` | npm `@controlvar/react-sdk` | 0.1.0 |
 | `sdk/react-native` | npm `@controlvar/react-native-sdk` | 0.1.0 |
 | `sdk/openfeature` | npm `@controlvar/openfeature-provider` | 0.1.0 |
-| `sdk/python` | PyPI `controlvar` (imported as `controlvar`) | 0.1.1 |
 | `sdk/openfeature-python` | PyPI `controlvar-openfeature` | 0.1.0 |
-| `sdk/go` | module `github.com/controlvar/controlvar/sdk/go` | the tag |
+| `sdk/go` | module `github.com/controlvar/controlvar/sdk/go` (proxy.golang.org) | v0.1.0 |
+| `sdk/dotnet` | NuGet `Controlvar.SDK` | 0.1.0 |
+| `sdk/java` | Maven Central `com.controlvar:controlvar-sdk` and `controlvar-spring-boot-starter` | 0.1.0 |
+| `sdk/mcp` | npm `@controlvar/mcp-server` (not an SDK) | 0.1.0 |
+| `sdk/edge` | npm `@controlvar/edge-sdk` | not published (the manifest says 0.2.0) |
 
-**Two of the sixteen are published.** At v0.36.4 the repository carries release tags
-of the form above for Python (0.1.0 and 0.1.1) and JavaScript (0.1.1), and the app's SDK guide says
-the two reference SDKs are on their registries (beta): `pip install controlvar==0.1.1` and
-`npm install @controlvar/js-sdk@0.1.1`. Every other SDK page says "Not yet published" and
-gives a from-source route instead (the Python OpenFeature name, `controlvar-openfeature`,
-holds only a `0.0.0` placeholder that contains no client). If you installed the package under
-its old name, `experimently`, uninstall it first. To work on the references themselves:
+**Nine of the sixteen are published, plus the MCP server.** The rest — edge, Ruby, PHP,
+Elixir, Flutter, Android, iOS — install from a clone. (The npm packages also list
+`0.0.0-stage` and `0.0.1-stage` versions, and both PyPI names a `0.0.0` placeholder, all
+uploaded before each package's first real release.) Two version histories are worth reading.
+The React SDK's manifest said 1.1.0 while nothing was published, and was set to 0.1.0 for its
+first release (#1631), so its first real release is 0.1.0, not a 1.x. And the
+Python SDK's first tag, 0.1.0, has no release on PyPI at all: the first published version is
+0.1.1. A tag is a statement about the repository; only the registry says what users can
+install. The app's own pages at the pin
+still describe several of these packages as installed from a clone; when a page and the
+registry disagree, the registry is what users get. If you installed the package under its old
+name, `experimently`, uninstall it first. To work on the references themselves:
 
 ```bash
 # Python: editable install from a clone
 pip install -e sdk/python
 # JavaScript: build and pack, then install the tarball in your app
-cd sdk/js && npm ci && npm run build && npm pack      # writes controlvar-js-sdk-0.1.1.tgz
+cd sdk/js && npm ci && npm run build && npm pack      # writes controlvar-js-sdk-0.3.0.tgz
 ```
 
 The first publish of each package is an irreversible act — a version number on PyPI or npm can
 never be reused — so it is done by a maintainer, by hand, once the registry has been told to
 trust the workflow. Nothing in this book asks you to publish.
+
+**Releases you cannot take back.** Publishing makes the most important compatibility
+question a question about code you can no longer change. A server-side process running
+`controlvar` 0.2.0 in local mode will download whatever ruleset this server sends next, for as
+long as it runs. If 0.2.0 cannot read it, it does not fail loudly: it keeps the last ruleset it
+could read, and a later kill switch never reaches it (Hour 3). Nothing on the server would
+show it. So the repository pins every published release that evaluates locally, and tests the
+_published bytes_, not the source:
+
+```json
+// 📁 tests/sdk-contract/published-sdks.json
+    {
+      "language": "js",
+      "registry": "npm",
+      "package": "@controlvar/js-sdk",
+      "version": "0.2.0",
+      "url": "https://registry.npmjs.org/@controlvar/js-sdk/-/js-sdk-0.2.0.tgz",
+      "digest": "sha512-S+0A9KtNSuYkGO6Ae9+nw5rbLvdZVLbZl9V+txGFoWSQEHii70vXwzr8BYGIxnkaK3aInXzErSjJ2dJnKZV98Q==",
+      "expectation": "accepted"
+    },
+```
+
+Three checks read that file, at three distances from the server:
+
+- **G1**, `tests/sdk-contract/test_published_ruleset.py`, in the `SDK Contract Tests` job of
+  every pull request that is not docs-only: each pinned release is downloaded, its digest
+  checked _before_ anything
+  is unpacked, only the evaluator's own files extracted (an archive with an absolute path, a
+  `..` or a link is refused whole), and run in its own process — under node, or under
+  `python -I -S` so no installed copy can be imported instead — against the ruleset in
+  `ruleset-vectors.json`. It must load it, answer every `must_local` case exactly as the
+  server does, and follow a kill switch sent afterwards. `expectation` says what is required:
+  `accepted`, or `format-refused` (the release hands every flag to the server), and the file
+  says that changing it "is a decision, not a fix".
+- **G2**, an integration test, feeds the Python releases the route's own bytes.
+- **G3**, the `PUBLISHED_LOCAL` rows of the live harness (Hour 11), runs the releases against a
+  real server and turns real flags off.
+
+Then the gate tests itself. Eight self-tests, P1 to P8, plant a defect into the inputs on every
+run and assert that the gate fails with the right words. P1 is the failure the gate exists
+for:
+
+```python
+# 📁 tests/sdk-contract/test_published_ruleset.py
+@regression
+def test_p1_an_unknown_evaluation_freezes_the_evaluator(artefact, unpacked, tmp_path):
+    """The failure the gate exists for: one flag the release cannot read, and
+    it keeps its old ruleset, kill switch included."""
+    extraction, root = unpacked
+    planted = {"key": "zz-planted", "active": True, "evaluation": "local_v2"}
+    vectors, path = _planted(tmp_path, _append(planted))
+    report = _run(artefact, root, tmp_path, path)
+    with pytest.raises(ps.GateError) as failure:
+        ps.check_report(artefact, extraction, report, vectors)
+    text = str(failure.value)
+    assert f"{artefact.label} kept ruleset 'gate-baseline'" in text
+    assert "The flag ruleset is malformed" in text
+    assert "flags it cannot read: ['zz-planted']" in text
+    assert 'gate-sentinel still answers {enabled: true, reason: "rollout"}' in text
+```
+
+One flag with an `evaluation` the release has never heard of, and 0.1.1 and 0.2.0 drop the
+whole document and keep answering from the old one. 0.3.0 changed that rule (Hour 3): it
+defers such a flag to the server on its own and keeps the rest of the ruleset. Its evaluator
+says why: "A newer server can therefore add a flag shape without stopping local evaluation for
+every other flag." Which has a consequence for the gate. Against 0.3.0, P1's
+plant no longer freezes anything, the gate has nothing to catch, and P1 — which asserts that
+the gate catches it — goes red for the wrong reason. The change that pins 0.3.0 (#1801, open
+at this book's pin) therefore moves P1's plant to a _malformed known shape_ — a string
+`rollout_percentage`, which every release, 0.3.0 included, still refuses whole — and renames
+it `test_p1_a_malformed_flag_freezes_the_evaluator`, with its four assertions unchanged. When
+the system under test improves, a planted defect has to be re-chosen so that it still
+exercises the gate.
+
+The last piece closes the loop with the registries. `tests/sdk-contract/published_versions_check.py`
+lists every version of `@controlvar/js-sdk` and `controlvar` from the registries' own JSON,
+downloads each file (checking the registry's digest), and classifies it by its member _names_
+alone — nothing is extracted, nothing imported. The versions that ship a local evaluator must
+be exactly the pinned ones:
+
+```python
+# 📁 tests/sdk-contract/published_versions_check.py
+#: A member name that means "this file ships a local evaluator".
+LOCAL_EVALUATOR = {
+    "npm": re.compile(r"package/(?:[^/]{1,100}/){0,8}local\.(?:js|cjs|mjs)"),
+    "pypi": re.compile(r"(?:[^/]{1,100}/){0,8}controlvar/local\.py"),
+}
+```
+
+It runs in nightly-qa and in rc-evidence at a release tag, and deliberately never on a pull
+request, because a publish would otherwise turn every open pull request red until the pull
+request pinning it lands. Run at this book's pin, the day after 0.3.0 was published, it does
+what it is for:
+
+```text
+FAIL: @controlvar/js-sdk 0.3.0 (npm) ships a local evaluator (package/dist/local.js) and is not in the gate: pin it in tests/sdk-contract/published-sdks.json
+FAIL: controlvar 0.3.0 (pypi) ships a local evaluator (controlvar/local.py) and is not in the gate: pin it in tests/sdk-contract/published-sdks.json
+```
+
+A release with an evaluator nobody tests is the gap; the check turns it into a red line with
+the fix in it.
 
 > **By the Way** — the golden-vector job and the live-contract job are _both_ in the PR gate
 > because they fail for different reasons. A hash change fails offline in seconds and points
@@ -830,10 +1078,18 @@ response is being renamed to `variant_config`:
 Then dry-run a release without publishing anything:
 
 ```bash
-python scripts/check_sdk_version.py js                       # prints the manifest version
+python scripts/check_sdk_version.py js                       # sdk/js: @controlvar/js-sdk 0.3.0 (npm)
 python scripts/check_sdk_version.py js --expect 9.9.9        # refused: the tag would not match
-python scripts/check_sdk_version.py java --expect 1.0.0      # refused: java has no publishing identity yet
+python scripts/check_sdk_version.py java --expect 1.0.0      # refused: the manifest says 0.1.0 (maven)
+python scripts/check_sdk_version.py ruby --expect 0.2.0      # refused: ruby has no publishing identity yet
+python scripts/check_sdk_version.py go                       # published by tag alone (no registry upload)
+python tests/sdk-contract/published_versions_check.py        # needs the network; at the pin, two FAIL lines
 ```
+
+The Java line used to be the example of an unwired SDK; since Java was wired to Maven Central
+it is refused for the ordinary reason, a version that does not match. Both refusals exit 1
+and print one `error:` line that says what to change. (`check_sdk_version.py` reads
+`pyproject.toml` with `tomllib`, so it needs Python 3.11.)
 
 ### Key takeaways
 
@@ -844,9 +1100,14 @@ python scripts/check_sdk_version.py java --expect 1.0.0      # refused: java has
 - Order: server additively → reference SDKs + tests → smoke → ports (issues for the rest) →
   deprecate, then remove (as #345/#495 → #770 did) → `ENGINE_VERSION` if numbers changed
   meaning.
-- Releases: one tag per SDK (`sdk/<name>/vX.Y.Z`), trusted publishing for PyPI and npm, Go by
-  tag, everything else refused until wired. At v0.36.4 the Python and JavaScript SDKs are
-  published; install the rest from source.
+- Releases: one tag per SDK (`sdk/<name>/vX.Y.Z`), trusted publishing for PyPI, npm and
+  NuGet, Maven Central validated by the workflow and published by a person, Go by tag,
+  everything else refused until wired. Nine SDKs and the MCP server are on their registries;
+  install the rest from source.
+- Every published release with a local evaluator is pinned by URL and digest and tested as
+  published bytes against the server's ruleset on every non-docs pull request; a nightly
+  check fails when a registry holds one that is not pinned; the gate's own self-tests are
+  re-chosen when the SDK improves.
 - Keep policy on the server; the SDK stays a cache in front of four calls.
 
 ---
@@ -889,6 +1150,21 @@ The release workflow's first job refuses it: Ruby is `unwired` in
 tested and published nothing would otherwise go green. Wiring Ruby means registering the
 account and moving it out of `unwired` in the same change.
 
+**Q8. The Java manifest is bumped to 0.2.0 and the Java SDK's release tag for 0.2.0 is
+pushed. When is 0.2.0 on Maven Central?**
+Not when the workflow goes green. `maven-build` tests and builds the bundle with no
+credentials; `maven` signs it, uploads it to the Central Portal for validation only, and waits
+until Central calls it `VALIDATED`. A person then presses Publish in the Central Portal (or
+Drop). The irreversible step is left to a human on purpose, in the one ecosystem with no
+trusted publishing.
+
+**Q9. Why is `published_versions_check.py` not a pull-request check, when it guards something
+that important?**
+Because what it checks changes outside the repository. A publish to npm or PyPI would turn
+every open pull request red at once, for a reason none of them caused, until the pull request
+that pins the new release lands. It runs nightly and at a release tag instead, where a red
+line means "pin the release" and nothing else.
+
 **Quiz.** A PR edits `pr-qa-gate.yml` to drop `dotnet` from the `sdks:` list "because the .NET
 setup step is slow." What else must the PR change, and what should the reviewer ask?
 → Every document that says .NET is verified in CI (the SDK guide's table, this book's Hour 12
@@ -914,7 +1190,7 @@ harness; read the failure line; then read the backend log for the corresponding 
 
 **E4.4 — Status hygiene.** Write a tiny script that parses the `sdks:` list out of
 `pr-qa-gate.yml` and the "Verified live" column out of `docs/sdk-guide.md`, and fails if
-the two disagree in either direction. Run it at v0.36.4 and read what it finds.
+the two disagree in either direction. Run it at the book's pin and read what it finds.
 Propose where in CI it would run.
 
 **E4.5 — Change plan.** Write the six-step order-of-operations plan for adding a new
@@ -961,9 +1237,10 @@ print("CI runs, the guide does not claim:", sorted(ci - claimed))
 print("the guide claims, CI does not run:", sorted(claimed - ci))
 ```
 
-At v0.36.4 both lists come back empty: the guide and the workflow agree, and that is the
+At the pin both lists come back empty: the guide and the workflow agree, and that is the
 state the script exists to protect. (Check that the script is not vacuous before trusting a
-clean result — it should have parsed 16 rows and 13 CI names — and plant a disagreement,
+clean result — it should have parsed 17 rows, the sixteen SDKs and the MCP server, whose
+"no" is correctly not a claim, and 13 CI names — and plant a disagreement,
 such as deleting `dotnet` from the `sdks:` list, to watch both lines fire. The guide's
 `openfeature-python` row uses the same directory name as the job, so names match without a
 translation table.) Run it as a step in the

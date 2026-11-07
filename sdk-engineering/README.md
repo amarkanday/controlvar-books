@@ -13,11 +13,16 @@
 > and it has a second act: the server then adopted the SDKs' hash for experiment assignment,
 > deleted the second decider that disagreed with both, and the JavaScript and Python SDKs
 > gained an opt-in local flag evaluation mode that reproduces the server's answer from the
-> server's own ruleset or asks. The book covers what the contract is and why "the server
+> server's own ruleset or asks. A third act is under way as you read: flags that serve
+> values, an exposure hook, event ids the server deduplicates, and the first releases on npm,
+> PyPI, NuGet, Maven Central and the Go module proxy, which turned "is the server compatible
+> with the SDK?" into "is the server compatible with every SDK release already installed?".
+> The book covers what the contract is and why "the server
 > decides" is its first rule; how a client is built so that it is fast, safe and honest
 > about failure; how the same design is ported across languages without drifting; and how you
 > _prove_ sixteen implementations agree — golden vectors offline, a generated corpus for local
-> evaluation, a live harness in CI, and two demo apps that consume the React SDK from source.
+> evaluation, the published releases tested as published, a live harness in CI, and two demo
+> apps that consume the React SDK from source.
 >
 > Controlvar was called Experimently before 0.35.0; you will still meet the old name in some
 > identifiers (an environment-variable fallback, a decoy value in the live harness).
@@ -44,9 +49,9 @@ user-facing reference this book explains is in the app repository: `docs/sdk-gui
 one page per SDK under `docs/sdk/` (including `docs/sdk/local-evaluation.md`).
 
 > **Convention in this book.** Blocks tagged `# 📁 path` are real Controlvar source at
-> v0.36.4; blocks with no path are illustrative. `# ✅` marks the idiom and `# ❌` the
-> anti-pattern it replaces. Keep a clone of
-> [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar) at `v0.36.4` open beside
+> the commit named in "A note on accuracy" below (the book's _pin_); blocks with no path are
+> illustrative. `# ✅` marks the idiom and `# ❌` the anti-pattern it replaces. Keep a clone of
+> [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar) at the pin open beside
 > the book.
 
 > **The one idea to anchor on:** an SDK is a **cache in front of four HTTP calls** plus a
@@ -76,14 +81,14 @@ one page per SDK under `docs/sdk/` (including `docs/sdk/local-evaluation.md`).
 ### Part III — Sixteen SDKs _(Hours 7–9)_ → [`part-3-sixteen-sdks.md`](./part-3-sixteen-sdks.md)
 
 - **Hour 7** — Porting the design: Go, Java + Spring Boot, Swift, Kotlin, Ruby, PHP, .NET, Elixir, Flutter
-- **Hour 8** — Standards and edges: OpenFeature providers, the edge runtime client, React Native
+- **Hour 8** — Standards and edges: OpenFeature providers, the edge runtime client, React Native (and the MCP server, which is not an SDK)
 - **Hour 9** — Case study: two deciders, four hashes, and how the drift was closed
 
 ### Part IV — Proving Agreement _(Hours 10–12)_ → [`part-4-proving-agreement.md`](./part-4-proving-agreement.md)
 
 - **Hour 10** — Unit testing a client: fake transports and recorded requests
 - **Hour 11** — The live contract harness: `contract_smoke`, the runner, and the CI job
-- **Hour 12** — Status, drift, change management and releases: how to change a contract sixteen clients depend on
+- **Hour 12** — Status, drift, change management and releases: how to change a contract sixteen clients depend on, and every release already installed
 
 ---
 
@@ -100,24 +105,32 @@ _Turn to [Part I](./part-1-the-contract.md). 🔌_
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`). Every snippet tagged `# 📁` was re-copied
-from the file at that tag; where a snippet leaves lines out it says so with `...`. The counts
-were measured there: the Python SDK's suite (210 tests, run with `pytest`) and the JavaScript
-SDK's suite (205 tests, run with `npx jest`) were run for this edition, as were the Hour 1–3
-Python examples that use `FakeTransport`, the hash arithmetic (buckets 69 and 79), the
-agreement rate between the API and the undeployed Lambda hasher (0.4996 over 10,000 users),
-`scripts/check_sdk_version.py`, and the Exercise E4.4 script. Not run for this edition: the
-live harness against a backend (it needs PostgreSQL, Redis and the API), the Go, Java, Swift,
-Kotlin, Ruby, PHP, .NET, Elixir and Flutter suites, the edge, React Native and OpenFeature
-suites, the ShopLab demo, and the CI workflows themselves; for those the book quotes the code
-and the workflow files, not a run. Files move; if a path 404s, `git grep` the symbol. To
-re-check a claim yourself, clone the repository, check out `v0.36.4`, and use the commands in
-the Try-It sections.
+Verified against Controlvar `09d815ea` (main on 6 November 2026: the platform after 0.43.2,
+with the JavaScript and Python SDKs at 0.3.0). Every snippet tagged `# 📁` was re-copied from
+the file at that commit, and every quoted line was checked to occur in it; where a snippet
+leaves lines out it says so with `...`. What the registries serve was read from each
+registry's own index on 7 November 2026. The counts were measured at the pin: the Python
+SDK's suite (469 tests, run with `pytest`), the JavaScript SDK's suite (410 tests, run with
+`npx jest`) and `pytest tests/sdk-contract` (84 tests, which download the pinned published
+releases) were run for this edition, as were the Hour 3 `FakeTransport` transcript (with
+`python -m doctest`), the Python solutions S1.3 to S1.5, the hash arithmetic (buckets 69 and
+79), the agreement rate between the API and the undeployed Lambda hasher (0.4996 over 10,000
+users),
+`scripts/check_sdk_version.py`, `tests/sdk-contract/published_versions_check.py`, and the
+Exercise E4.4 script. The Hour 4, 5 and 8 transcripts were run offline, against the SDKs built
+from the pin with a fake transport or `fetch` answering as the seeded server does, not against
+a server. Not run for this edition: the live harness against a backend (it needs PostgreSQL,
+Redis and the API), the MCP server's contract suite, the Go, Java, Swift, Kotlin, Ruby, PHP,
+.NET, Elixir and Flutter suites, the edge, React, React Native and OpenFeature suites, the
+ShopLab demo, and the CI workflows themselves; for those the book quotes the code and the
+workflow files, not a run. Files move; if a path 404s, `git grep` the symbol. To re-check a
+claim yourself, clone the repository, check out the pin, and use the commands in the Try-It
+sections.
 
 ## Related reading — Production Engineering
 
-The Production Engineering specialization uses a newer, explicitly pinned app snapshot; this
-book retains its own reference tag. See that book's README for scope and verification.
+The Production Engineering specialization is pinned to an app snapshot of its own; this book
+keeps its own pin. See that book's README for scope and verification.
 
 - [Measurement and experiment design](../production-engineering/part-1-experiment-design.md#hour-1--measurement-and-experiment-design)
 - [Distributed correctness](../production-engineering/part-2-reliable-systems.md#hour-4--assignments-transactions-and-retries)
