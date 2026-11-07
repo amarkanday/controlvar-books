@@ -33,8 +33,9 @@
   especially the Build book's assignment-and-event loop, the API and the data model. Experienced engineers
   can jump to a lesson by task (see the table below) with a clone of the app open alongside. You need
   Python 3.11, a virtual environment with the app's `backend/requirements.txt`, and a clone of
-  `Controlvar/controlvar` at tag `v0.36.4`. No database, browser or cloud account is needed for the
-  hands-on blocks, which run real pieces of the backend in isolation.
+  `Controlvar/controlvar` checked out at this book's pin, commit `09d815ea` (`main` after v0.43.2). No
+  database, browser or cloud account is needed for the hands-on blocks, which run real pieces of the
+  backend in isolation.
 
 ## How to use this book
 
@@ -58,19 +59,21 @@ Along the way, sidebars flag a **By the Way** (context), a **Watch Out!** (a tra
 solutions.
 
 Two words are used with care throughout. **Implemented** means you can point at the line of code or the
-test at v0.36.4. **Recommended practice** means a procedure you must provide; the platform does not do it
+test at the pin. **Recommended practice** means a procedure you must provide; the platform does not do it
 for you. Illustrative scenarios and numbers are labelled as such. When a lesson says "nothing in the code
 does X", that is a statement about what was searched for and not found, and the lesson says what the search
 was.
 
-> **Convention in this book.** Blocks tagged `# 📁 path` are real Controlvar source at v0.36.4, copied from
-> the file at the path; read them against a checkout of the tag. Blocks with no path are illustrative or
-> are commands to type. A line of prose that starts "Expected result" is the output of running the block
-> above it on the tag with the safety environment variables set; a notice about unset Cognito settings may
-> also appear and can be ignored. Have the app clone open at `v0.36.4`, and a terminal in its root with the
-> virtual environment active. Controlvar was called Experimently before 0.35.0, so you will still meet the
-> old name in some identifiers (the advisory-lock namespace `experimently.scheduler.`, for one). They were
-> not renamed because renaming them would change behaviour.
+> **Convention in this book.** Blocks tagged `# 📁 path` are real Controlvar source at the book's *pin*,
+> commit `09d815ea`, copied from the file at the path; read them against a checkout of that commit. A
+> `...` line marks lines left out. Blocks with no path are illustrative or are commands to type. A line of
+> prose that starts "Expected result" is the output of running the block above it at the pin with the
+> safety environment variables set; a notice about unset Cognito settings may also appear and can be
+> ignored. Have the app clone open at `09d815ea`, and a terminal in its root with the virtual environment
+> active. When a lesson says a fix "shipped in" a version, that release is the first tag that contains
+> it. Controlvar was called Experimently before 0.35.0, so you will still meet the old name in some
+> identifiers (the advisory-lock namespace `experimently.scheduler.`, for one). They were not renamed
+> because renaming them would change behaviour.
 
 ## The one idea to anchor on
 
@@ -104,8 +107,8 @@ When you can answer those four for your own system, you are doing production eng
 
 ### Part II — Reliable Systems _(Hours 4–6)_ → [`part-2-reliable-systems.md`](./part-2-reliable-systems.md)
 
-- **Hour 4** — Assignments, transactions and retries: two requests, one user (ambiguous writes, batch results and retry policy)
-- **Hour 5** — Schedulers, replicas and stale state: five loops, one lock (advisory locks, run history, the cache that was deleted, SDK-held rulesets)
+- **Hour 4** — Assignments, transactions and retries: two requests, one user (ambiguous writes, the event id as an idempotency contract, batch results and retry policy)
+- **Hour 5** — Schedulers, replicas and stale state: five loops, one lock (advisory locks, run history, work kept off the event loop, the cache that was deleted, SDK-held rulesets)
 - **Hour 6** — Database evolution and performance: the previous release is still running (expand and contract, two heads, plans, connection budgets)
 
 ### Part III — Security and Privacy _(Hours 7–9)_ → [`part-3-security-and-privacy.md`](./part-3-security-and-privacy.md)
@@ -116,9 +119,9 @@ When you can answer those four for your own system, you are doing production eng
 
 ### Part IV — Safe Change _(Hours 10–12)_ → [`part-4-safe-change.md`](./part-4-safe-change.md)
 
-- **Hour 10** — The feature-flag lifecycle: the kill switch that was not (status, targeting, rollback, archive and retirement)
+- **Hour 10** — The feature-flag lifecycle: the kill switch that was not (status, targeting, rollback, how long "off" takes to arrive, archive, delete and retirement)
 - **Hour 11** — Changing Controlvar safely: the owner's name (a real change across storage, API, dashboard, contract and profiles)
-- **Hour 12** — A release review from evidence to decision: the test that could not fail (verified, failed, unverified; recovery; handoff)
+- **Hour 12** — A release review from evidence to decision: the test that could not fail (verified, failed, unverified; a capacity claim's method; recovery; handoff)
 
 ---
 
@@ -151,25 +154,35 @@ _Turn to [Part I](./part-1-experiment-design.md)._
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`).
+Verified against Controlvar `main` at `09d815ea` (6 November 2026: the platform after v0.43.2, with the
+JavaScript and Python SDKs at 0.3.0). The previous edition was verified against v0.36.4; the lessons that
+changed most are Hour 4 (the event id), Hour 5 (tick work off the event loop), Hour 7 (a second enforced
+scope, and custom grants), Hour 10 (how long "off" takes, and what archived and deleted flags answer) and
+Hour 12 (the scale-evidence method).
 
-**What was run.** Every "Try It Yourself" block that says it needs no database was run on the tag, from a
-clean clone, in a fresh virtual environment with `backend/requirements.txt` installed and the backend's
-database and cache addresses pointed at a closed local port, and its output is the output shown. Existing
-tests named in the lessons were run on the tag and passed: the SDK-scope and flag-mutation inventories,
-the API-key scope rules, the flag-cache guard, the exception-text guard, the OpenAPI snapshot check, the
-sample-ratio and automatic-rollback-default tests, and the Python SDK's transport and client tests. The two
-planted-defect exercises (the flag-cache guard and the scope inventory) were run and failed as described.
+**What was run.** Every "Try It Yourself" block that says it needs no database was run at the pin, from a
+fresh clone, with `backend/requirements.txt` installed and the backend's database and cache addresses
+pointed at a closed local port, and its output is the output shown. Existing tests named in the lessons
+were run at the pin and passed: the SDK-scope and flag-mutation inventories with the API-key scope rules
+(55), the flag-cache guard (4), the event-key vectors and `event_id` input rules (61), the Python SDK's
+transport and client tests (217), the automatic-rollback default with the kill-switch numbers (51), the
+scale method's unit tests (274), the exception-text guard with the OpenAPI snapshot check (37) and the
+sample-ratio tests (34). The two planted-defect exercises (the flag-cache guard and the scope
+inventory) were run and failed as described. Every line of every tagged excerpt was checked to occur in
+its file at the pin.
 
 **What was not run.** Anything that needs PostgreSQL or Redis (the scheduler-lock tests, the concurrent
-first-assignment test, the migration transition tests, a real `EXPLAIN ANALYZE`), the commands that assume
-the Quick Start stack, any paid provider call, and anything that touches a cloud account. Those lessons
-read the test or the document instead and say so. Two claims are searches rather than runs: that nothing
-reads `retention_expires_at`, and that the results path has no attribution-window setting. The lessons give
-the search so you can repeat it.
+first-assignment test, the duplicate-event integration tests including the two-connection claim, the
+migration transition tests, the overload regression test, a real `EXPLAIN ANALYZE`), the scale harness
+itself (it needs Docker, k6 and a hosted runner), the commands that assume the Quick Start stack, any paid
+provider call, and anything that touches a cloud account. Those lessons read the test or the document
+instead and say so. The kill-switch timings in Hour 10 are the app's documented defaults, read from its
+page and pinned by its test, not timed against running clients. Two claims are searches rather than runs:
+that nothing reads `retention_expires_at`, and that the results path has no attribution-window setting.
+The lessons give the search so you can repeat it.
 
 **How to re-check.** The library's gates check each tagged excerpt and path against the app at a pinned
-reference: see [`tools/README.md`](../tools/README.md), which names the reference tag (`v0.36.4`) and how
-to run the checks for this book. If you read this book against a later release, re-read the excerpts and
-the "Expected result" blocks first: the stability notes, the limitations page and the migration notes in the
-app's `docs/` are the places the behaviour described here is most likely to change.
+reference: see [`tools/README.md`](../tools/README.md) for how to run them. This book was checked with
+`REF=09d815ea tools/check.sh production-engineering`. If you read it against a later release, re-read the
+excerpts and the "Expected result" blocks first: the stability notes, the limitations page and the
+migration notes in the app's `docs/` are the places the behaviour described here is most likely to change.

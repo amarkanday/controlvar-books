@@ -11,7 +11,7 @@ contract and follows it through the code that computes the numbers. Hour 2 carri
 from hypothesis to removal, including the ending nobody plans for (no winner). Hour 3 applies the same
 discipline to a different measuring instrument, an LLM judge, whose failures look like data.
 
-Work through it with a clone of the app checked out at the v0.36.4 tag next to this book and a Python
+Work through it with a clone of the app checked out at this book's pin, `09d815ea`, and a Python
 virtual environment with `backend/requirements.txt` installed (the Try It Yourself blocks run small
 pieces of the real backend with no database). Exercises that need the full stack say so and use the
 app's Quick Start; none of them is required to follow the argument.
@@ -329,10 +329,30 @@ the server **stored** it before the assignment (`events.updated_at < assigned_at
 you submit afterwards does not turn it into a valid pre-treatment covariate. Distinguish event time from
 receipt time in your own contracts for the same reason.
 
-> **Watch Out!** Every metric is analysed as a conversion. The app's limitations page is explicit: a
-> metric's type is stored, but its events' `value` is not analysed. A "revenue" metric tells you whether
-> each user sent the event, not how much they spent. If your decision is about revenue, plan a separate
-> analysis of the stored values and say so in the contract.
+#### Not every metric is a proportion
+
+Converting users is the numerator of a **conversion** metric. The other four metric types are analysed
+differently:
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py
+MEAN_METRIC_TYPES = ("revenue", "count", "duration", "custom")
+```
+
+For these, `per_user_mean_metric_result` says that "every user assigned to a variant is one unit": their
+value is the total of their counted values (for a count metric, their number of events), and "0 for a
+user with none". It compares the arms' means with Welch's t-test. So the denominator is still assigned
+users, and a user who never bought anything is a zero, not a missing row. That is the right unit for
+"revenue per assigned user", and it changes what a repeated event does. A user who sends the same purchase
+twice still counts once in a conversion rate, but adds the value twice to a revenue mean and counts twice
+in a count metric. Hour 4 shows the event id that stops a retry from doing that.
+
+> **Watch Out!** A mean metric is a mean only on its headline row. The app's limitations page lists what
+> is still computed on the share of users who sent the event, as for a conversion, even for these metric
+> types: the sequential and Bayesian analyses, the sample-size plan, the daily series and the Live tab.
+> There is no ratio metric (revenue per *order*) and no outlier control: winsorization is stored and
+> clips nothing, so one very large spender moves the mean and widens its interval. Write in your contract
+> which of these numbers your decision reads.
 
 #### Power: plan the sample before you look
 
@@ -416,8 +436,9 @@ the response fields.
 ### Key takeaways
 
 - A metric contract fixes the unit, the event, the denominator and the horizon *before* traffic arrives.
-- Controlvar's numerator is **converting users**, matched by event name and restricted to users assigned
-  to the event's variant; there is no attribution window, so write yours into the plan.
+- A conversion metric's numerator is **converting users**, matched by event name and restricted to users
+  assigned to the event's variant; revenue, count, duration and custom metrics are a **mean per assigned
+  user**, zeros included. There is no attribution window, so write yours into the plan.
 - SRM (p < 0.001) protects the denominator; when it fires, the recommendation is `INCONCLUSIVE`
   whatever the p-value says.
 - Time has two clocks, the event's and the server's. CUPED honours both; so should your contract.
@@ -557,11 +578,14 @@ experience through a separate flag, an incident may need both. Hour 10 covers th
 #### Not everything is on the dashboard
 
 Before you hand a runbook to an on-call engineer, check where each action lives. The app's
-"dashboard and API" page lists, per capability, whether a screen exists. At v0.36.4, creating an
-experiment, starting, pausing and completing it, and editing a draft's name, description and hypothesis
-are dashboard actions; changing a draft's variants or metrics, scheduling start and end dates, creating or
-advancing rollout schedules, and downloading results as CSV are API only. A runbook that says "click
-Pause" for something that only exists as an API call will fail at 3 a.m.
+"dashboard and API" page lists, per capability, whether a screen exists. At the pin, creating, starting,
+pausing, resuming and completing an experiment, editing a draft (its name, description, hypothesis,
+variants, metrics and its start and end dates), cloning an experiment, and creating, pausing and advancing
+rollout schedules are dashboard actions. Scheduling a paused experiment's resume, setting a flag's
+per-flag safety thresholds, archiving or deleting a flag, creating a bandit experiment and downloading
+results as CSV are API only. The list moves every release, which is the point: a runbook that says "click
+Pause" for something that only exists as an API call will fail at 3 a.m., so check the page for the
+version you run.
 
 #### Rehearse with a demo you can break
 
@@ -868,7 +892,7 @@ for raw in ['{"score": 0.8, "reasoning": "ok"}', 'I give it 1 out of 5',
 EOF
 ```
 
-Expected result (the first number depends on the price table at v0.36.4, and the Cognito notice may appear among the lines):
+Expected result (the first number depends on the price table at the pin, and the Cognito notice may appear among the lines):
 
 ```text
 0.012
@@ -911,7 +935,8 @@ and a promotion decision stating which checks were automated and which were done
 
 **Why not make a shipping decision from raw event totals?** The binary metric counts assigned converting
 users. Repeated events and unassigned senders change event totals without changing the intended outcome,
-and Controlvar's `count_converting_users` drops both on purpose.
+and Controlvar's `count_converting_users` drops both on purpose. A mean metric drops unassigned senders
+too, but it does count a repeated event again, which is why retried events need an `event_id` (Hour 4).
 
 **If the SRM check passes, is the randomisation proven fine?** No. It says the observed split is
 unsurprising at p ≥ 0.001. It does not detect every kind of non-exchangeability, and it is skipped for
@@ -955,9 +980,9 @@ visible in a counter. (4) Whether numerator and denominator count the same thing
 ### Solutions
 
 1. A good answer marks "denominator: assigned users in the variant" and "outcome: at least one matching
-   conversion" as enforced, "horizon: seven days" as recommended practice (no window exists in the code),
-   and anything about revenue values as unknown or out of scope, since every metric is analysed as a
-   conversion.
+   conversion" (or, for a revenue metric, "the mean per assigned user, zeros included") as enforced,
+   "horizon: seven days" as recommended practice (no window exists in the code), and revenue per order or
+   any outlier rule as recommended practice outside the platform, since neither is implemented.
 2. If control has 100 assignments and 20 matching events from 10 assigned users, and treatment has 100
    assignments and 18 events from 12 assigned users, the binary rates are 10% and 12%, a two-point
    difference, where event rows would suggest control is better. The platform drops the repeated events

@@ -12,8 +12,8 @@ touched, including the layer where it went quietly wrong. Hour 12 closes the loo
 demand as evidence for a change like that, how to record what you could *not* check, and who owns the
 cleanup.
 
-As before, keep the app clone at v0.36.4 open. The Try It Yourself blocks run real pieces of the backend
-with the safety variables from Part I and need no database.
+As before, keep the app clone at this book's pin, `09d815ea`, open. The Try It Yourself blocks run real
+pieces of the backend with the safety variables from Part I and need no database.
 
 ---
 
@@ -21,9 +21,9 @@ with the safety variables from Part I and need no database.
 
 ## Hour 10 — The feature-flag lifecycle: the kill switch that was not
 
-**Outcome:** ship a flag with an owner, a tested failure behaviour and a removal path, and state exactly
-what each control (global percentage, targeting rules, server rollback, client refresh) does and does not
-turn off.
+**Outcome:** ship a flag with an owner, a tested failure behaviour and a removal path, state exactly what
+each control (global percentage, targeting rules, server rollback, client refresh) does and does not turn
+off, and say how long "off" takes to reach each kind of client.
 
 ### What & why
 
@@ -35,9 +35,11 @@ They differ in default, owner, evidence and expected lifetime, and mixing them i
 flag becomes a permanent undocumented dependency. Write down which one you are creating, who owns it, the
 safe fallback, which services consume it, the payload shape, and the date you will remove it or review it.
 
-At v0.36.4 Controlvar records a key, name, description, status (`INACTIVE`, `ACTIVE` or `ARCHIVED`), an
-`owner_id`, targeting rules, a rollout percentage, a `default_value` (always `false`) and tags. It has
-**no expiry or review-date field, no stale-flag detection and no code-reference discovery**. The
+At the pin Controlvar records a key, name, description, status (`INACTIVE`, `ACTIVE` or `ARCHIVED`), an
+`owner_id`, targeting rules, a rollout percentage, a value type (`boolean`, `string`, `number` or `json`)
+with the `on_value` and `off_value` a non-boolean flag serves, tags, and a deprecated `default_value` that
+is always `false` and that evaluation does not read. It has **no expiry or review-date field, no
+stale-flag detection and no code-reference discovery**. The
 metadata that makes a flag retire is *yours to keep*, in your ticket tracker or your repository. Name keys
 for a capability, not a ticket; never reuse a retired key for a different meaning while old clients may
 still ask for it; and never flip the sense of a boolean from "new checkout" to "disable checkout" in place.
@@ -98,9 +100,15 @@ or an unreadable time window): the *whole* ruleset is abandoned and the flag is 
 written, so the safety monitor does not count it. A flag that quietly serves nobody because its rules are
 broken is a failure mode your tests should include.
 
-The application interprets the result. The SDKs' `isFeatureEnabled` returns `false` when the call itself
-fails, so a flag your code cannot reach behaves as off. That is a *safe default*, and only you can decide
-whether "off" is safe for your feature; for a kill switch guarding something that must stay on, it is not.
+The application interprets the result. `GET /api/v1/feature-flags/evaluate/{key}` answers
+`{key, enabled, value, value_type, config, reason}`. For a string, number or JSON flag, `value` is the
+flag's `on_value` where it is on for the user and its `off_value` otherwise; the route's docstring spells
+out "every way a flag is off -- inactive, archived, no match, outside the percentage, `reason: "error"`",
+and each serves the off value. (A boolean flag's `value` is `enabled`.) So "off" is itself a value you
+chose when you created the flag, and a kill switch is only as safe as that value. The SDKs'
+`isFeatureEnabled` returns `false` when the call itself fails, so a flag your code cannot reach behaves as
+off. That is a *safe default*, and only you can decide whether "off" is safe for your feature; for a kill
+switch guarding something that must stay on, it is not.
 
 #### The one rule for rollbacks
 
@@ -188,12 +196,56 @@ notice.
 > 15). That is why a rollback pauses them: otherwise the scheduler, doing its job, would raise the
 > percentage you just lowered.
 
+#### How long "off" takes to arrive
+
+Turning a flag off changes the server at once: the app's "Turning a Flag Off" page says that from the next
+evaluation it answers `enabled: false`, and "it keeps no cache of flags" (Hour 5 explains why). Every
+client, though, "keeps serving an answer it already has until that answer expires". So the honest answer
+to "how long does the kill switch take?" is a table, one row per client, and the page has one. Its
+headline, with the defaults:
+
+| Client | Serves the change within |
+|---|---|
+| Every SDK but the edge SDK, when the server evaluates (JavaScript, Python, Go, Java, .NET, Ruby, PHP, Elixir, iOS, Android, Flutter, React, React Native, both OpenFeature providers) | 5 minutes, the next time your code asks (the per-user, per-flag cache) |
+| The edge SDK | 1 minute, or about 2 with a KV store, plus the store's own propagation |
+| JavaScript and Python in local evaluation | About 33 seconds (a 30-second refresh with 10% jitter) |
+| A React or React Native component already on screen | Not until it mounts again: "the SDKs neither poll nor stream" |
+| React Native and iOS while offline | Not until the device reaches the API once: the stored answer has no time limit |
+| Any SDK after a safety rollback | The monitor's interval (5 minutes by default) plus the client's own time above |
+
+Two of those rows are surprises worth rehearsing. A screen that is already open never asks again, so an
+incident runbook that says "turn it off" also needs "and here is how the open sessions pick it up". And an
+offline fallback that serves the last answer "with no time limit" is the right choice for an outage and the
+wrong one for a kill switch; the page says to turn the fallback off "if serving off is safer than serving a
+stale on". The levers for making it faster are the obvious ones, each with a cost: a shorter cache
+lifetime (more requests against the SDK rate limit), clearing the cache from your code when you know a flag
+changed, and a shorter local refresh interval.
+
+What makes this page trustworthy is that its numbers are not typed:
+
+```python
+# 📁 backend/tests/unit/sdk/test_kill_switch_numbers.py
+"""Each number on the Turning a Flag Off page is read from its SDK's own source (#1519).
+
+``docs/feature-flags/kill-switch.md`` says how long a flag turned off takes to
+reach each client. Every number on it is a unit of its claims registry, and the
+test holding the unit reads the number from the SDK's source, never from the
+page. A default that moves fails here until the expected value below, and the
+page with it, move too:
+```
+
+A runbook number that silently drifts from the code is worse than no number, because people act on it. So
+each number is read from the SDK that owns it, and a new SDK "fails here until the page has a row for
+it".
+
 #### Archive, delete and the guard at the lowest layer
 
-An archived flag is retired: "it is never served, and nothing turns it back on by accident". Every request
-that would turn it on answers 400 with a fixed sentence and leaves it archived; the only way back is
-`POST /api/v1/feature-flags/{id}/unarchive`, which makes it inactive, and the dashboard has no archive
-action yet. The interesting part is *where* the rule lives:
+An archived flag is retired. The app's flag guide says what it answers: "every evaluation answers it as
+off (`enabled: false`, `reason: "inactive"`, and its off value, which a value method returns instead of
+your default), in local evaluation too, and nothing turns it back on by accident." Every request that
+would turn it on answers 400 with a fixed sentence and leaves it archived; the only way back is
+`POST /api/v1/feature-flags/{id}/unarchive`, which makes it inactive, and the dashboard has no archive or
+unarchive action yet (both are API only). The interesting part is *where* the rule lives:
 
 ```python
 # 📁 backend/app/models/feature_flag.py
@@ -223,10 +275,40 @@ refuses `ARCHIVED -> ACTIVE` for any other code that assigns `status` through th
 of its docstring: "A Core `UPDATE` or raw SQL never reaches this listener." Defence in depth names what it
 does not cover.
 
-Archive, disable and delete are three different operations. Archive hides a flag from service without
-losing its history. Delete is permanent: it removes the flag, its safety configuration, its evaluation
-metrics and its error logs, and keeps the *events* tagged with it (with `feature_flag_id` set to null).
-Which should you use before a code release has reached every client? Neither. Remove the code first.
+Archive, disable and delete are three different operations, and a client still running old code sees each
+one differently:
+
+| Operation | What the server answers for the key | What a client still asking gets |
+|---|---|---|
+| Turn off (inactive) | `enabled: false`, `reason: "inactive"`, the off value | The off value, once its cached answer expires |
+| Archive | The same as off, and it cannot be turned on by accident | The same |
+| Delete | `404` (as of v0.42.0) | Whatever that SDK does on any failure: `isFeatureEnabled` is `false`, and a value method returns the default *your code* passed, not the flag's off value |
+
+Delete is permanent: it removes the flag, its safety configuration, its evaluation metrics and its error
+logs, and keeps the *events* tagged with it (with `feature_flag_id` set to null). A client keeps an answer
+it cached until the cache expires, 5 minutes by default, so for a while after a delete some users still
+get the old answer and others the failure path. One SDK had to learn the difference between "deleted" and
+"down": the React Native SDK keeps an offline copy of every answer and serves it when a request fails, and
+until v0.43.2 it served that stored answer for a deleted flag as well. Its client now says why a 404 is
+different:
+
+```ts
+// 📁 sdk/react-native/src/client.ts
+// A 404 is a definitive answer (the flag was deleted), not an outage: drop the
+// stored answer so it is never served again, and answer disabled.
+if (err instanceof ApiError && err.status === 404) {
+  if (this.offlineFallback) await this.storage.removeFlag(userId, flagKey);
+  return disabled(flagKey);
+}
+return stored ? stored.value : disabled(flagKey);
+```
+
+"A definitive answer, not an outage" is the distinction every fallback needs: serving a stale answer
+through an outage is resilience, and serving it after the server has said the thing is gone is a bug.
+
+Which should you use before a code release has reached every client? Neither. Remove the code first. If you
+must act before then, archive: it keeps serving the off value you chose, while delete hands each client to
+its failure path.
 
 #### Retire in the right order
 
@@ -270,10 +352,10 @@ for status, pct, target in [("ACTIVE", 50, 0), ("ACTIVE", 50, 10), ("ACTIVE", 5,
                             ("INACTIVE", 50, 0), ("ARCHIVED", 50, 0)]:
     print("rollback", status, pct, "->", target, ":", rollback_change(F(status, pct), target))
 EOF
-python -m pytest backend/tests/unit/services/test_automatic_rollbacks_default_off.py -p no:cov -q
+python -m pytest backend/tests/unit/services/test_automatic_rollbacks_default_off.py backend/tests/unit/sdk/test_kill_switch_numbers.py -p no:cov -q
 ```
 
-Expected result (pytest adds its per-test lines):
+Expected result (pytest adds its per-test lines and ends with `51 passed` at the pin):
 
 ```text
 ACTIVE 0 {'plan': 'paid'} -> True targeting_rule
@@ -297,18 +379,22 @@ say?
 
 **Answer.** Matching targeting enables users independently of the global percentage. For a full stop,
 use the supported inactive/rollback-to-zero action (and know that a non-zero rollback target only lowers
-the global percentage). Check application defaults and SDK refresh delay (a local-evaluation SDK learns at
-its next successful refresh, 30 seconds by default, and keeps the old ruleset if it cannot reach the API).
-Rehearse with both a paid and a non-paid user.
+the global percentage). Then say how long it takes to arrive: up to 5 minutes for an SDK's cached answer
+by default, about 33 seconds for a local-evaluation SDK (which keeps the old ruleset if it cannot reach the
+API), and never for a React screen already open until it mounts again. Check the flag's off value and the
+application's defaults, and rehearse with both a paid and a non-paid user.
 
 ### Key takeaways
 
 - A flag needs an owner, a failure behaviour and a retirement date, and Controlvar keeps none of the last
   two for you.
 - Global percentage, targeting rules, status, server rollback and client refresh are separate controls.
-  Only an inactive flag is off for everyone.
+  Only an inactive flag is off for everyone, and "off" serves the off value you chose.
+- "Off" reaches each client on that client's clock; the app publishes the table, and a test reads every
+  number in it from the SDK that owns it.
 - Safety rollback is periodic, off by default, and counts only errors from server-side keys.
-- Remove the code, then retire the flag. Delete is permanent but keeps the events.
+- Remove the code, then retire the flag. Archive keeps serving the off value; delete answers 404 and sends
+  every client still asking down its failure path, and keeps the events.
 
 **Review artifact:** a flag record, branch and failure tests, rollback rehearsal evidence, a consumer
 inventory and a removal or long-term review date.
@@ -518,12 +604,15 @@ Engineering book).
 Another real example of expand-then-contract is in the flag model: the `default_value` column carries a
 `server_default`, and the comment says why it is load-bearing, in one clause: "the previous release's image
 inserts rows without naming this column, and the database fills it". An older writer meeting a new
-`NOT NULL` column is exactly the mixed-version case from Hour 6.
+`NOT NULL` column is exactly the mixed-version case from Hour 6. The same model shows the contract half
+waiting its turn: typed flags added `value_type`, `on_value` and `off_value` (with a `server_default` on
+`value_type` for the same reason), and `default_value` became deprecated, still written, never read by
+evaluation. Dropping it is a later release's job.
 
 #### A hypothetical to practise on: an editable label
 
 Now apply the map yourself. Suppose users ask for an optional, human-editable **owner label** (free text,
-at most 80 characters) on experiments. It is **hypothetical**; there is no `owner_label` field at v0.36.4.
+at most 80 characters) on experiments. It is **hypothetical**; there is no `owner_label` field at the pin.
 Decide first what it is (cosmetic, not an authorisation boundary) and who may change it (the same role that
 may update an experiment). Then fill the surface map:
 
@@ -708,6 +797,72 @@ the only legitimate way to green is to cut the crossing.
 "Do not weaken an assertion to make a test pass; the only legitimate way to green is to cut the crossing."
 Copy that sentence into your own gates.
 
+#### A capacity claim is a measurement with a method
+
+"It handles N requests a second" is the claim reviewers most often accept without evidence. Controlvar's
+answer to it (issue #1608, "Published scale evidence: a load test with a stated method") is worth studying
+precisely because, at this book's pin, it has **not** published a number yet. The method and the harness
+are in the repository; the app's load-testing page still says "This page publishes no response time or
+throughput"; and #1756, the 30-second pause from Hour 5, says the published capacity measurement "waits for
+this fix". A measurement that refuses to publish while the system is known to misbehave is doing its job.
+
+The method is a file, not a paragraph:
+
+```json
+// 📁 tests/scale/config.json
+  "keeps_up": {
+    "max_errors_per_mille": 1,
+    "max_p99_ms": 1000,
+    "max_dropped": 0
+  },
+  "validity": {
+    "max_generator_cpu_permille": 900,
+    "max_start_lag_p99_us": 5000,
+    "max_foreign_cpu_permille": 100,
+    "min_sample_permille": 900,
+    "sent_identity_tolerance": 1
+  },
+  ...
+  "repetitions": 3,
+  "max_knee_spread_steps": 2,
+```
+
+Read it as three separate questions. **Did the step keep up?** At most 1 error per thousand requests, a
+p99 of at most a second, nothing dropped. **Was the step a valid measurement at all?** The load generator
+itself under 90% CPU, its requests starting on time, other work on its CPU under 10%, enough of the
+requests sampled; a step that fails these is `INVALID`, whatever its latency, because a saturated load
+generator measures itself. **Is the result stable?** Three repetitions; the headline is the *lowest*
+"knee" (the last step that kept up) of the three, and a spread between them wider than two steps is
+disclosed beside it rather than hidden.
+
+The summariser also knows when a run is not a capacity measurement even though it produced numbers:
+
+```python
+# 📁 tests/scale/scale_evidence.py
+``stalled``, from the step's own record and ``previous`` (the step before
+it; None for step 1, which is never ``stalled``): at least
+``min_failed_permille`` of the measured requests failed, and the API's CPU
+fell to at most ``max_api_cpu_of_previous_permille`` of the previous step's
+although this step offered more. A run at its limit is expected to keep the
+API at least as busy as the step before; one whose answers stop while the
+API goes quiet has not measured a capacity. It is checked before
+``serialised``, whose signature (the API's thread under its limit, at most
+one active database connection, a failure on latency) a stall also meets.
+```
+
+"One whose answers stop while the API goes quiet has not measured a capacity." A system at its limit is
+busy; a system that stops answering while idle is stuck, and the first failing step of a stuck run is not
+its capacity. The results file says the rest: a run stopped as `stalled` or `invalid` cannot be rendered
+onto the page at all, every number is an integer in a unit its key names, and `verify` checks the
+committed results "byte for byte" against the artifact of the CI run that produced them, an artifact that
+must still exist. The workflow that runs it is never a required check: it measures release images on a
+GitHub-hosted runner, and evidence about capacity belongs in a published, reproducible document, not in a
+merge gate.
+
+None of it needs a reviewer to trust the author. That is the bar for any number in a release review: the
+method written down before the run, a validity check that can reject the run, repetitions, and a way for
+someone else to check the published figure against its source.
+
 #### Recovery is a decision, not a hope
 
 For each boundary, the review asks a recovery question. For a database change: can the previous application
@@ -782,6 +937,19 @@ last run is back to `4 passed`. (Do this in a throwaway clone; the checkout disc
 (the gate fires on the planted defect) and one for what it does not (it says nothing about a cache key
 spelled in some way the pattern does not match).
 
+The scale method's own checks run offline too, on recorded step data, with no load generator and no
+stack:
+
+```bash
+python -m pytest backend/tests/unit/scripts/test_scale_evidence.py -p no:cov -q
+```
+
+It reports `274 passed` at the pin. Open the file and read
+`test_a_step_that_measures_the_generator_is_invalid` and
+`test_a_stalled_run_is_never_published_and_never_links_the_database_issue`: each builds a run that
+*looks* like a result and asserts that the summariser refuses to call it one. A measurement method earns
+trust the same way a gate does, by being shown the cases it must reject.
+
 Now write a review outcome. The owner-label patch passes its new serializer test. There is no test for
 explicit null, the previous API version has not been exercised against the expanded schema, and the rollout
 plan says only "turn off if problems". What is the review outcome?
@@ -822,6 +990,13 @@ the percentage you just lowered.
 **Why is `owner_name` only on the detail route?** A per-row lookup on a list is an N+1 query, and the
 detail route can afford one.
 
+**Why archive a flag rather than delete it while old clients still ask for it?** An archived flag keeps
+answering with the off value you chose; a deleted one answers 404, and each SDK falls back to whatever
+default the calling code passed.
+
+**Why does the scale method refuse a stalled run?** An API that stops answering while its CPU falls is
+stuck, not saturated, so the step where it failed says nothing about its capacity.
+
 ### Quiz
 
 1. Is a cosmetic owner label an authorisation model?
@@ -849,8 +1024,10 @@ action does exactly that). (5) Users matched by a targeting rule, who keep their
 
 1. Identify: check the flag's status, global percentage, targeting rules and the safety check endpoint. Stop:
    make the flag inactive (or roll back to 0%), pausing active rollout schedules. Verify: evaluate for a
-   user inside and outside each rule, check the rollback record, and confirm every SDK mode's refresh
-   (server mode immediately, local mode at the next successful refresh).
+   user inside and outside each rule, check the rollback record, and confirm each client against its row
+   of the app's "Turning a Flag Off" table (the server at once; an SDK's cached answer within 5 minutes by
+   default, the edge SDK's within 1 minute; local evaluation within about 33 seconds; an open React screen
+   and an offline mobile device only when they ask again).
 2. Persistence: nullable column plus migration; API: optional on create/update/read; dashboard: edit and
    clear, rendered as text; SDKs: unaffected unless typed models reject unknown fields; exports: decide
    explicitly; core/full: core; deployment: expand-only. Mark "SDKs" and "exports" unknown until you read
