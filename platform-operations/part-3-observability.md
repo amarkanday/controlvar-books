@@ -135,6 +135,22 @@ fields @timestamp, request_id, path, event
 | limit 10
 ```
 
+The app's CDK guide has one that is in the repository, and it answers an operations question
+rather than a debugging one: does the API see its users, or its load balancer? uvicorn's access
+line starts with the client address uvicorn resolved, so counting by that address is the check
+for Part I's trusted-proxy list on AWS:
+
+```text
+# 📁 docs/self-hosting/cdk.md
+fields event
+| filter logger = "uvicorn.access" and event like "/api/"
+| parse event /^(?<client>\S+):\d+ - /
+| stats count(*) as requests by client
+| sort requests desc
+```
+
+Users' addresses mean it works; `10.0.x.x` on every line is the load balancer's.
+
 The rest of the chain: nginx sets the header from its own `$request_id`, the ALB in
 production adds `X-Amzn-Trace-Id` (a different ID, also logged by the ALB access logs), and
 the API's response header lets the dashboard's `ApiError` (Build book Day 23) surface the
@@ -193,8 +209,9 @@ platform answers them at different paths.
 Metrics are the third audience: Prometheus (or the CloudWatch agent) scraping `/metrics`
 for request counts, latencies, assignments, evaluations, cache hits, rate limits and
 scheduler ticks. The scrape endpoint is unauthenticated by nature — so it's guarded by a
-token outside development, and labels are normalised so a UUID in a path doesn't create a
-metric series per experiment.
+token outside development — and every label takes its values from a bounded set the platform
+defines (its routes, its flags, its experiments, fixed lists of methods and event types), never
+from free text a client sent, so no request can create a metric series of its own.
 
 ### How Controlvar does it
 
@@ -373,10 +390,11 @@ dashboards meaningful:
 http_requests_total: Counter = Counter(...)              # method, endpoint, status
 http_request_duration_seconds: Histogram = Histogram(...)
 experiment_assignments_total: Counter = Counter(...)     # experiment_id, variant_id
-events_tracked_total: Counter = Counter(...)             # event_type (bucketed)
+events_tracked_total: Counter = Counter(...)             # event_type (bucketed); stored events only
+events_duplicate_total: Counter = Counter(...)           # route: track | batch | events
 feature_flag_evaluations_total: Counter = Counter(...)   # flag_key, result
 cache_hits_total / cache_misses_total: Counter           # cache_type
-rate_limit_hits_total / rate_limit_rejections_total: Counter
+rate_limit_hits_total / rate_limit_rejections_total: Counter   # endpoint = the limit's bucket
 active_experiments_gauge: Gauge
 scheduler_last_success_timestamp: Gauge = Gauge("scheduler_last_success_timestamp", "Unix timestamp of the last successful tick of each background scheduler", ["name"])
 scheduler_tick_duration_seconds: Histogram = Histogram(..., ["name"], buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0])
@@ -387,24 +405,48 @@ and the middleware that keeps HTTP labels bounded:
 
 ```python
 # 📁 backend/app/middleware/prometheus_metrics_middleware.py
-def normalize_path(path: str) -> str:
-    """Replace dynamic path segments with ``{id}`` for stable metric labels.
+"""
+FastAPI/Starlette middleware that automatically records Prometheus metrics
+for every HTTP request.
 
-    Two categories of dynamic segments are replaced:
+A request is labelled by the route it matched, as that route's template
+(``/api/v1/feature-flags/user/{user_id}``), never by the path the client
+sent, and ``UNMATCHED_ENDPOINT`` when it matched no route. The method label
+is mapped to a fixed set by :func:`backend.app.core.metrics.record_request`.
+"""
+...
+UNMATCHED_ENDPOINT = "unmatched"
+...
+def route_template(scope: Scope) -> str:
+    """The template of the route this request matched, or ``UNMATCHED_ENDPOINT``.
 
-    * UUID v4 (e.g. ``550e8400-e29b-41d4-a716-446655440000``)
-    * Pure numeric IDs (e.g. ``42``)
-    """
-    path = _UUID_PATTERN.sub("/{id}", path)
-    path = _NUMERIC_PATTERN.sub("/{id}", path)
-    return path
+    Read once the request has been handled: routing records what it matched
+    in the scope, which every layer of the stack shares. Nothing here reads
+    the request path, so the label takes only the values the application's
+    routes define, plus ``UNMATCHED_ENDPOINT``.
 ```
 
-Without that, `/api/v1/experiments/<uuid>/results` would be a new time series per
-experiment — a cardinality explosion that takes Prometheus down. `event_type_label` does the
-same for events (a bounded set of known types plus `other`). `experiment_assignments_total`
-_does_ carry `experiment_id` — bounded by the number of experiments, which is a deliberate,
-small cardinality.
+Every distinct label value is a time series Prometheus keeps, so a label fed from the request
+path hands the series count to whoever sends requests. The middleware used to label by the path
+with UUID and numeric segments replaced by `{id}`. That was a **deny-list** of what to remove,
+and it missed every other shape: a flag key in `/feature-flags/evaluate/<key>`, a user id in
+`/feature-flags/user/<id>`, any random path a scanner tries, any invented HTTP method. Each was a
+new series. Since v0.40.0 (#1611) it is an **allow-list** of what to keep: the label is the
+template of the route the request matched, which only the application's own routes can supply,
+and everything that matched no route (a 404, the trailing-slash redirect, a request a middleware
+refused before routing, such as a wrong `Host` or a 429) is the single value `unmatched`. The
+`method` label is mapped the same way, to GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS or
+`other`. The regression test (`backend/tests/unit/middleware/test_metric_labels_bounded.py`)
+sends 1,200 requests of six hostile shapes and asserts that they add at most 16 label sets.
+
+One caution in the source is worth copying: the full template comes from a FastAPI scope key that
+is not public API. If an upgrade removes it, routes fall back to `unmatched` (never to the path),
+and a test fails naming `route_template()`. A dashboard that keyed on the old form needs updating:
+`/api/v1/experiments/{id}` is now `/api/v1/experiments/{experiment_id}`.
+
+`event_type_label` does the same for events (a bounded set of known types plus `other`).
+`experiment_assignments_total` _does_ carry `experiment_id` — bounded by the number of
+experiments, which is a deliberate, small cardinality.
 
 **What to graph.** The platform ships two CloudWatch dashboards
 (`infrastructure/cloudwatch/*.json`, deployed by `deploy-dashboards.sh`) and a CDK one in
@@ -414,16 +456,20 @@ today, so those panels stay empty; the alarms (Hour 9) were cleaned up, the dash
 not. The four graphs an on-call engineer actually looks at, in order:
 
 1. `http_requests_total` by status, rate over 1 min — the 5xx line is the pager.
-2. `http_request_duration_seconds` p99 by endpoint — `/tracking/assign` and
-   `/feature-flags/evaluate/{id}` are the hot path; p99 > 500 ms is a problem.
+2. `http_request_duration_seconds` p99 by endpoint — `/api/v1/tracking/assign` and
+   `/api/v1/feature-flags/evaluate/{flag_key}` are the hot path; p99 > 500 ms is a problem.
 3. `scheduler_last_success_timestamp{name}` — `time() − value` per scheduler; > 2 × the
    scheduler's interval means a stuck or crash-looping loop (Hour 9).
 4. `rate_limit_rejections_total` rate — a spike is either an abusive client or an SDK
-   misconfiguration (usually a server-side SDK with the cache disabled). The limits it
-   counts are per client IP: SDK paths share `SDK_RATE_LIMIT_PER_MINUTE` (6,000/min by
-   default), exports share 10/min, auth endpoints have strict per-route limits, and
-   everything else gets 300/min (`resolve_rate_limit()` in
-   `backend/app/middleware/rate_limiter.py`).
+   misconfiguration (usually a server-side SDK with the cache disabled), or, on a self-hosted
+   install, a proxy the API does not believe (Part I, Hour 3). Its `endpoint` label is the
+   **limit** a request was counted against, from `resolve_rate_limit_bucket()` in
+   `backend/app/middleware/rate_limiter.py`: the path of a route with a limit of its own (the
+   sign-in and password endpoints, batch assign, the audit-log export, AI design), or `export`, `ai_interpret`,
+   `sdk` or `default`. That is a fixed set too. The counting itself is per client address and
+   per path: each SDK path gets `SDK_RATE_LIMIT_PER_MINUTE` (6,000/min by default) of its own,
+   every other path 300/min, and only the export routes (10/min) and the AI interpretation
+   routes (10/min) share one counter per address.
 
 > **Watch Out!** `/health` is the alias the ALB uses, and it's _readiness_. If you ever
 > change the ALB target group to `/health/live` "to stop flapping during a DB blip," you
@@ -451,8 +497,9 @@ docker compose stop postgres; curl -s -o /dev/null -w '%{http_code}\n' localhost
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/health/live                                  # still 200
 ```
 
-Then hit `/api/v1/experiments/<uuid>` a few times and confirm the metric label is
-`/api/v1/experiments/{id}`, not the UUID.
+Then hit `/api/v1/experiments/<uuid>` a few times and confirm the metric label is the route's
+template, `/api/v1/experiments/{experiment_id}`, not the UUID; then request a path that does not
+exist and find it counted under `endpoint="unmatched"`.
 
 ### Key takeaways
 
@@ -463,7 +510,9 @@ Then hit `/api/v1/experiments/<uuid>` a few times and confirm the metric label i
   bytes), `METRICS_ENABLED=false` → 404.
 - Readiness also reports `profile` (`core`/`full`) and a `modules` check, in every
   environment; neither gates readiness.
-- Labels are normalised (`{id}`, bucketed event types) to keep cardinality bounded.
+- Labels come from bounded sets the platform defines, never from free text in the request: the
+  matched route's template or `unmatched`, a fixed method set, bucketed event types, rate-limit
+  buckets, and the ids of flags and experiments that exist.
 - Graph 5xx rate, hot-path p99, scheduler staleness, rate-limit rejections.
 
 ---
@@ -504,7 +553,8 @@ three guarantees:
    get the lock skips the tick.
 2. **Run history** — every executed tick is persisted through
    :meth:`SchedulerHealthService.record_run` (``scheduler_runs`` table), which
-   feeds ``GET /api/v1/scheduler/health``.
+   feeds ``GET /api/v1/scheduler/health``. The write runs in a worker thread
+   (:func:`run_in_worker`), never on the event loop's thread.
 3. **Prometheus signal** — ``scheduler_last_success_timestamp{name}``,
    ``scheduler_tick_duration_seconds{name}`` and
    ``scheduler_ticks_total{name,status}`` from :mod:`backend.app.core.metrics`.
@@ -581,6 +631,66 @@ Prometheus (so the dashboard shows the lock working) but not to the run-history 
 the history is of _work_, not of coordination). A tick that raises is recorded as `failed`
 and then **re-raised**, so each scheduler loop keeps its own back-off; the runner doesn't
 swallow.
+
+**Off the event loop.** The five loops live inside the API process, on the same asyncio event
+loop that answers requests, and that is an operational hazard the code now names. A tick body is
+an `async def` that makes synchronous SQLAlchemy calls, so while it runs on the loop, the API
+answers nothing else; with one worker per container (Part I), every request waits. Issue #1690
+measured the metrics tick freezing the loop for about 3.7 seconds against a million `raw_metrics`
+rows, every 15 minutes, and growing as an install is used. The fix, released scheduler by
+scheduler between v0.41.0 and v0.43.2, runs each tick's body in a worker thread through one
+helper:
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+async def run_in_worker(work: Callable[[], Any], *, label: str) -> Any:
+    """
+    Run *work* in a worker thread; the event loop awaits it (#1690).
+
+    For a tick whose body is synchronous (SQLAlchemy queries, HTTP sends): run
+    on the event loop, it stops the API answering anything else until it
+    finishes. *work* must be a plain callable. A coroutine function cannot be
+    handed over as it is -- ``asyncio.to_thread`` on one only creates the
+    coroutine and never runs it, and the tick is recorded as a success that
+    did nothing -- so wrap it to create and run the coroutine inside the
+    thread, on a private event loop: ``lambda: asyncio.run(body())``.
+```
+
+That middle sentence is a trap worth remembering: hand a coroutine _function_ to a thread and the
+thread returns a coroutine object nobody awaits, so the tick "succeeds" having done nothing, and
+the run history records a success. The rollout scheduler's tick is the wrapped form exactly:
+`run_in_worker(lambda: asyncio.run(self.process_rollout_schedules()), ...)`. Further down, the
+same docstring explains why the helper does not return before its thread does even when it is
+cancelled: `run_locked_tick` releases the advisory lock when the tick returns, so returning early
+would let another replica's tick start beside a thread that is still running.
+
+The last piece arrived in v0.43.2: the run record itself. Writing it checks a database connection
+out of the pool, and that write used to happen on the loop:
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+    if record:
+        # In a worker thread, like the tick bodies (#1690): the write checks a
+        # connection out of the pool, and when every connection is held by a
+        # request waiting for this event loop, a checkout made on the loop's
+        # own thread waits the whole pool timeout and stops the API answering
+        # for that long -- and then the run record is lost as well.
+        await run_in_worker(
+            functools.partial(
+                _persist_run, name, started_at, completed_at, status, result, error
+            ),
+            label=f"{name} run record",
+        )
+```
+
+Read the comment as a deadlock with a timeout. Under load every pooled connection can be held by
+a request whose handler is waiting for the event loop; a checkout made _on_ that loop then waits
+for a connection that cannot be released until the loop runs, which it cannot do while it waits.
+The pool timeout breaks the tie, and until it does the API answers nobody. The release that moved
+the write, v0.43.2, closed #1756, whose symptom is the one an operator would see: under sustained
+overload, the API stopped answering every request for about 30 seconds at a time. The general
+rule for anything you add to a scheduler: a blocking call belongs in `run_in_worker`, never on
+the loop.
 
 Scheduler health — is it running (activity in the last 30 minutes), what was the last
 status, how many consecutive failures:
@@ -721,7 +831,16 @@ consequential actions:
 
 ```python
 # 📁 backend/app/core/rollout_scheduler.py
-                self._notification_service.notify_rollout_advanced(
+                # Each send in a worker thread: it is a synchronous HTTP call
+                # (#1690). After the commit, so nothing uncommitted is announced.
+                for notification in notifications:
+                    try:
+                        await asyncio.to_thread(
+                            self._notification_service.notify_rollout_advanced,
+                            **notification,
+                        )
+                    except Exception as exc:
+                        logger.warning("Notification failed (non-critical): %s", exc)
 ```
 
 ```python
@@ -737,9 +856,13 @@ consequential actions:
             )
 ```
 
-Both are opt-in (`SLACK_ENABLED` + `SLACK_BOT_TOKEN`, `EMAIL_ENABLED` + SendGrid/SMTP
-settings) and both degrade to a logged warning when the SDK or config is absent — a failed
-Slack post must never fail a safety rollback. The StreamPulse rollout story (Build book
+The rollout scheduler's loop shows two rules in a few lines. The announcement goes out **after the
+commit**, so nobody is told about a stage change that then rolled back. And a failed send is a
+logged warning, never an exception that undoes the work it describes. (Each send is also an HTTP
+call, so it runs in a worker thread, for the reason the previous section gave.) Both channels are
+opt-in (`SLACK_ENABLED` + `SLACK_BOT_TOKEN`, `EMAIL_ENABLED` + SendGrid/SMTP settings) and both
+degrade to a logged warning when the SDK or config is absent — a failed Slack post must never fail
+a safety rollback. The StreamPulse rollout story (Build book
 Day 21) is the demo of this loop end to end: rollout advances → Slack; error rate spikes →
 safety rollback → Slack.
 
@@ -789,6 +912,8 @@ safety rollback or rollout advance.
 - Five loops, one runner: `pg_try_advisory_lock(hashtext(name))` on a dedicated autocommit
   connection (Aurora kills idle-in-transaction sessions), skip when held, record `success
   / partial / failed` to `scheduler_runs`, three Prometheus metrics, re-raise on error.
+- Tick bodies, their notifications and the run record run in worker threads (`run_in_worker`),
+  because synchronous database work on the event loop stops the API answering anything.
 - `GET /api/v1/scheduler/health`: running (30-minute window), last status, consecutive
   failures; the staleness gauge is the precise signal.
 - Every alarm goes to `experimentation-alerts-<env>`, whose one subscriber is
@@ -837,10 +962,11 @@ address), or the alarm was one of the per-colour `experimentation-api-healthy-*`
 which have no action by design — only the `no-healthy-task` composite emails. (An unset
 `ALARM_EMAIL` is not a cause in staging: synth refuses to run without it.)
 
-**Quiz.** Which one line in `metrics.py` prevents a per-experiment time series for HTTP
-requests, and which counter deliberately _does_ have one?
-→ `normalize_path` (`/{id}`) in the middleware for `http_requests_total`;
-`experiment_assignments_total{experiment_id, variant_id}` carries it on purpose, bounded by
+**Quiz.** What prevents a per-experiment (or per-user, or per-scanner-guess) time series for
+HTTP requests, and which counter deliberately _does_ have one series per experiment?
+→ `route_template()` in the middleware: the `endpoint` label of `http_requests_total` is the
+matched route's template or `unmatched`, so it never contains anything the client typed.
+`experiment_assignments_total{experiment_id, variant_id}` carries the id on purpose, bounded by
 the experiment count.
 
 ---
@@ -898,8 +1024,8 @@ srm_checks_total: Counter = Counter("srm_checks_total", "Sample-ratio-mismatch c
 PromQL: `sum(rate(srm_checks_total{result="mismatch"}[1h])) / sum(rate(srm_checks_total{result!="skipped"}[1h]))`.
 
 **S3.3** — `false`: a Redis outage leaves every task ready; rate limiting falls back to
-_per-task_ memory, so the effective limit becomes N × 6,000/min per IP — degraded
-protection, full availability. `true`: a Redis outage makes every task unready, the ALB has
+_per-task_ memory, so the effective limit becomes N × 6,000/min per address on each SDK path —
+degraded protection, full availability. `true`: a Redis outage makes every task unready, the ALB has
 no targets, and the platform is down until failover completes (~30–60 s) — full protection,
 no availability. For a public SDK endpoint the first is almost always right; pair it with
 an alarm on Redis health so the degraded window is known.

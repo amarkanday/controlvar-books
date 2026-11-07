@@ -15,8 +15,8 @@ database rollback order, the secrets a deployment needs, and the backups behind 
 Application rollback and database recovery have different requirements, so pay particular
 attention to the order of operations when a release changes the schema.
 
-> Verified against Controlvar v0.36.4 (`79f8ed18`). The workflows are read from `.github/workflows/`
-> at that tag; nothing in this Part was run against a real AWS account, and where the app's own
+> Verified against Controlvar `09d815ea` (`main` after v0.43.2). The workflows are read from
+> `.github/workflows/` at that commit; nothing in this Part was run against a real AWS account, and where the app's own
 > runbooks say a path has not been observed in one, so does this book.
 
 ---
@@ -59,7 +59,7 @@ concurrency:
 
 jobs:
   changes:                 # is this a docs-only change? (scripts/classify_changes.py)
-  unit-tests:              # Postgres service; backend/tests/unit with -x; plus the Lambda suites
+  unit-tests:              # Postgres service; unit, realistic and installer-sweep tests with -x; the Lambda suites
   module-tests:            # the optional modules' own tests, same shape, minutes not an hour
   base-requirements-only:  # the suite with only backend/requirements.txt installed
   smoke-tests:             # backend/tests/smoke: the wiring checks (routes exist, deps resolve)
@@ -96,7 +96,7 @@ The unit job runs the Lambda suites too, with a comment that explains a past gap
           APP_ENV: test
           TESTING: 'true'
           ...
-        run: python -m pytest backend/tests/unit/ backend/tests/realistic/ -p no:cov -q --tb=short -x --junitxml=unit-junit.xml
+        run: python -m pytest backend/tests/unit/ backend/tests/realistic/ backend/tests/installer_sweeps/ -p no:cov -q --tb=short -x --junitxml=unit-junit.xml
 
       ...
       # The Lambda functions (event processor, flag evaluation) and their
@@ -116,8 +116,9 @@ coverage plugin — coverage is a separate, explicit run. (No stack deploys a ha
 `backend/lambda/`; these suites keep the code that is there honest. Part II, Hour 4.) Between
 the two steps sits one that is easy to miss: `scripts/check_junit_skips.py` fails the job if a
 test that must run was *skipped* — in the workflow-reading tests, the statistical gates, the
-seeded realistic scenarios and the docs tests — because a skipped gate looks exactly like a
-passing one.
+seeded realistic scenarios, the docs tests, the AWS installer's harness and fault sweeps
+(`backend/tests/installer_sweeps`, which need only bash and jq) and the ground-truth library's
+cross-checks — because a skipped gate looks exactly like a passing one.
 
 The Docker smoke is the job that most resembles a customer — it builds the images and walks
 the same path a self-hoster would:
@@ -160,7 +161,11 @@ That last comment is the `pipefail` trap from the Build book (Day 24): `grep -q`
 pipe as soon as it matches, `curl` gets `SIGPIPE`, exits 23, and `set -o pipefail` fails the
 step on a success. Fetch to a file, then grep. The same job also builds the `full` image and
 checks that every module-only dependency is in it and none is in `core` — the list is
-derived from the two lock files, not typed.
+derived from the two lock files, not typed. It runs the image with each misconfiguration the
+settings preflight must refuse and greps for the exact refusal line, `FORWARDED_ALLOW_IPS=172.18.0.3/16`
+among them; and once the stack is up, a step named "The API names the proxies it believes" reads
+the API's `trusted proxies` start line (Part I, Hour 3) and fails on the `WARNING` form or an empty
+network list.
 
 The release gate — deterministic dependencies from a dedicated compose file, run through the
 same script a developer uses locally, plus the security checks, summarised into one named
@@ -277,14 +282,35 @@ The **Regression Guard** is the one process rule enforced by CI: a pull request 
 ```
 
 And the **nightly** suite (`02:00 UTC`) runs what's too slow or too environment-dependent for
-a pull request: integration tests, benchmarks, the smoke tests, the SDK contracts again and
-the browser E2E suite, filing an issue when it fails.
+a pull request: integration tests, benchmarks, the smoke tests, the SDK contracts again (and a
+check that every SDK release published with a local evaluator is pinned in the compatibility
+gate), the browser E2E suite, and the ground-truth replay below at four times the users, once
+clean and once with every fault combined, filing an issue when it fails. "When it fails" took a
+correction worth knowing:
+
+```yaml
+# 📁 .github/workflows/nightly-qa.yml
+  # A red night has to leave something behind that a human sees in the morning.
+  nightly-failure-issue:
+    name: File an issue on failure
+    ...
+    # A job that hits its timeout-minutes ends `cancelled`, not `failure`, so
+    # failure() alone stayed false on 2026-11-02 and 2026-11-03 and no issue was
+    # filed. A person cancelling the run files one too; that fails closed.
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+```
+
+A timed-out job is the slowest kind of failure, and `failure()` did not count it, so the alerting
+path was silent on exactly the nights it was needed.
 
 **What branch protection requires.** Exactly these 20 check names, as `REQUIRED_CHECKS` in
 `scripts/configure-repo.sh` declares them. That script is what applies branch protection, and it
-says live protection may differ from its list; what the live repository enforces is a setting only
-a maintainer can read, with `gh api repos/Controlvar/controlvar/branches/main/protection/required_status_checks`
-(the script's payload sets `strict`, which makes a branch merge only when it is up to date with `main`):
+changes required-check names and nothing else: before it writes, it runs
+`scripts/check_required_checks.sh` against live protection and refuses, writing nothing, if live
+differs from its body in any other way. What the live repository enforces is a setting only a
+maintainer can read, with `gh api repos/Controlvar/controlvar/branches/main/protection/required_status_checks`.
+The body the script writes is "what main has today": `strict` is **false**, so a branch need not
+be up to date with `main` to merge, and there is **no** required pull request review:
 
 | Workflow | Required checks it reports |
 |---|---|
@@ -299,11 +325,43 @@ a maintainer can read, with `gh api repos/Controlvar/controlvar/branches/main/pr
 | DCO | `DCO` (every commit carries a `Signed-off-by`) |
 | Leak Guard | `Leak Guard` (`scripts/leak_guard.py`: secrets and false claims in tracked files) |
 
+With `strict` off, two pull requests that are each green against the `main` they started from
+can merge one after the other and leave `main` red, because neither was tested with the other.
+What catches that is the Release Gate's run on every push to `main` (it is on the commit a release
+is cut from, and Deploy looks it up there), and the nightly suite. `strict` on would close the gap
+at the price of bringing every open pull request up to date, and re-running its checks, after each
+merge; the script's comment says either setting is changed "on purpose, here and live together".
+
 Not required, and worth knowing: **`conventional-title`** checks that a pull request title is
 a conventional commit. It reports, but it does not block — and the title is the squash
 subject release-please reads (Hour 11), so a prose title merges and then silently drops out
 of the changelog. The nightly, performance and Cognito workflows, CodeQL and Doc Examples are
-advisory too.
+advisory too, and so are the newer workflows below.
+
+**The workflows that run only when they are needed.** Several workflows are path-filtered or
+dispatched by hand, and none of them is required. The path-filtered ones say why in their
+headers: a path-filtered workflow does not report at all on a pull request that touches none of
+its paths, and "a required check that does not report blocks a pull request for ever". The rule
+used instead, in `installer-macos.yml`'s words: "a pull request that runs this job merges only
+with it green at its head."
+
+| Workflow | Runs when | What it proves |
+|---|---|---|
+| `ground-truth.yml` (Ground-truth Replay) | a pull request touching a file the API imports on the core profile (or its own files), the `e2e` label, or a dispatch | seeded, realistic traffic through the public API to a freshly booted platform, and the results page checked against the event contract and an independent reference (`tests/ground_truth`) |
+| `scale-evidence.yml` (Scale evidence) | dispatched on `main`; a smoke run on pull requests touching the harness | the shipped Compose stack under k6 on a GitHub-hosted runner, with the release images `compose.yml` names: six request types, three runs each by default, merged into one results file a person commits verbatim |
+| `installer-macos.yml` | changes under `deploy/aws-installer/` or its tests | the AWS installer's harness and fault sweeps on macOS's `/bin/bash` 3.2 and BSD tools, which `Unit Tests` runs on Linux |
+| `demo-apps.yml` (Demo Apps) | changes under `demo/` and what its tests load | ShopLab's and StreamPulse's jest suites and the simulators' pytest suites, through the same `scripts/rc_evidence.py --suite` command the release-candidate evidence uses |
+| `contributor-guard.yml` | every pull request, on `pull_request_target` (one from this repository passes at once) | that a fork changes only the areas open to outside contributors (`scripts/contributor_guard.py`); it runs main's copy of the script, checks nothing of the pull request out, and reads the file list through the API |
+
+Two of these teach something general. `contributor-guard` runs on the privileged trigger
+(`pull_request_target` runs main's code, here with a read-only token, before anyone approves a
+fork's runs), so its shape is pinned by a test: no `if:` (a skipped job reports success), no
+`continue-on-error`, no `concurrency:`, nothing installed, and every event value reaches the script
+only through `env:`. And `scale-evidence` refuses to measure unless `compose.yml` is byte for byte
+the release tag's and the images' revision labels are the tag's commit: a capacity number is
+evidence only about what it measured. At this book's pin the harness exists and no results file
+has been committed yet; #1756, which held up the measurement, was fixed in v0.43.2 (Part III,
+Hour 9).
 
 > **Watch Out!** "Required" is a branch-protection setting, not a property of the workflow
 > file. A new job added to the PR gate isn't required until someone adds its exact check name
@@ -339,7 +397,12 @@ check runs and an unfiltered read can miss the gate).
   `docker-compose.test.yml`, frontend build, Bandit + gitleaks → one `Release Gate Summary`
   (`if: always()`, `toJSON(needs)`), on pull requests and every push to `main`.
 - 20 required checks, including `Security Scan Summary`, `DCO` and `Leak Guard`;
-  `conventional-title` is not required. "Required" lives in branch protection.
+  `conventional-title` is not required. "Required" lives in branch protection, which has
+  `strict` off and no review rule; the push-to-`main` Release Gate and the nightly catch what
+  two separately green pull requests break together.
+- Path-filtered and dispatched workflows (ground-truth replay, k6 scale evidence, installer on
+  macOS, demo apps) are never required, because a required check that does not report blocks a
+  pull request for ever; nor is the contributor guard, which checks what a fork may change.
 
 ---
 
@@ -417,9 +480,9 @@ What a release publishes, for version `X.Y.Z`:
 
 The documentation site is not part of that call. It is built from the tag by dispatching
 `gh workflow run docs.yml --ref vX.Y.Z`, and it deploys only for a final `v*` tag (an rc tag
-builds but does not deploy). The app's [CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/v0.36.4/CONTRIBUTING.md)
+builds but does not deploy). The app's [CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/CONTRIBUTING.md)
 describes how a release is cut and re-run, and
-[Releases, images and verification](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/self-hosting/releases.md)
+[Releases, images and verification](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/self-hosting/releases.md)
 says what a release publishes and how to check it.
 
 **The deploy's inputs.** The profile is a decision, not a default:
@@ -505,7 +568,8 @@ script text before bash parses it — and the next job holds the environment's A
 once. Before anything in AWS changes it refuses, each with a named error: an environment
 without its `AWS_ACCOUNT_ID` or `AWS_ROLE_ARN` secret or its `PUBLIC_BASE_URL` variable (a
 red run, never a silent skip); a role in the wrong account; stacks that are not deployed; a
-profile the stacks were not deployed for; a secret a task definition references that does
+profile the stacks were not deployed for; an API task family whose newest revision has no
+usable `FORWARDED_ALLOW_IPS` (below); a secret a task definition references that does
 not exist; a missing ECR repository; an earlier deployment still active; and an API 5xx alarm
 in ALARM (checked again just before the snapshot). The concurrency group is
 `deploy-<environment>` and is never cancelled: a deploy stopped halfway has migrated a
@@ -597,6 +661,45 @@ what ECS stored and refuses before CodeDeploy is asked for anything:
             --fargate-stack "$FARGATE_STACK"
 ```
 
+The same copy can lack `FORWARDED_ALLOW_IPS` (Part II, Hour 5), and then the new image would see
+every request as the load balancer's. So since v0.40.0 a second script refuses that, twice, with
+no `if:`: once on the family's newest revision **before anything is built or changed**, and once
+on what ECS stored for the registered ARN, just before the CodeDeploy deployment:
+
+```yaml
+# 📁 .github/workflows/deploy.yml
+      - name: Refuse an API task definition family without FORWARDED_ALLOW_IPS
+        run: |
+          set -euo pipefail
+          python3 -I -S scripts/refuse_api_revision_without_forwarded_allow_ips.py \
+            --family "$ECS_BACKEND_TASK_FAMILY" \
+            --release release \
+            --environment "$TARGET_ENV" \
+            --fargate-stack "$FARGATE_STACK"
+```
+
+Three habits in that script are worth stealing for any deploy guard:
+
+```python
+# 📁 scripts/refuse_api_revision_without_forwarded_allow_ips.py
+Exit status: 0 go on (the setting is usable, or the release predates it); 1
+refused; 2 could not tell (bad arguments, the AWS call failed, its answer
+could not be read, it describes another revision, or main() raised: an
+`::error::` naming the exception's type only). 2 also stops the deploy: "I
+could not read it" is not "it is set".
+```
+
+First, **"could not tell" fails closed**: exit 2 stops the deploy exactly as a refusal does.
+Second, it does not re-implement the rules. It imports `entry_problems` and
+`every_address_problems` from `backend.app.core.proxy_trust` in its own checkout and applies the
+staging-and-production rules, so the guard and the image's start-up check share one definition of
+a usable entry. Third, it can only read: its whole allow-list of AWS operations is
+`ecs describe-task-definition`. And it knows its history: a release from before the change still
+passes the old fixed list to uvicorn and needs nothing from the task definition, so such a
+release is skipped with a notice, but only when its entrypoint is positively identified by that
+old line; anything it cannot identify is checked. `rollback.yml` runs neither of these two
+checks.
+
 **The canary.** The AppSpec is the whole contract with CodeDeploy — which task definition,
 which container and port:
 
@@ -670,7 +773,7 @@ dashboard_task_definition_arn=experimentation-dashboard-<env>:<m>` — the revis
 serving **before** this deploy.
 
 **Before the first deploy of an environment** (each environment is its own AWS account, in
-`us-west-2`; the app's [deployment guide](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/deployment/deployment-guide.md)
+`us-west-2`; the app's [deployment guide](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/deployment/deployment-guide.md)
 has the full checklist):
 
 - a GitHub environment named `staging` or `prod` with a required reviewer, the **secrets**
@@ -713,7 +816,7 @@ the repository that built the image and it is case-sensitive: releases before 0.
 under the former repository's name, and `controlvar/controlvar` in lower case matches no signature:
 
 ```bash
-IMAGE=ghcr.io/controlvar/controlvar:core-0.36.4
+IMAGE=ghcr.io/controlvar/controlvar:core-0.43.2
 cosign verify "$IMAGE" \
   --certificate-identity-regexp '^https://github\.com/Controlvar/controlvar/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
@@ -730,9 +833,10 @@ docker inspect --format '{{index .Config.Labels "io.experimently.profile"}}' "$I
   `docs.yml --ref vX.Y.Z` by hand.
 - Deploy: one `Deploy` workflow for staging and prod; inputs environment, release tag,
   profile; preflight with no AWS credential; one approval; refusals before any change.
-- Order: build by digest → snapshot → one-shot migration task (`bootstrap`, the only schema
-  writer) → API revision (refused if it would migrate) → CodeDeploy canary approved by the
-  workflow → smoke test via `PUBLIC_BASE_URL` → dashboard rolling deploy → rollback line.
+- Order: refuse a task family without `FORWARDED_ALLOW_IPS` → build by digest → snapshot →
+  one-shot migration task (`bootstrap`, the only schema writer) → API revision (refused if it
+  would migrate, or lacks `FORWARDED_ALLOW_IPS`) → CodeDeploy canary approved by the workflow →
+  smoke test via `PUBLIC_BASE_URL` → dashboard rolling deploy → rollback line.
 
 ---
 
@@ -943,6 +1047,15 @@ remaining path from there involves restoring the database and the Engineering Le
 migrations are backward-compatible by rule, most rollbacks need no database step at all: the
 older release simply runs against the newer schema (the API tasks never migrate on start).
 
+> **By the Way** — the same order holds off AWS, more strictly. Where the API migrates on start
+> (Docker Compose, Part I, and the Helm chart's init container), the older image runs the
+> bootstrap when it starts, meets revisions it has no file for, and refuses to start: "this
+> database was migrated by a newer Controlvar release than this image". The runbook's rule there is
+> to downgrade first, with the newer release still running (one `alembic downgrade <id>` to each
+> head of the release you go back to: its core head, and on a full install its modules head too;
+> `alembic heads`, run with the older image, prints them), and only then start the older image.
+> Each downgrade in between runs, and the runbook's Step 2 says what each one loses.
+
 **Secrets.** What a deployment needs in Secrets Manager, per environment:
 
 | Secret | Who makes it | Profile |
@@ -1124,9 +1237,14 @@ renamed the dashboard service in the CDK but not in `rollback.yml`?
 sdk-live-contract (core)` from its reusable workflow), one each from Release Gate, Security Scan, Integration Tests,
 SDK Unit Tests, Infrastructure Tests, Lint, Regression Guard, DCO and Leak Guard. Running but
 not required: `conventional-title` (the strongest case for requiring it — a prose title
-silently drops a change out of the release), `Dependency Review`, CodeQL and Doc Examples.
-What the live repository enforces is a setting, not a file, which is why the audit has a command
-as well as a script.
+silently drops a change out of the release), `Dependency Review`, CodeQL, Doc Examples and
+`contributor-guard` (it always runs, so it could be required without blocking anything; one
+argument against is that only a maintainer merges a fork's pull request anyway, and the guard's
+red check is already in front of them). The path-filtered ones — Ground-truth
+Replay, Demo Apps, the installer on macOS, the scale smoke — cannot be required without blocking
+every pull request that does not touch their paths. What the live repository enforces is a
+setting, not a file, which is why the audit has a command as well as a script (and why
+`scripts/check_required_checks.sh` exists: it compares the two).
 
 **S4.2** — the migration task meets every state including an **empty** database (an
 environment's first deploy), and the historical migration chain cannot be replayed from
@@ -1185,4 +1303,4 @@ _You've finished Platform Operations. The other two specializations are
 [Experimentation Statistics](../experimentation-statistics/README.md) and
 [SDK Engineering](../sdk-engineering/README.md); the core path is in the [root README](../README.md);
 to contribute to Controlvar itself, start with its
-[CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/v0.36.4/CONTRIBUTING.md)._ 🛠️
+[CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/CONTRIBUTING.md)._ 🛠️

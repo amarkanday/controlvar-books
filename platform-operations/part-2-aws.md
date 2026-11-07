@@ -6,7 +6,8 @@
 
 The same images, on AWS. Hour 4 is the map: nine CDK stacks in Python (twelve in a full
 checkout), the environment switch that sizes them, the profile switch that decides whether
-the module stacks exist, and the dependency order that `cdk deploy --all` respects. Hour 5
+the module stacks exist, and the dependency order that `cdk deploy --all` respects, plus the
+beta installer that runs the whole sequence in your own account with one command. Hour 5
 is the request path: one internet-facing ALB in front of two ECS Fargate services — the API,
 which CodeDeploy replaces blue/green behind a canary, and the dashboard, which rolls — with
 secrets injected from Secrets Manager by complete ARN and auto-scaling on CPU and memory.
@@ -18,7 +19,7 @@ CDK source and its synthesized templates.
 
 ---
 
-## Hour 4 — The CDK app: nine stacks (twelve with the modules) and the order they depend on
+## Hour 4 — The CDK app: nine stacks (twelve with the modules), the order they depend on, and the one-command installer
 
 ### What & why
 
@@ -287,6 +288,111 @@ internet at all, in either direction.
 > resolves only once you add an alias record for it, pointing at the load balancer
 > `experimentation-<env>` (`docs/self-hosting/cdk.md` has the commands).
 
+#### The one-command installer (beta)
+
+Everything in that Watch Out, and the first migration of Hour 11, is a list of steps a person can
+get wrong. Since v0.37.0 the repository also ships a script that runs them:
+`deploy/aws-installer/controlvar-aws`, with two commands, `install` and `uninstall`. It is not a
+second way of deploying. It runs the app's CDK guide (`docs/self-hosting/cdk.md`) for the core
+profile, in `staging`'s shape, in `us-west-2`, so what it builds is the nine stacks of this Hour
+with their usual names (`experimentation-<stack>-staging`, whatever you call your install). It
+creates the two ECR repositories and the two secrets, requests a certificate and validates it with
+a record in your own Route 53 zone, copies the release's signed images into the repositories after
+verifying them with cosign, deploys the stacks, points your name at the load balancer, and checks
+the install from the internet. In between it creates the schema and the first administrator the
+way Hour 11's Deploy does, with the same two scripts (`scripts/register_task_definition.sh`, then
+`scripts/run_migration_task.sh` running `python -m backend.app.db.bootstrap`), and it takes the
+bootstrap's own log lines ("created the first administrator …", "Database bootstrap complete") as
+the proof, not the task's exit status alone.
+
+Its header is its contract:
+
+```bash
+# 📁 deploy/aws-installer/controlvar-aws
+# controlvar-aws: install Controlvar on AWS with one command, and remove it again (beta).
+#
+#   ./deploy/aws-installer/controlvar-aws install --account ID --domain HOST --alarm-email ADDRESS
+#   ./deploy/aws-installer/controlvar-aws uninstall --account ID
+#   ./deploy/aws-installer/controlvar-aws --help
+#
+# It runs the AWS CDK guide's steps (docs/self-hosting/cdk.md) for the core profile, in
+# staging's shape, in us-west-2, and records the account read-only before its first change so
+# that uninstall can compare. Run from a clone of Controlvar/controlvar that has its tags; the
+# CDK runs in a copy of the release's tag in the record (~/.controlvar-aws/), never in the
+# clone. Bash 3.2 or later; no set -e: every status is checked where it is made.
+#
+# Exit status: 0 done; 1 failed after something was made (the message says what exists and
+# what it bills); 2 refused, nothing changed; 130 interrupted.
+```
+
+and its `install` reads in the order an operator should think:
+
+```bash
+# 📁 deploy/aws-installer/controlvar-aws
+cv_install() {
+    cv_parse "$@"
+    ...
+    cv_check_started
+    cv_out "Checks (read-only; nothing is created yet):"
+    cv_check_tools
+    cv_check_release
+    ...
+    cv_check_permissions
+    cv_check_collisions
+    ...
+    cv_plan
+    if [ "$CV_PLAN_ONLY" -eq 1 ]; then
+        cv_out "Plan only: nothing was created. Run the same command without --plan-only to install."
+        exit 0
+    fi
+    cv_confirm
+    cv_step_sweep
+    cv_start
+    cv_step_bootstrap
+    cv_step_repositories_and_secrets
+    cv_step_certificate
+    cv_step_images
+    cv_step_deploy
+    cv_step_alias
+    cv_step_schema
+    cv_step_smoke
+    CV_STEP="the summary"
+    cv_summary
+    exit 0
+}
+```
+
+The design choices are the ones this book keeps returning to, applied to a tool that spends money:
+
+- **Refuse before changing anything.** Every check is read-only, and a failed one exits 2 with
+  nothing created. Among them: the sign-in is an IAM Identity Center profile and nothing else (no
+  access keys), renewed in the last 15 minutes; the account holds no `experimentation-` stack in
+  any enabled region; none of the repository or secret names is taken; IAM's policy simulator
+  allows every action the install makes; the Fargate vCPU quota is at least 3; and the name you
+  give is directly below exactly one public zone of the account, which the internet resolves.
+  `--plan-only` stops after the checks and the plan.
+- **Make the human type the account.** The confirmation is the account ID, typed. The guide warns
+  against filling `--account` from `aws sts get-caller-identity`: the installer compares the two,
+  "and a command that fills one from the other checks nothing."
+- **Record before the first change, compare after the last.** Just before it changes anything it
+  records what the account holds, under `~/.controlvar-aws/<account>-us-west-2/`. `uninstall`
+  deletes only what the install made, then compares the account with that record and lists what
+  AWS itself keeps (service-linked roles, managed keys, backups it removes in time); its report
+  ends `Not explained: none` when nothing else changed.
+- **Install never continues; uninstall always does.** An install that stops after making
+  something exits 1, says what exists and what it bills, and will not resume: you run `uninstall`,
+  then `install` again. `uninstall` can be re-run from any half-built state. One direction has to
+  be idempotent, and the safe one is the one that removes.
+- **Say what it costs.** The plan prints the price: about $10 a day while it is up, at
+  `us-west-2` list prices of 2026-10-17, used or not, and the summary repeats it.
+
+The label is meant. The app's guide says that, as of v0.37.0, it has been run end to end on AWS
+once (on 2026-10-27, from a Mac, installing v0.36.4), that it is not for production data, and that
+there are no upgrades: to move to a new release you uninstall and install again. Everything else is
+tested against a fake AWS CLI, on Linux in the `Unit Tests` job and on macOS's bash 3.2 in its own
+workflow (Part IV, Hour 10). One step it cannot do for you is the same as in Part III: the alarm
+email's SNS subscription must be confirmed by the recipient, or the alarms reach nobody.
+
 ### Try It Yourself
 
 Synth needs the inputs a real deploy needs. Placeholders are fine — nothing resolves an ARN
@@ -336,6 +442,9 @@ value you gave — an ARN carries an account ID, and a synth log is not a place 
 - Synth refuses missing inputs: certificate, public URL, complete secret ARNs, and
   `ALARM_EMAIL` in staging and prod. No account ID in the repo; no DNS record from any stack.
 - No stack deploys a `backend/lambda/` handler; the only functions are placeholders or inline.
+- `deploy/aws-installer/controlvar-aws` (beta, from v0.37.0) runs the CDK guide's steps for the
+  core profile in `staging`'s shape: read-only checks that exit 2, a plan, a typed account ID, a
+  record of the account before the first change; install never resumes, uninstall always can.
 
 ---
 
@@ -417,7 +526,7 @@ word is exactly six characters long, because that word is then parsed as the suf
 three, `jwt-secret` is the one that fails ("secret" is six characters), and every task needs
 it, so no task would start; `first-superuser-password` and `audit-hmac-key` would resolve.
 (That is also why a check that the complete ARN is right needs a *wrong* suffix as its
-negative control, not a missing one; the app's [deployment guide](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/deployment/deployment-guide.md) has the checklist.) Nothing can derive the suffix
+negative control, not a missing one; the app's [deployment guide](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/deployment/deployment-guide.md) has the checklist.) Nothing can derive the suffix
 at synth, so the operator supplies it:
 `JWT_SECRET_ARN` and `FIRST_SUPERUSER_PASSWORD_SECRET_ARN` always, `AUDIT_HMAC_KEY_SECRET_ARN`
 for the full profile (it signs the audit log; a core image never reads it, and naming a
@@ -502,8 +611,14 @@ non-secrets, `secrets=` for the rest, a container health check on `/health`:
                 "REDIS_HOST": redis_host,
                 "REDIS_PORT": redis_port,
                 "REDIS_SSL": "true",
+                ...
                 "RUN_MIGRATIONS": "false",
                 "SEED": "",
+                # The proxies the API believes X-Forwarded-For from, besides
+                # loopback and its own subnet: the load balancer, which sits
+                # in this VPC's public subnets. The whole VPC, because the
+                # task admits connections from the load balancer alone. ...
+                "FORWARDED_ALLOW_IPS": "10.0.0.0/16",
             },
             secrets={
                 "POSTGRES_USER": ecs.Secret.from_secrets_manager(
@@ -546,6 +661,21 @@ this database at start-up: an older image refuses to start against a schema a ne
 migrated, so a migrating entrypoint would turn every rollback, replacement and scale-out of
 an old revision into a crash loop. `infrastructure/tests/test_api_task_does_not_migrate.py`
 pins both values, and the Deploy workflow refuses an API revision that would migrate on start.
+
+`FORWARDED_ALLOW_IPS` is Part I, Hour 3's trust list applied to AWS. The API image believes
+`X-Forwarded-For` from loopback and the networks its task is attached to. In `awsvpc` mode that is
+the task's own private subnet, and the load balancer is not on it: it sits in the public subnets.
+Without this line the API would resolve every request to the load balancer's address, and every
+user would share one rate-limit counter per path. The value is the VPC's whole range,
+`10.0.0.0/16`, and `infrastructure/tests/test_api_task_forwarded_allow_ips.py` compares it exactly
+with the VPC's CIDR block in the synthesised assembly, for staging and prod, core and full; the
+migration and dashboard tasks do not carry it. The whole VPC is narrow enough because the task
+admits connections from the load balancer alone. One operational consequence follows: the setting
+reaches running tasks only through a `cdk deploy` of the Fargate stack, so an environment whose
+stack was last deployed from an older checkout lacks it, and `Deploy` refuses to go on until the
+stack is deployed again (Part IV, Hour 11). The CloudWatch Logs Insights query in the app's CDK
+guide (Part III, Hour 7 quotes it) counts requests per client address: users' addresses mean it
+works, and `10.0.x.x` on every line is the load balancer's.
 
 **The load balancer and its rules.** Two API target groups, blue and green, identical:
 port 8000, health check `/health` every 30 s, 30 s deregistration. The HTTPS listener's
@@ -758,6 +888,7 @@ cd infrastructure/cdk && ENVIRONMENT=prod ALARM_EMAIL=ops@your-domain.com \
 grep -n "DeploymentController\|CODE_DEPLOY\|CodeDeployDefault" /tmp/f.yaml
 grep -n -A3 "Secrets:" /tmp/f.yaml | head -30          # ValueFrom: complete ARNs, never values
 grep -n "RUN_MIGRATIONS" -A1 /tmp/f.yaml               # "false"
+grep -n "FORWARDED_ALLOW_IPS" -A1 /tmp/f.yaml          # 10.0.0.0/16, the VPC's range
 grep -n "PathPattern\|Priority" -A3 /tmp/f.yaml | head -30
 grep -n "MinCapacity\|MaxCapacity\|TargetValue" /tmp/f.yaml
 grep -n "experimentation-api-5xx" /tmp/f.yaml
@@ -782,6 +913,8 @@ Then repeat the `MinCapacity` grep with `ENVIRONMENT=staging` (and `/staging/` A
   no Redis secret.
 - The stack's image is `bootstrap` (never `latest`); the pipeline deploys by digest. The API
   runs `RUN_MIGRATIONS=false`: `cdk deploy` alone leaves no schema until the first Deploy.
+- The API task sets `FORWARDED_ALLOW_IPS=10.0.0.0/16` because the load balancer is not on the
+  task's own subnet; only a `cdk deploy` of the Fargate stack puts it on a running environment.
 - Scale from the environment's task count to 10. Run `scripts/check_live_target_group.py`
   before any `cdk deploy` of the Fargate stack on a running environment.
 
@@ -1118,6 +1251,16 @@ In a full deployment, the DynamoDB counters table first; on failure, Postgres (a
 primary-metric conversions), then `BanditState`, then priors. A core deployment has no
 counters table and starts at Postgres. Weights still update; they're just computed from the
 slower source.
+
+**Q7. The installer's step 6 fails after twenty minutes with three stacks created. Why does it
+not offer to carry on from step 6, and what do you run?**
+Its rule is that once anything exists it never continues (`deploy/aws-installer/lib/steps.sh`
+says so in its header):
+a resume would have to trust that each half-finished step left a known state, and building on a
+wrong guess costs more than starting again. It exits 1 and lists what exists and what it bills; you run
+`uninstall` (which can always be re-run, and deletes only what the record says the install made),
+then `install` again. An `install` on a computer whose record holds a started install refuses
+with exit 2 until you have.
 
 **Quiz.** `min_capacity=api_desired_count` and `WEB_CONCURRENCY=1`: at the floor, how many
 scheduler loops exist in prod and in staging, and how many run each tick?
