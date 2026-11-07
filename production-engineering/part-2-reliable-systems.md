@@ -1036,8 +1036,8 @@ the keys in it; an upgrade afterwards starts from no keys.
 ```
 
 A foreign key is the textbook choice, and here it would have been the wrong one: the lock it takes on the
-busiest table in the system would queue behind every in-flight event write, and every new write would
-queue behind it. The migration gives up referential integrity on purpose, says so, and has a test that
+busiest table in the system would queue behind every in-flight event write, and (because PostgreSQL queues
+later lock requests behind a waiting one) every new write would queue behind it. The migration gives up referential integrity on purpose, says so, and has a test that
 holds it to "takes no lock on `events`". And it is honest about the mixed-version window: while the
 previous release is still serving, *its* event writes are not deduplicated. An expand migration is safe
 for the old code; that does not mean the old code gets the new behaviour.
