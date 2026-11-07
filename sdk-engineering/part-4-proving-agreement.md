@@ -1013,8 +1013,8 @@ defers such a flag to the server on its own and keeps the rest of the ruleset. I
 says why: "A newer server can therefore add a flag shape without stopping local evaluation for
 every other flag." Which has a consequence for the gate. Against 0.3.0, P1's
 plant no longer freezes anything, the gate has nothing to catch, and P1 — which asserts that
-the gate catches it — goes red for the wrong reason. The change that pins 0.3.0 (#1801, open
-at this book's pin) therefore moves P1's plant to a _malformed known shape_ — a string
+the gate catches it — goes red for the wrong reason. The change that pins 0.3.0 (#1801, still
+open when this book's pin was taken, merged since) therefore moves P1's plant to a _malformed known shape_ — a string
 `rollout_percentage`, which every release, 0.3.0 included, still refuses whole — and renames
 it `test_p1_a_malformed_flag_freezes_the_evaluator`, with its four assertions unchanged. When
 the system under test improves, a planted defect has to be re-chosen so that it still
