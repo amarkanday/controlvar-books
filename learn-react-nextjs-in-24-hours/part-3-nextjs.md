@@ -54,12 +54,17 @@ frontend/src/pages/
 ├── power-calculator.tsx     # /power-calculator (public)
 ├── privacy.tsx              # /privacy (the public site's privacy notice)
 ├── account/
+│   ├── api-keys.tsx         # /account/api-keys (any signed-in user's own API keys)
 │   └── password.tsx         # /account/password (a local user changes their own password)
 ├── docs/
 │   └── index.tsx            # /docs — a hub of links to the documentation
 ├── experiments/
 │   ├── index.tsx            # /experiments
 │   ├── new.tsx              # /experiments/new (guided setup; ?advanced = one page)
+│   ├── holdouts.tsx         # /experiments/holdouts (the global holdout)
+│   ├── exclusion-groups/
+│   │   ├── index.tsx        # /experiments/exclusion-groups
+│   │   └── [id].tsx         # /experiments/exclusion-groups/:id
 │   └── [id].tsx             # /experiments/:id
 ├── feature-flags/
 │   ├── index.tsx · new.tsx · [id].tsx
@@ -116,6 +121,33 @@ Thin: the page is routing + a title + one component. (`query.id as string | unde
 `as` that Hour 4 would prefer as a `typeof` narrow; the `[id].tsx` experiment page does it
 the stricter way.) On the first render of a static export, `query` is `{}` until the router
 hydrates — hence the `if (!id)` loading branch, which every dynamic page has.
+
+The newest experiment pages show the router's precedence rule at work. `/experiments/holdouts`
+and `/experiments/exclusion-groups` sit beside `/experiments/[id]`. Next's router matches a
+predefined segment before a dynamic one, so `holdouts` is never read as an experiment id; the
+nginx blocks generated for the image (Hour 13) keep the same order, because their
+`try_files $uri $uri.html ...` tries the exported static page before falling back to
+`[id].html`. The thinnest page of all is one of the newest:
+
+```tsx
+// 📁 frontend/src/pages/account/api-keys.tsx
+/**
+ * Your own API keys, for every signed-in user. There is no admin guard: the
+ * route is protected like every dashboard page (`routeKind`), and the API
+ * scopes each call to the caller's own keys.
+ */
+export default function OwnApiKeysPage() {
+  return (
+    <div className="flex-1 bg-slate-50">
+      <PageTitle title="Your API keys" />
+      <OwnApiKeys />
+    </div>
+  );
+}
+```
+
+Its comment states the access rule, and the rule is the API's: every role may hold keys of its
+own, so the page needs no gate beyond being `protected` (Hour 11). Hour 15 opens `OwnApiKeys`.
 
 #### Module routes: the `@modules/*` seam
 
@@ -356,7 +388,7 @@ The classifier:
 /**
  * Routes rendered without the application shell. `/sso/complete` is one so
  * that it is never `protected`: RequireAuth would bounce an anonymous visitor
- * to `/login?next=`, carrying the SSO hand-off fragment along.
+ * to `/login?next=`, carrying the SSO hand-off fragment along (C2b).
  */
 const BARE_ROUTES = new Set<string>(['/login', '/', '/sso/complete']);
 
@@ -398,6 +430,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { AuthProvider } from "@/contexts/AuthContext";
 import { NotificationProvider } from "@/contexts/NotificationContext";
 import { ModulesProvider } from "@/contexts/ModulesContext";
+import { EffectivePermissionsProvider } from "@/contexts/EffectivePermissionsContext";
 import { ToastContainer } from "@/components/ToastContainer";
 import { AppShell } from "@/components/AppShell";
 import { RequireAuth } from "@/components/RequireAuth";
@@ -405,6 +438,10 @@ import { routeKind } from "@/utils/routes";
 
 export default function App({ Component, pageProps, router }: AppProps) {
   const kind = routeKind(router.pathname);
+  // The page's path, without its query or hash: a navigation to another page
+  // asks for the signed-in user's effective permissions again (#891), a
+  // filter written into the query string does not.
+  const navigationKey = (router.asPath ?? "").split(/[?#]/)[0];
 
   let page = <Component {...pageProps} />;
   if (kind === "protected") {
@@ -423,10 +460,12 @@ export default function App({ Component, pageProps, router }: AppProps) {
       </Head>
       <ModulesProvider>
         <AuthProvider>
-          <NotificationProvider>
-            {page}
-            <ToastContainer />
-          </NotificationProvider>
+          <EffectivePermissionsProvider navigationKey={navigationKey}>
+            <NotificationProvider>
+              {page}
+              <ToastContainer />
+            </NotificationProvider>
+          </EffectivePermissionsProvider>
         </AuthProvider>
       </ModulesProvider>
     </ErrorBoundary>
@@ -436,9 +475,16 @@ export default function App({ Component, pageProps, router }: AppProps) {
 
 Read the nesting from outside in: an `ErrorBoundary` (a class component that catches render
 errors and shows a fallback instead of a blank page), `<Head>` (title/favicon — pages
-override the title with `<PageTitle>`), the modules, auth and notification providers, then the page
-wrapped by its kind, then the toasts rendered once at the root so they overlay everything.
-`page` is built up by reassignment — a JSX value is just a value.
+override the title with `<PageTitle>`), the modules, auth, effective-permissions and notification
+providers, then the page wrapped by its kind, then the toasts rendered once at the root so they
+overlay everything. `page` is built up by reassignment — a JSX value is just a value.
+
+`navigationKey` is the one piece of routing the providers see. `_app` is rendered again on every
+client-side navigation, so the path it computes changes exactly when the user moves to another page;
+the effective-permissions provider (Hour 9) lists it as a dependency and asks for the user's map
+again. The comment records the second half of the decision: the query string and the hash are cut
+off, so a filter or a wizard step written into the URL (`?step=details`, Hour 15) does not send a
+request.
 
 The shell — nav items with access gating, and the active-link rule:
 
@@ -449,19 +495,19 @@ export const NAV_ITEMS: NavItem[] = [
   { label: 'Feature Flags', href: '/feature-flags', testId: 'nav-feature-flags' },
   { label: 'Segments', href: '/segments', testId: 'nav-segments' },
   // Every role: the audit API answers each one, narrowed to their own entries
-  // for DEVELOPER and VIEWER. `roles` also keeps it off anonymous renders.
+  // for anyone who may not read the audit log. `roles` also keeps it off
+  // anonymous renders.
   { label: 'Audit Log', href: '/admin/audit', testId: 'nav-audit-log', roles: AUDIT_LOG_ROLES },
   { label: 'Admin', href: '/admin', testId: 'nav-admin', superuser: true },
   { label: 'Docs', href: '/docs', testId: 'nav-docs' },
 ];
-
+...
 export function isNavActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 ...
   const marketing = isMarketingSite();
   const visibleNav = NAV_ITEMS.filter((item) => {
-    if (marketing) return item.href === '/docs';
     if (item.superuser) return user !== null && user.is_superuser === true;
     if (item.roles) return user !== null && item.roles.includes(user.role);
     return true;
@@ -473,8 +519,9 @@ export function isNavActive(pathname: string, href: string): boolean {
 columns on the user: an ADMIN-role user who is not a superuser gets 403 from every admin
 endpoint. An earlier version showed the item to `roles: ['ADMIN', 'DEVELOPER']`; a DEVELOPER
 saw it, clicked, and met a page of 403s. The rule the nav follows is the one the API applies.
-(`marketing` is the public-site build of the same code, Hour 13, which has no API and shows
-only Docs.)
+(`marketing` is the public-site build of the same code, Hour 13, which has no API. The filter no
+longer special-cases it: a few lines further down, the marketing build returns a different header
+altogether, `SiteHeader`, the public homepage's own, so none of these items is rendered there.)
 
 Modules add a second, collapsed group:
 
@@ -503,10 +550,12 @@ These links appear under a "More" disclosure only when `useModules()` (Hour 9's
 `ModulesProvider`) reports the module installed; in the core profile "More" carries a
 "Modules" link to the guide instead (not while the probe is still in flight, and not after a
 failed one, because the dashboard has no grounds to claim "this is the core profile" when all it
-knows is that the API did not answer). For a local-sign-in user "More" also holds "Change
-password" (`/account/password`), kept out of the header row because the extra item pushed the
-header past its row width and wrapped the other items. The primary nav is core chrome and never hard-links a
-route the core profile does not serve.
+knows is that the API did not answer). "More" also holds the signed-in user's own pages: "Your
+API keys" (`/account/api-keys`) for everyone, and "Change password" (`/account/password`) only for a
+local-sign-in user, because under any other provider that route answers 404. Both are kept out of
+the header row: an earlier "Change password" there pushed the header past its row width and
+wrapped the other items. The primary nav is core chrome and never hard-links a route the core
+profile does not serve.
 
 Nav gating is a convenience, not a control; the endpoints return 403 regardless.
 `isNavActive` is exported for its test, and it's the same prefix logic as `routeKind`; because
@@ -514,7 +563,9 @@ Nav gating is a convenience, not a control; the endpoints return 403 regardless.
 matching href, so only the more specific item is marked current there. "Audit Log" is a second
 example of a nav rule copied from the API rather than invented: it carries `roles: AUDIT_LOG_ROLES`
 (all four roles) because the audit API answers every signed-in user, narrowed to their own entries
-for DEVELOPER and VIEWER. The shell also renders a skip link (`href="#main-content"`) and `aria-current="page"` on the
+for anyone who may not read the whole log (that is: not a superuser, not ADMIN or ANALYST, and no
+`audit_log: read` grant; `readsAllAuditLogs` in `frontend/src/components/admin/audit/access.ts`
+mirrors it, for the sentence the page shows). The shell also renders a skip link (`href="#main-content"`) and `aria-current="page"` on the
 active item — accessibility that the Playwright a11y suite checks.
 
 `<PageTitle>` — the per-page title, because `<Head>` in `_app` sets only the default:
@@ -615,11 +666,13 @@ export interface RequireAuthProps {
  * Client-side gate for protected pages (the API is the real enforcement).
  *
  * - `loading`    → spinner
- * - `anonymous`  → `router.replace('/login?next=<current path>')`
+ * - `anonymous`  → `router.replace('/login?next=<current path>')`, or, after
+ *                  a logout in this tab, to the logout's own sign-in path
+ *                  (`afterLogoutPath`, plain `/login` unless it named a `next`)
  * - wrong role   → inline 403 view (`data-testid="require-auth-forbidden"`)
  */
 export function RequireAuth({ children, roles, superuser, fallbackPath = '/experiments', loading }: RequireAuthProps) {
-  const { status, user } = useAuth();
+  const { status, user, afterLogoutPath } = useAuth();
   const router = useRouter();
 
   const { isReady, asPath } = router;
@@ -629,6 +682,13 @@ export function RequireAuth({ children, roles, superuser, fallbackPath = '/exper
     // On a static export `asPath` is the route pattern (`/experiments/[id]`)
     // until the router is ready; wait so `next=` carries the real URL.
     if (!isReady) return;
+    // After a logout, this page belonged to the person who signed out: as
+    // `next` it took the next person to sign in there (#1006). The logout's
+    // path is also where its caller navigates, so the two cannot disagree.
+    if (afterLogoutPath) {
+      void router.replace(afterLogoutPath);
+      return;
+    }
     const next = safeNextPath(asPath, '/');
     const target =
       next === '/' || next.startsWith(LOGIN_PATH)
@@ -636,7 +696,7 @@ export function RequireAuth({ children, roles, superuser, fallbackPath = '/exper
         : `${LOGIN_PATH}?next=${encodeURIComponent(next)}`;
     void router.replace(target);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, isReady, asPath]);
+  }, [status, isReady, asPath, afterLogoutPath]);
 
   if (status === 'loading' || status === 'anonymous' || !user) {
     return (
@@ -690,9 +750,11 @@ export function RequireAuth({ children, roles, superuser, fallbackPath = '/exper
 ```
 
 The redirect is a side effect, so it's in an effect (never in render); it waits for
-`isReady`; it uses `replace`; and the `next=` value goes through `safeNextPath`, which
-refuses anything that isn't a same-origin absolute path — so a crafted
-`/login?next=//evil.com` can't bounce a user off-site after login:
+`isReady`; it uses `replace`; after a logout it goes where the logout said (Hour 9's
+`afterLogoutPath`), so a shared browser never carries one person's page into the next person's
+sign-in; and otherwise the `next=` value goes through `safeNextPath`, which refuses anything that
+isn't a same-origin absolute path — so a crafted `/login?next=//evil.com` can't bounce a user
+off-site after login:
 
 ```typescript
 // 📁 frontend/src/services/api.ts
@@ -715,6 +777,7 @@ A dynamic route reading its parameter the strict way:
 // 📁 frontend/src/pages/experiments/[id].tsx
   const router = useRouter();
   const { user } = useAuth();
+  const { effective, loading: permissionsLoading } = useEffectivePermissions();
   const rawId = router.query.id;
   const id = typeof rawId === 'string' ? rawId : undefined;
 ```
@@ -784,8 +847,11 @@ export const DEFAULT_AFTER_LOGIN = '/experiments';
 
 ### Try It Yourself
 
-Log out, open `/experiments/<some id>`, and watch the URL become
-`/login?next=%2Fexperiments%2F<id>`; log in and confirm you land back on the experiment. Then
+Log out, type `/experiments/<some id>` into the address bar, and watch the URL become
+`/login?next=%2Fexperiments%2F<id>`; log in and confirm you land back on the experiment. (A typed
+URL is a full page load, which starts a fresh `AuthProvider` with no `afterLogoutPath`.) Now press
+**Log out** while that experiment is on screen: the URL becomes plain `/login`, with no `next=`.
+Then
 try `/login?next=//example.com` and confirm you land on `/experiments`, not off-site. Finally,
 log in as a `VIEWER` and open `/admin` — the inline 403, not a redirect. Do the same as an
 ADMIN-role user who is not a superuser: the 403 now says "requires a superuser account".
@@ -799,8 +865,9 @@ ADMIN-role user who is not a superuser: the 403 now says "requires a superuser a
 
 ### Key takeaways
 
-- `RequireAuth`: spinner → redirect (`replace`, after `isReady`, via `safeNextPath`) → inline
-  403 (`superuser` first, then `roles`) → children. UX, not enforcement.
+- `RequireAuth`: spinner → redirect (`replace`, after `isReady`, to the logout's own path or
+  via `safeNextPath`) → inline 403 (`superuser` first, then `roles`) → children. UX, not
+  enforcement.
 - Admin pages are `export default withAdminGuard(Page)`, superuser-only by default, because the
   admin API is.
 - `useRouter`: `pathname` (pattern), `asPath` (real), `query`, `isReady`, `push`/`replace`.
@@ -1021,8 +1088,10 @@ network.)
 > **Did You Know?** One build-time variable decides *which site* the code is.
 > `NEXT_PUBLIC_SITE_MODE` defaults to `platform` (the dashboard a self-hoster runs);
 > `npm run build:marketing` sets it to `marketing` for the public website, which has no API
-> behind it. In that mode the shell shows only Docs and no sign-in button
-> (`frontend/src/utils/site-mode.ts`), and `frontend/scripts/prune-marketing-site.mjs` then deletes the
+> behind it. In that mode the shell shows the public site's own header instead of the dashboard's
+> (`SiteHeader`: Docs, Power calculator and Source, and no sign-in button, because there is
+> nothing to sign in to; `frontend/src/utils/site-mode.ts` explains why a dead sign-in button "reads
+> as a broken product"), and `frontend/scripts/prune-marketing-site.mjs` then deletes the
 > dashboard routes from `out/` — refusing to run unless the mode is `marketing`, and refusing
 > when it matched nothing, so it can never quietly delete the dashboard from a platform build.
 

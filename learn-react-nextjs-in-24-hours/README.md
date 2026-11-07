@@ -8,7 +8,7 @@
 > reconnect, charts that render in tests, a rule builder that emits the exact JSON a backend
 > expects. This book is different. Every concept is taught **twice**: once in the abstract,
 > and once with a real snippet pulled from the **Controlvar** dashboard (a Next.js 16
-> pages-router app on React 19, built with Turbopack; strict TypeScript; about 1,800 Jest test
+> pages-router app on React 19, built with Turbopack; strict TypeScript; about 2,600 Jest test
 > cases counted from `it(` and `test(` calls under `frontend/src` and `modules/frontend/src`;
 > Playwright browser journeys that gate every pull request, plus a nightly accessibility
 > suite). By Hour 24 you'll be able to _write_ a page in this codebase, not just
@@ -46,7 +46,7 @@ same rhythm so you can pace yourself:
 Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions).
 
 > **Convention in this book.** Code blocks tagged `// 📁 path/to/file.ts` are excerpts of real
-> Controlvar source at the reference release below — mostly under `frontend/`, some under
+> Controlvar source at the reference commit below — mostly under `frontend/`, some under
 > `modules/frontend/`, `backend/` or `demo/`; `...` marks lines left out. Blocks with no path
 > are illustrative. `// ✅` marks the
 > idiom we want; `// ❌` marks the anti-pattern it replaces. Have the dashboard running
@@ -73,9 +73,9 @@ each over the next 24 hours:
 5. **Mirror server validation for feedback; show the server's message when they
    disagree — except where the status alone says what happened, and then say it in the
    page's own words with the fix.** → Hour 15
-6. **Never more permissive than the API.** Offer what the user's role (or superuser flag, or
-   installed modules) allows, mirror the API's rule exactly, and say why when a control is
-   missing. → Hours 11, 12, 16
+6. **Never more permissive than the API.** Offer what the user's role (or superuser flag,
+   effective permissions, or installed modules) allows, mirror the API's rule exactly, and say
+   why when a control is missing. → Hours 9, 11, 12, 16
 7. **`data-testid` on anything a test or a scenario runner needs to find.** Tests query by
    role and text first, by test id when structure would otherwise leak into the test. →
    Hours 21, 22
@@ -130,14 +130,14 @@ each over the next 24 hours:
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`). Controlvar was called Experimently before 0.35.0, and you
-will still meet the old name in some identifiers: the `experimently.token` and `experimently.bearer`
-strings, the `EXPERIMENTLY_PROFILE` build argument, the `experimently-web` image name in the Dockerfile's
-own comments. Those are quoted as the code spells them. Every `// 📁` excerpt was copied from the file at
-that tag, and the tools in this repository's `tools/` directory check that the paths exist and that every
-identifier in an excerpt occurs in its file. I did not run the dashboard, Jest or Playwright to produce the
-output shown in the exercises: where a Try It Yourself shows a result, it comes from reading the code at
-that tag. Files move; if a path 404s, `git grep` the symbol in both dashboard trees (e.g.
+Verified against Controlvar `main` at `09d815ea` (after v0.43.2). Controlvar was called Experimently
+before 0.35.0, and you will still meet the old name in some identifiers: the `experimently.token` and
+`experimently.bearer` strings, the `EXPERIMENTLY_PROFILE` build argument, the `experimently-web` image name
+in the Dockerfile's own comments. Those are quoted as the code spells them. Every `// 📁` excerpt was
+copied from the file at that commit, and the tools in this repository's `tools/` directory check that the
+paths exist and that every identifier in an excerpt occurs in its file. I did not run the dashboard, Jest
+or Playwright to produce the output shown in the exercises: where a Try It Yourself shows a result, it
+comes from reading the code at that commit. Files move; if a path 404s, `git grep` the symbol in both dashboard trees (e.g.
 `git grep -n "export function apiFetch" -- frontend/src modules/frontend/src`). The _patterns_ outlast the
 line numbers. To re-check the book yourself, follow `tools/README.md`.
 

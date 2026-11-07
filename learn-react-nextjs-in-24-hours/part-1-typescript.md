@@ -442,8 +442,11 @@ export async function apiFetch<T = unknown>(
     redirectOn401 = true,
     headers: extraHeaders,
     body: rawBody,
+    timeoutMs: rawTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal: callerSignal,
     ...rest
   } = options;
+  const timeoutMs = checkTimeout(rawTimeoutMs);
 
   const url = apiUrl(path, query);
   const headers: Record<string, string> = { Accept: 'application/json', ...(extraHeaders ?? {}) };
@@ -464,26 +467,74 @@ export async function apiFetch<T = unknown>(
   const init: RequestInit = { ...rest, headers };
   if (body !== undefined) init.body = body;
 
-  let response: LooseResponse;
+  const deadline = startDeadline(timeoutMs, callerSignal);
+  init.signal = deadline.signal;
   try {
-    response = (await fetch(url, init)) as LooseResponse;
-  } catch (err) {
-    throw new ApiError({ status: 0, detail: unreachableMessage(), cause: err });
-  }
+    let response: LooseResponse;
+    try {
+      response = (await fetch(url, init)) as LooseResponse;
+    } catch (err) {
+      if (deadline.expired) throw timeoutError(timeoutMs, init.method ?? 'GET', err);
+      throw new ApiError({ status: 0, detail: unreachableMessage(), cause: err });
+    } finally {
+      deadline.stop();
+    }
 
-  if (response.ok) {
-    return readSuccessBody<T>(response, path);
-  }
+    if (response.ok) {
+      return await readSuccessBody<T>(response, path);
+    }
 
-  throw await failureFrom(response, auth, redirectOn401);
+    throw await failureFrom(response, auth, redirectOn401);
+  } finally {
+    // After the body is read, so a caller's abort still cancels the read.
+    deadline.release();
+  }
 }
 ```
 
 The wrapper reads top to bottom as the life of one request: build the URL, build the headers (JSON
 body gets its `Content-Type`, the bearer token is attached unless the caller passed an
-`Authorization` header of its own), call `fetch`, and branch. A thrown `fetch` (the browser could
-not reach the API at all) becomes an `ApiError` with `status: 0`. A 2xx goes to `readSuccessBody<T>`.
-Anything else is handed to `failureFrom`, which builds the error:
+`Authorization` header of its own), start a deadline, call `fetch`, and branch. A thrown `fetch`
+becomes an `ApiError` with `status: 0`, and there are now two reasons it can throw. Either the browser
+could not reach the API at all (the `unreachableMessage()` case), or the **deadline** fired first.
+A 2xx goes to `readSuccessBody<T>`. Anything else is handed to `failureFrom`, which builds the error.
+
+#### The deadline: why a request now gives up
+
+Before #1592 `apiFetch` had no deadline of its own: a request to an API that accepted the
+connection and then said nothing waited for as long as the browser let it. Now every
+`apiFetch` waits at most `DEFAULT_REQUEST_TIMEOUT_MS` (30,000 ms) **for the response headers**; the
+few routes that are slow by nature (results, the audit-log export, the warehouse checks) wait
+`LONG_REQUEST_TIMEOUT_MS` (120,000 ms) instead. The body is not timed: a response that
+started and then stalls is waited for, which is what the `stop()` in the inner `finally` means.
+
+Three details are worth reading closely, because each is a decision written as code:
+
+- `checkTimeout(rawTimeoutMs)` throws a `TypeError` for anything that is not a number of
+  milliseconds above 0 and at most `MAX_REQUEST_TIMEOUT_MS` (2,147,483,647, the longest delay
+  `setTimeout` honours; a longer one fires at once). There is deliberately no "no deadline" value.
+- `startDeadline` makes one `AbortController` per request and aborts it from a timer **or** from the
+  caller's own `signal`, forwarded by a listener. Its `expired` flag is set only by the timer, so a
+  caller that cancels its own request never sees "timed out".
+- `timeoutError` decides what a time-out *means*. A GET, HEAD or OPTIONS changed nothing, so the
+  message says "Try again". Any other method may still have been carried out by the API after the
+  dashboard stopped waiting, so the `ApiError` is `outcomeUnknown` and its message says so: "the
+  request may or may not have been carried out. Reload the page and check before you try again."
+
+```typescript
+// 📁 frontend/src/services/api.ts
+function timeoutError(timeoutMs: number, method: string, cause: unknown): ApiError {
+  const outcomeUnknown = !SAFE_METHODS.has(method.toUpperCase());
+  const message = timeoutMessage(timeoutMs, outcomeUnknown);
+  return new ApiError({ status: 0, detail: message, message, cause, timedOut: true, outcomeUnknown });
+}
+```
+
+A time-out is still `status: 0`, so code that turns an error into words checks `timedOut` **before**
+it checks for an unreachable API. The login page's `loginErrorMessage` does exactly that
+(`if (err.timedOut) return signInTimeoutMessage();` comes before `if (err.status === 0) ...`), and so
+do the newer components that map a failure to their own sentences (Hour 15). Here is
+`failureFrom`:
 
 ```typescript
 // 📁 frontend/src/services/api.ts
@@ -527,8 +578,8 @@ response header: a 5xx message carries `Request ID: ...`, which an administrator
 API log for. `ApiError` keeps it as `requestId`, keeps a `Retry-After` header as `retryAfter`
 (the API's rate limiter sends one with a 429), and its `isServerError` getter is `status >= 500`.
 The error is built in its own function because a second caller needs it: `apiDownload`, which
-fetches a file (the audit-log export) with the same token and the same error handling but does not parse the
-body as JSON.
+fetches a file (the audit-log export) with the same token and the same error handling, waits the
+long deadline for the headers, and does not parse the body as JSON.
 
 Typed call sites — the service supplies `T`:
 
@@ -557,6 +608,8 @@ export class ApiError extends Error {
   readonly code?: string;
   readonly requestId?: string;
   readonly retryAfter?: number;
+  readonly timedOut: boolean;
+  readonly outcomeUnknown: boolean;
   ...
 }
 
@@ -696,6 +749,9 @@ in a Jest REPL (or a scratch test) and read the string it builds.
   `Array.isArray`, `in`, `instanceof`, type guards (`err is ApiError`).
 - `as` only after a check (or for the caller's promise about the API).
 - `Promise<T>` types async results; 204 → `undefined as T`.
+- Every `apiFetch` has a deadline: 30 s for the headers by default, `timeoutMs` to change it, no
+  way to switch it off. A time-out is `status: 0` with `timedOut`; a timed-out write is also
+  `outcomeUnknown`. Check `timedOut` before treating `status: 0` as "unreachable".
 
 ---
 
@@ -798,6 +854,42 @@ function readHeroConfig(configuration: Record<string, unknown> | null) {
 `as const` makes the literal values readonly literals (`'video' | 'image'`), so
 `media === 'video'` downstream is type-checked rather than a string comparison.
 
+A discriminated union that is also generic — the state of one read on the experiment page (its
+exclusion group, or the global holdout):
+
+```typescript
+// 📁 frontend/src/hooks/useExperimentEligibility.ts
+export type EligibilityRead<T> =
+  | { kind: 'loading' }
+  | { kind: 'present'; value: T }
+  | { kind: 'absent' }
+  | { kind: 'refused' }
+  | { kind: 'error' };
+
+type Answer<T> = Exclude<EligibilityRead<T>, { kind: 'loading' }>;
+```
+
+Only the `present` member has a `value`, so the page can read it only after checking `kind`:
+
+```tsx
+// 📁 frontend/src/pages/experiments/[id].tsx
+        {holdout.kind === 'present' && (
+          <dd data-testid="experiment-holdout">
+            <Link href="/experiments/holdouts" className={NOTE_LINK}>
+              {holdoutLabel(holdout.value)}
+            </Link>
+          </dd>
+        )}
+```
+
+Why five members and not `GlobalHoldout | null`? Because `null` would have to mean four different
+things — not loaded yet, none active, not allowed to see it, could not be read — and the page says
+something different for each (`ELIGIBILITY_COPY`, with a test id per state). The parser that feeds it
+draws the same line: JSON `null` from the API is `absent` ("None active"), but an empty body, an
+inactive holdout or any other odd shape is `error`, "never 'none', which would be a claim the page
+cannot back". `Exclude<EligibilityRead<T>, { kind: 'loading' }>` is a built-in utility type
+removing one member from the union: an *answer* is anything but `loading`.
+
 The mirror, with its loose-on-purpose field and its `Record<string, unknown>` blobs:
 
 ```typescript
@@ -811,7 +903,10 @@ The mirror, with its loose-on-purpose field and its `Record<string, unknown>` bl
 `status` is the exact union (the page branches on it: `ACTIONS_BY_STATUS[experiment.status]`);
 `experiment_type` is loose (the page only labels it); `targeting_rules` and `configuration`
 are opaque JSON the dashboard passes through (the rule builder has its own typed shape,
-Hour 19).
+Hour 19). The flag type has a newer field written the same way: `value_type?: string` in
+`frontend/src/services/featureFlags.ts` is documented as "read as any string so a type a later
+release adds is still shown", even though the API today sends one of `boolean`, `string`,
+`number` or `json`.
 
 > **Watch Out!** `||` for defaults is the JavaScript zero trap: `conversions || '—'` renders
 > `—` for a real zero. Use `??` for "missing," and be explicit (`value === null ? '—' : value`)
@@ -909,6 +1004,13 @@ the module and a module it does not carry falls back to the stub. `tsconfig.core
 only the stub target and excludes `../modules`, so a core type-check cannot quietly resolve
 to module code that a core build will not have.
 
+**Q8. A `POST` to create something times out after 30 seconds. Why does the dashboard not say
+"it failed"?**
+Because it does not know. The API may have received the request and carried it out after the
+dashboard stopped waiting. `timeoutError` marks any method other than GET, HEAD or OPTIONS as
+`outcomeUnknown`, and the message asks the user to reload and check before trying again, so a
+retry cannot create a second copy unseen.
+
 **Quiz.** `const id = typeof rawId === 'string' ? rawId : undefined;` — what types can
 `router.query.id` be, and which does this exclude?
 → `string | string[] | undefined`; it excludes the array (a repeated query parameter),
@@ -976,6 +1078,15 @@ export const STAGE_STATUS_LABELS: Record<RolloutStageStatus, string> = {
   completed: 'Completed',
 };
 ```
+
+The dashboard now has a mirror of its own, written when the flag page gained its rollout-schedule
+section (Hour 15): `RolloutStage` in `frontend/src/services/featureFlags.ts`. Compare yours with
+it. It calls the trigger union `RolloutTriggerType`, it carries the fields this exercise left out
+(`rollout_schedule_id`, `trigger_configuration`, `completed_date`, `started_at` and the
+timestamps), and its status union has a fourth member, `'failed'`, because the backend's
+`RolloutStageStatus` enum has one. The exercise's field list was incomplete; a mirror copied from a
+description instead of from the schema inherits the description's gaps. That is why the house
+rule says to mirror the schema itself.
 
 **S1.2**
 
