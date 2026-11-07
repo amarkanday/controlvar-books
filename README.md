@@ -36,8 +36,9 @@ assumes.
 
 ## The library
 
-Eight books in two groups. The **core path** takes you from zero to reading and extending the whole system; the
-**specializations** go deep on the subsystems that make the product what it is.
+Eight books in two groups, and a short guide for contributors. The **core path** takes you from zero to reading
+and extending the whole system; the **specializations** go deep on the subsystems that make the product what it
+is; **Before You Change Controlvar** is the one to read before your first pull request.
 
 **Core path, in order:**
 
@@ -71,6 +72,13 @@ Eight books in two groups. The **core path** takes you from zero to reading and 
    experiment design and the decision lifecycle, evaluating LLM features, retries and replicas, database evolution,
    security and privacy, retiring a flag, and a worked review of a change that crosses the API, storage, dashboard
    and SDKs.
+
+**Before your first change, at any point:**
+
+9. **[Before You Change Controlvar](./before-you-change-controlvar/README.md)**: a short guide for someone about
+   to make a first change: the codebase map, running the stack, where each decision lives, the tests and gates a
+   pull request must pass, how changes are planned and reviewed, one real fix from issue to release, and the
+   changes whose effects land far from where they are made. It links to the lessons above that go deeper.
 
 ## How every book works
 
