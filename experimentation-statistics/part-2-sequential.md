@@ -292,7 +292,10 @@ reads **current totals**, not a history:
   same arm on every call) — a third or fourth arm is not analysed by this route;
 - on the experiment's **primary metric** (else its first metric);
 - `*_total` = assignment rows for the variant; `*_successes` = **converting users**, counted
-  exactly as `/results` counts them (`count_converting_users`, Part I Hour 2).
+  exactly as `/results` counts them (`count_converting_users`, Part I Hour 2), whatever the
+  metric's type. A revenue primary metric is tested here as the share of users who sent its
+  event, not as its mean per user, so the Sequential tab and the metric's `/results` row can
+  answer different questions about the same metric.
 
 The same function builds the `sequential_testing` block embedded in `GET /results/{id}` when
 sequential testing is enabled, so the two answers cannot disagree. `run_sequential_analysis`
@@ -490,9 +493,10 @@ both, so the agreement holds at whatever level you asked for.
 > δ̂ ± √(V + τ²)·√(2·ln(1/α)). That was the platform's formula before issue #231 was fixed.
 > It never narrowed below about ±0.078 at τ² = 0.001 however much data arrived, and it could
 > contain 0 while `can_stop` said stop. The inverted form above replaced it, in engine
-> version 1.2.0, and the switch to the Agresti–Caffo variance came with engine version 1.4.0
-> (Part IV Hour 12). Both changes move numbers a client may have stored, which is what the
-> engine version is for.
+> version 1.2.0, and the switch to the Agresti–Caffo variance came with engine version 1.4.0.
+> The engine is at 1.8.0 now; none of 1.5.0–1.8.0 touched the sequential analysis (Part IV
+> Hour 12). Both changes move numbers a client may have stored, which is what the engine
+> version is for.
 
 `backend/tests/unit/stats_validation/test_sequential_confidence_sequence.py` holds the
 replacement to its two properties: agreement with `can_stop` and narrowing as n grows.

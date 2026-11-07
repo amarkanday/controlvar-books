@@ -36,6 +36,9 @@
   the bandit scheduler, or the results UI.
 - Analysts and PMs who want to know what the dashboard's numbers actually mean and when to
   distrust them.
+- Engineers about to change Controlvar's analysis code. Read Part IV Hour 12 before your first
+  pull request: any change that moves a number the engine returns, caches or stores must bump
+  `ENGINE_VERSION` in the same change, and the tests that enforce this are listed there.
 - You need the **core four** books (especially the Build book's Days 6 and 19) — this
   assumes you know how assignments and events are stored, how results are computed and
   cached, and how the Monte Carlo seed works. Maths: comfortable with means, variances and
@@ -57,7 +60,7 @@ settings at ports nothing listens on if you are working on a machine that also r
 stack: none of the numbers here needs a database.
 
 > **Convention in this book.** Code blocks tagged `# 📁 path/to/file` are real Controlvar
-> source at v0.36.4, quoted as excerpts. Blocks with no path are illustrative (the Try Its and
+> source at commit `09d815ea` (`main` after v0.43.2), quoted as excerpts. Blocks with no path are illustrative (the Try Its and
 > solutions are code you run, not excerpts). `# ✅` marks the idiom we want and `# ❌` the
 > anti-pattern it replaces. The sidebars follow the original books: **By the Way** for a
 > side road, **Watch Out!** for a trap, **Did You Know?** for the thing you will want to tell
@@ -65,13 +68,14 @@ stack: none of the numbers here needs a database.
 
 ### What is live, what is beta, what is API-only
 
-| Analysis                                   | Status at v0.36.4                                                                |
+| Analysis                                   | Status at `09d815ea`                                                             |
 | ------------------------------------------ | -------------------------------------------------------------------------------- |
-| `/results` (Fisher, intervals, correction) | live; every metric analysed as converting users / assigned users, at the experiment's stored level and correction |
+| `/results` (Fisher or Welch, intervals, correction) | live; a conversion metric as converting users / assigned users (Fisher), a revenue, count, duration or custom metric as its mean per assigned user (Welch); each treatment's difference, lift and impact with intervals; at the experiment's stored level and correction (Part I Hour 2) |
 | SRM check                                  | live: on the `/results` response and above the dashboard's tabs; a failed check turns the recommendation into `INCONCLUSIVE` |
 | Sequential (mSPRT + confidence sequence)   | **beta**: no alpha-spending table (Part II)                                      |
 | Bayesian (PtBB, expected loss, decision)   | live, on the Overview tab and the API; the decision is a recommendation, nothing acts on it |
 | CUPED route                                | numbers `ga` (each user's own pre-assignment events), route `x-stability: beta`, API only (Part III Hour 7) |
+| Winsorization                              | `variance_reduction_config.method = winsorization` is stored and clips nothing (Part III Hour 7) |
 | Post-stratification route                  | answers **501** (not available yet)                                              |
 | Interactions                               | `/scan`: overlap only; the pair route is **beta** and tests the interaction (Part IV Hour 11) |
 | Novelty, SUTVA                             | not computed (Part IV Hour 11)                                                   |
@@ -98,7 +102,7 @@ valid.
 ### Part I — Foundations _(Hours 1–3)_ → [`part-1-foundations.md`](./part-1-foundations.md)
 
 - **Hour 1** — Randomisation, exchangeability, and the sample-ratio mismatch check
-- **Hour 2** — Proportions: the z-test, Fisher's exact test, confidence intervals, effect size
+- **Hour 2** — Proportions and means: Fisher's exact test, Welch's t-test, the z-test, intervals, effect size
 - **Hour 3** — Power and sample size: what "minimum sample size" protects you from
 
 ### Part II — Peeking Safely _(Hours 4–6)_ → [`part-2-sequential.md`](./part-2-sequential.md)
@@ -133,16 +137,23 @@ Specialize:                                    ├─ ⭐ Experimentation Statis
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`; `79f8ed1897733c74b288dac14e036fabbbe85f12`). The
-statistics engine there is `ENGINE_VERSION` 1.4.0. The numbers in the Try Its and Solutions of
-Parts I–III, and of Hours 10 and 11 and the seed arithmetic of Hour 12, were re-run against a
-clone of that tag, importing the app's own modules with the database and Redis pointed at ports
-nothing listens on. What was **not** run: the steps that need a running stack (the `curl`
-calls, the `analysis_snapshots` query, the cache invalidation in Hour 12), the dashboard, and
-the warehouse routes themselves; those are read from the code. Excerpts tagged `# 📁` are
-checked by the repository's snippet gate (`tools/README.md`: V2 and V3), which verifies that the
-file exists at the pinned tag and that every identifier in the excerpt is in it; it does not
-compare literals, so a changed default inside a quoted line is for you to re-check.
+Verified against Controlvar `main` at `09d815ea` (after v0.43.2;
+`09d815ea18273982d710fb444ba76f05a18bc5c6`). The statistics engine there is `ENGINE_VERSION`
+1.8.0. Every number in the Try Its and Solutions of Parts I–III, of Hours 10 and 11 and the seed
+arithmetic of Hour 12 was re-run against a clone of that commit, importing the app's own modules
+with the database and Redis pointed at ports nothing listens on. The engine moved from 1.4.0 to
+1.8.0 since the previous edition and no number the book already printed changed: those
+versions changed what a lower-is-better metric, or a non-conversion metric on `/results`, gets,
+and added fields, and none of the earlier examples is either. The new examples (means per user, the difference intervals,
+`lower_is_better`, the false-winner battery) were run the same way. The engine's fingerprint
+tests, the stats-validation suite and the ground-truth library's unit gates were run and pass at
+that commit. What was **not** run: the steps that need a running stack (the `curl` calls, the
+`analysis_snapshots` query, the cache invalidation in Hour 12, the ground-truth replay itself),
+the dashboard, and the warehouse routes themselves; those are read from the code. Excerpts tagged
+`# 📁` are checked by the repository's snippet gate (`tools/README.md`: V2 and V3), which
+verifies that the file exists at the pinned commit and that every identifier in the excerpt is
+in it; it does not compare literals, so a changed default inside a quoted line is for you to
+re-check.
 
 ## Related reading — Production Engineering
 

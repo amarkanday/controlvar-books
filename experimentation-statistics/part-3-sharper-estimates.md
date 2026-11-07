@@ -43,7 +43,8 @@ to _doubling_ the sample size, for free.
 **Winsorization** is the blunt companion for heavy-tailed metrics like revenue: clip the top
 percentile so a single $10,000 order doesn't dominate the variance. It changes the estimand
 slightly (you're now measuring "revenue capped at the 99th percentile") in exchange for a
-usable interval.
+usable interval. Controlvar stores a winsorization setting and applies it nowhere: the library
+function below is the method, and no results view calls it.
 
 ### How Controlvar does it
 
@@ -217,10 +218,13 @@ each user's own history.
 - **The config** is the experiment's `variance_reduction_config`: `method` (`none`, `cuped`,
   `cuped_plus`, `winsorization`), `covariate_metric_id`, `covariate_lookback_days` (1–90,
   default 7) and `winsorization_percentile` (50–100, default 99). `none` means θ is exactly 0.
-  `cuped_plus` is computed as `cuped` and each row's `method` says `cuped`. `winsorization`
-  clips outcomes, which only makes sense for mean metrics, and the route analyses proportions
-  only: it lists each proportion metric as `winsorization_needs_mean_metric` rather than clipping
-  a 0/1 outcome to zero.
+  `cuped_plus` is computed as `cuped` and each row's `method` says `cuped`. `winsorization` is
+  **accepted and stored, and applied by no results view** (#1739). This route analyses
+  proportions only and lists each one as `winsorization_needs_mean_metric` rather than clip a 0/1
+  outcome to zero. The views that do analyse a mean — `/results`' revenue, count, duration and
+  custom metrics (Part I Hour 2) — do not read the setting either, so a metric's numbers are the
+  same whatever `winsorization_percentile` says, and one very large spender moves a revenue
+  mean and widens its interval in full.
 - Only the **API** carries it. The dashboard shows no CUPED figure.
 
 `CupedService.apply_cuped_ratio` (a ratio-metric variant that ignores X) and the other library
@@ -295,7 +299,7 @@ and a 0/1 outcome ("bought during the test"), from sums:
 ...     r = cuped_metric_result([(C, nC, *sc), (T, nT, *st)], 0.95, "none", metric=M, adjust=adjust)[0]
 ...     print(adjust, round(r["adjusted_effect"], 4), round(r["adjusted_se"], 5), r["theta"], round(r["variance_reduction_pct"], 1))
 False 0.0116 0.00325 0.0 0.0
-True 0.0101 0.00302 0.26... 13.4
+True 0.0101 0.00302 0.2595... 13.4
 ```
 
 Two things to notice. The standard error falls from 0.00325 to 0.00302 (13.4% less variance): a
@@ -315,8 +319,9 @@ reason it is worth having. The `adjust=False` row, with `theta == 0.0` and the u
   `covariate_lookback_days` before assignment, and did the server receive it before the user was
   assigned. Only proportion metrics are analysed; the numbers are `ga`, the route is
   `x-stability: beta`, and the dashboard shows no CUPED figure.
-- Winsorize heavy tails (changes the estimand slightly); post-stratification for categorical
-  covariates — whose route answers 501 until it has real per-user rows.
+- Winsorize heavy tails (changes the estimand slightly) — by hand: the platform stores
+  `winsorization` and clips nothing. Post-stratification for categorical covariates — whose
+  route answers 501 until it has real per-user rows.
 - Adjusting on a post-treatment variable introduces bias — X must be pre-experiment.
 
 ---
@@ -564,6 +569,30 @@ the recommendation and ends the experiment.
 **Turning it on.** Bayesian analysis is enabled through the experiments API:
 `bayesian_enabled: true` on create or update, with an optional `bayesian_config` (omitted,
 the default `BayesianConfig` is stored). A cloned experiment keeps its analysis settings.
+It reads converting users on the primary metric (else the first) whatever the metric's type,
+so a revenue primary metric gets a Beta-Binomial on the share of users who bought, not on
+revenue per user.
+
+**Lower is better.** Since engine 1.5.0 the analysis reads the primary metric's
+`lower_is_better` (Part I Hour 2), and the way it does so keeps the seed meaningful:
+
+```python
+# 📁 backend/app/services/bayesian_service.py
+        # One matrix of draws feeds PtBB, expected loss and the ROPE check.
+        samples = _draw_posterior_samples(posteriors, n_samples, seed)
+        if lower_is_better:
+            # Negated after the seeded draw: the same stream, best = lowest.
+            samples = -samples
+        ptbb = _ptbb_from_samples(samples)
+        losses = _expected_loss_from_samples(samples)
+```
+
+The draws are made exactly as a higher-is-better analysis makes them and negated afterwards, so
+the random stream is unchanged and only the meaning of "best" moves. The probability to be best
+becomes the probability of having the lowest rate; the expected loss becomes how far a variant's
+rate is above the lowest, still non-negative and in the metric's own units, so the 0.975 floor
+and `loss_threshold` keep their meaning. The ROPE is compared with the best variant's advantage
+in the good direction. The posteriors and credible intervals are the rates themselves, unchanged.
 
 > **Watch Out!** The prior matters at small n. Beta(1, 1) is "uninformative" but it's still
 > a claim that a 90% conversion rate is as plausible as 4%; with 20 users it pulls the
@@ -611,6 +640,18 @@ At n = 1,000 the expected-loss condition alone would have stopped; the probabili
 what says "not yet". Then set an informative prior (`{"alpha": 4, "beta": 96}`) and rerun the
 n = 1,000 case — PtBB moves toward 0.5 (0.895 here), as it should with weak data.
 
+The direction, on an error metric where the treatment's rate fell from 5.2% to 3.0%:
+
+```python
+>>> from backend.app.services.bayesian_service import BayesianService
+>>> errors = [{"conversions": 52, "total": 1000}, {"conversions": 30, "total": 1000}]
+>>> BayesianService().analyze(errors, seed=1)["probability_to_be_best"], BayesianService().analyze(errors, seed=1, lower_is_better=True)["probability_to_be_best"]
+([0.99357, 0.00643], [0.00643, 0.99357])
+```
+
+The same draws, negated: the two probabilities swap, and the decision (`STOP_WINNER` both times)
+now points at the variant with fewer errors.
+
 And the A/A calibration in miniature — two identical arms at 1%, 5,000 users each:
 
 ```python
@@ -639,6 +680,8 @@ And the A/A calibration in miniature — two identical arms at 1%, 5,000 users e
   not fill.
 - The prior matters at small n; enable the analysis with `bayesian_enabled` and
   `bayesian_config`.
+- It follows the primary metric's `lower_is_better` by negating the seeded draws, and it
+  analyses the share of users who converted whatever the metric's type.
 
 ---
 
@@ -797,6 +840,36 @@ order (Build book Day 19):
 3. The previously persisted `BanditState`.
 4. Zero-count priors (equal weights).
 
+**Lower is better** (engine 1.6.0, #1385). A bandit that rewards conversions on an error or
+churn metric sends its traffic to the arm with the _most_ errors. Every source above returns raw
+counts — successes are converting users, as stored and reported — and the scheduler applies the
+primary metric's direction once, at the algorithms' input:
+
+```python
+# 📁 backend/app/core/bandit_scheduler.py  (abridged)
+def _as_rewards(
+    stats: Dict[str, VariantStats], lower_is_better: bool
+) -> Dict[str, VariantStats]:
+    """Turn converting-user counts into the bandit's reward counts.
+
+    Higher is better: a converting user is a success, unchanged.  Lower is
+    better (an error or churn event): a user who did NOT convert is the
+    success, so the arm with fewer converting users earns the traffic (#1385).
+    ``total_reward`` (UCB1) follows ``successes``.
+    """
+    if not lower_is_better:
+        return stats
+    flipped: Dict[str, VariantStats] = {}
+    for vid, vs in stats.items():
+        successes = max(vs.pulls - vs.successes, 0)
+        ...
+```
+
+The weights, the regret estimate and the history rows' posterior `alpha`/`beta` come from the
+reward counts; the `successes` and `failures` the state and history store stay the converting
+users. So a lower-is-better bandit's stored counts read exactly like a higher-is-better one's,
+and only its weights show the direction.
+
 The regret estimate is stored as `BanditState.regret_reduction_pct` (null when it is not
 positive). The dashboard does not show it — read it from the bandit state if you want it:
 
@@ -900,6 +973,18 @@ The unplayed arm takes 95% of the Thompson weight: a uniform draw beats both pla
 draws (which sit near 0.04 and 0.05) about 95% of the time. After 100 pulls at 3% it keeps
 a fifth — still exploring, because 100 pulls leave its rate uncertain.
 
+And a lower-is-better primary metric, where the counts are users who hit an error:
+
+```python
+>>> from backend.app.core.bandit_scheduler import _as_rewards
+>>> raw = {"a": VariantStats("a", successes=52, failures=948, pulls=1000, total_reward=52),
+...        "b": VariantStats("b", successes=30, failures=970, pulls=1000, total_reward=30)}
+>>> ThompsonSampling.compute_weights(list(raw.values()), seed=1), ThompsonSampling.compute_weights(list(_as_rewards(raw, True).values()), seed=1)
+({'a': 0.9933, 'b': 0.0067}, {'a': 0.007, 'b': 0.993})
+```
+
+Read as conversions, `a` would get 99% of the traffic; read as errors, `b` does.
+
 Then simulate a bandit run: 30 days, 1,000 users/day, true rates (0.04, 0.052, 0.03),
 recompute Thompson weights each day from cumulative counts, and plot the share of traffic
 each arm receives over time — and the _observed_ rate of arm b vs its true 0.052, to see
@@ -912,7 +997,8 @@ the bias.
 - The scheduler recomputes weights each tick from real counts (DynamoDB only when at least
   as complete as PostgreSQL → PostgreSQL converting users → BanditState → priors), persists
   them and the regret estimate (not shown on the dashboard); `/assign` routes new users by
-  them deterministically.
+  them deterministically. A lower-is-better primary metric makes a user who did _not_ convert
+  the reward (`_as_rewards`); the stored counts stay the converting users.
 - Bandits trade inference for reward: rates are biased, SRM is skipped, exchangeability is
   gone — use them to optimise, not to measure.
 
@@ -922,7 +1008,7 @@ the bias.
 
 ### What & why
 
-Every result in Part I needed two numbers per variant, `(n, n_converted)`. A mean metric —
+Every proportion in Part I needed two numbers per variant, `(n, n_converted)`. A mean metric —
 revenue per user, minutes watched — needs three: the unit count, the sum of the values and
 the sum of their squares. Those are **sufficient statistics**: the estimator's answer is a
 function of them alone, so you never need the rows. That is what lets the platform analyse an
@@ -949,8 +1035,12 @@ may still change. The numbers themselves come from the core estimators in
   alpha, correction_method, metric=...)`: per variant the mean, the sample variance and a
   t-interval `mean ± t(1 − α/2, n − 1)·√(var/n)`; per treatment **Welch's t-test**
   (`ttest_ind_from_stats` on the centred means), Cohen's d, observed power and the relative
-  improvement (null when the control's mean is 0). This is the one place the results engine
-  runs Welch's t.
+  improvement (null when the control's mean is 0). It is also the function `/results` runs for a
+  revenue, count, duration or custom metric: `per_user_mean_metric_result` builds these centred
+  sums from each assigned user's value and calls it (Part I Hour 2), so the same per-user values
+  give the same p-value from either path. What differs is the difference fields: a warehouse
+  run's mean metrics get no `absolute_difference`, lift interval or impact, while its
+  proportion metrics, through `binomial_metric_result`, get all of them.
 - **Refusals, not guesses.** A variant with fewer than 2 units is "not computed"
   (`fewer_than_2_units`); sums no sample could produce — a negative variance, a non-finite
   sum — are `result_invalid`; two arms with no variation get a "no variation" note instead of
@@ -983,7 +1073,9 @@ holds the function to an exact reference.
 - Proportions need `(n, n_converted)`; means need `(n, Σ(y−k), Σ(y−k)²)` centred on the grand
   mean so large offsets don't cancel the variance.
 - Warehouse runs (full profile, beta routes) use the same proportion function as `/results`
-  and a Welch's-t mean function; only aggregates leave the warehouse.
+  and the same Welch's-t mean function `/results` uses for revenue, count, duration and custom
+  metrics; only aggregates leave the warehouse. A warehouse mean result carries no difference
+  or impact intervals.
 - Impossible sums are refused, too-small arms are "not computed", and SRM is checked.
 
 ---
@@ -1034,6 +1126,12 @@ window, so there is almost nothing to adjust on: the product may have mostly new
 covariate event may be the wrong one (try a different `covariate_metric_id`, or a longer
 `covariate_lookback_days`). A reduction near 0 with high coverage would be the sign of a covariate
 that simply does not predict the outcome.
+
+**Q9. A bandit's primary metric is a checkout error, lower is better. Its stored state says arm
+`b` has 30 successes in 1,000 pulls and 99% of the weight. Is that a bug?**
+No. The stored `successes` are converting users — here, users who hit the error — and the
+weights come from the reward counts, in which a user who did _not_ convert is the success. `b`
+has the fewest errors, so it earns the traffic.
 
 **Quiz.** Thompson weight for an arm with Beta(1, 1) among arms with Beta(41, 961) and
 Beta(53, 949)?

@@ -7,8 +7,8 @@
 Three hours on the bedrock. A conversion-rate comparison stands on three things: users who were
 really allocated at random, a test that suits the data, and enough observations to see an effect
 worth acting on. Why randomisation is the whole point and how the platform checks that it actually
-happened (Hour 1); the tests and intervals behind a conversion-rate comparison and the labels the
-dashboard puts on them (Hour 2); and power — the number that tells you how many users a decision
+happened (Hour 1); the tests and intervals behind a conversion-rate or revenue-per-user comparison
+and the labels the dashboard puts on them (Hour 2); and power — the number that tells you how many users a decision
 needs and the gate that stops a lucky early result from shipping (Hour 3). Keep a Python shell
 with `scipy` open; every formula here is one line away from a number.
 
@@ -186,7 +186,7 @@ variant. The chi-square tells you the split is wrong; the fix is always in the p
 >>> from backend.app.services.srm_service import compute_srm
 >>> compute_srm({"control": 5000, "treatment": 5000}, {"control": 50, "treatment": 50}).p_value        # ≈ 1.0
 >>> r = compute_srm({"control": 6043, "treatment": 5712}, {"control": 50, "treatment": 50}); r.chi2, r.p_value, r.warning
-(9.32..., 0.00227..., False)
+(9.32..., 0.002266..., False)
 >>> compute_srm({"control": 5100, "treatment": 4900}, {"control": 50, "treatment": 50}).p_value        # ≈ 0.0455 — not a warning at 0.001
 >>> compute_srm({"a": 100}, {"a": 100})                                                                 # None: one arm, undefined
 >>> compute_srm({"a": 7000, "b": 3000}, {"a": 70, "b": 30}).warning                                     # False: matches the configured split
@@ -209,19 +209,26 @@ Then simulate the false-alarm rate: draw 10,000 fair 50/50 splits of 10,000 user
 
 ---
 
-## Hour 2 — Proportions: Fisher's exact test, the z-test, confidence intervals, effect size
+## Hour 2 — Proportions and means: Fisher's exact test, Welch's t-test, the z-test, intervals, effect size
 
 ### What & why
 
-A conversion metric is a **proportion**: `converting users / assigned users` per variant.
-Comparing two proportions is the oldest question in statistics, and there are several
-standard tools. This is what the platform uses each one for:
+A conversion metric is a **proportion**: `converting users / assigned users` per variant. A
+revenue, count, duration or custom metric is a **mean per assigned user**: every assigned user
+contributes one number (what they spent, how many times they did the thing, how long they spent
+doing it), and a user who did nothing contributes 0. Comparing two proportions is the oldest
+question in statistics and comparing two means the next oldest, and there are several standard
+tools for each. This is what the platform uses each one for:
 
-| Question                            | `/results` (every metric)                    | `?breakdown=` segments              |
-| ----------------------------------- | -------------------------------------------- | ----------------------------------- |
-| Do the rates differ? (p-value)      | **Fisher's exact test**, at every n          | pooled **two-proportion z-test**    |
-| How precise is each rate? (CI)      | normal approximation at the analysis level   | **Wilson** interval, at the corrected α |
-| How big is the difference? (effect) | **Cohen's h**, labelled                      | —                                   |
+| Question                                | `/results`, conversion metric                  | `/results`, revenue / count / duration / custom | `?breakdown=` segments              |
+| --------------------------------------- | ---------------------------------------------- | ----------------------------------------------- | ----------------------------------- |
+| Do the arms differ? (p-value)           | **Fisher's exact test**, at every n            | **Welch's t-test**                              | pooled **two-proportion z-test**    |
+| How precise is each arm? (CI)           | normal approximation at the analysis level     | t-interval at the analysis level                | **Wilson** interval, at the corrected α |
+| How precise is the difference? (CI)     | **Newcombe** on the difference, **MOVER-R** on the lift | **Welch** on the difference, **Fieller** on the lift | —                         |
+| How big is the difference? (effect)     | **Cohen's h**, labelled                        | **Cohen's d**, labelled                         | —                                   |
+
+(A breakdown of a revenue, count, duration or custom metric reports the share of users who sent
+its event in each segment, not its mean: see Part IV Hour 11.)
 
 **Fisher's exact test** computes the exact probability of the observed 2×2 table (and all
 more extreme tables) under the null of equal rates — no approximation, correct at any size,
@@ -238,17 +245,60 @@ inequality properly — it stays in [0, 1] and has better coverage for rare even
 2·arcsin√p₂ − 2·arcsin√p₁ puts a difference in proportions on a scale where 0.2/0.5/0.8 mean
 small/medium/large regardless of the base rate. A significant-but-negligible result is the
 most common outcome of a well-powered test, and the label is what lets the results page say
-so.
+so. **Cohen's d**, the difference of two means over √((s_c² + s_t²)/2), does the same job for
+a mean, with the same cut-offs.
+
+**Welch's t-test** compares two means without assuming the arms share a variance:
+t = (ȳ_t − ȳ_c) / √(s_t²/n_t + s_c²/n_c), on the Welch–Satterthwaite degrees of freedom. On
+revenue the variances are rarely equal — a treatment that turns a few more users into big
+spenders changes the spread as well as the mean — so the pooled-variance t-test's assumption is
+the wrong default.
+
+An interval on each arm says how precisely that arm is known. A decision needs to know how
+precisely the **difference** is known, and that is its own interval; so is the relative lift.
+The "+30%" a product manager quotes is a ratio, and its uncertainty is not the difference's
+interval divided by the control's rate.
 
 ### How Controlvar does it
 
-#### One counts-based engine
+#### Two analyses, one module
 
-`/results` does its statistics on counts, not on rows. For each metric it counts, per
-variant, two numbers — the users assigned and the users who converted — and hands those
-counts to one function, `binomial_metric_result`, in
-`backend/app/services/sufficient_stats_analysis.py`. Everything `/results` reports about a
-variant follows from `(n, n_converted)`:
+`/results` does its statistics on counts and per-user values, not on rows. For each metric it
+counts, per variant, the users assigned and the users who converted, and then the metric's type
+decides which function in `backend/app/services/sufficient_stats_analysis.py` gets them:
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py
+MEAN_METRIC_TYPES = ("revenue", "count", "duration", "custom")
+```
+
+```python
+# 📁 backend/app/services/analysis_service.py  (abridged)
+        alpha = 1.0 - confidence_level
+        metrics = [
+            (
+                self._per_user_mean_result(
+                    experiment, metric, raw, alpha, correction_method
+                )
+                if metric_type_name(metric) in MEAN_METRIC_TYPES
+                else binomial_metric_result(
+                    ...
+                    alpha,
+                    correction_method,
+                    metric=metric,
+                )
+            )
+            for metric, raw in zip(metric_definitions, metrics_results)
+        ]
+```
+
+A new `MetricType` member fails `test_value_metrics_per_user.py` until someone classifies it on
+one side or the other, so no metric type reaches `/results` unanalysed by accident. Each metric in
+the response says which analysis it got in its `analysis` field: `"mean"`, or the schema's
+default, `"proportion"`.
+
+A conversion metric goes to `binomial_metric_result`. Everything `/results` reports about its
+variants follows from `(n, n_converted)`:
 
 ```python
 # 📁 backend/app/services/sufficient_stats_analysis.py
@@ -287,11 +337,11 @@ def binomial_variant_results(variants: Sequence[BinomialCounts], confidence_leve
 
 Three things to read off it:
 
-- **Fisher for every variant of every metric, at every n.** There is no switch to a z-test
-  for large samples and no switch to Welch's t for revenue: `statistical_test_used` is
-  `"fisher_exact"` on every treatment `/results` returns, whatever the metric's
-  `metric_type`. A "revenue" metric on `/results` is analysed as "did the user produce a
-  matching event" — a proportion.
+- **Fisher for every treatment of every conversion metric, at every n.** There is no switch to
+  a z-test for large samples: `statistical_test_used` is `"fisher_exact"` on every treatment of
+  a conversion metric. (The previous edition of this book said the same of _every_ metric,
+  revenue included, which was true until engine 1.5.0; "Means per assigned user" below is what
+  replaced it.)
 - **The interval and the significance decision use the same level.** The level sets both `z`
   (via `two_sided_z`) and `alpha = 1 − level`. Where the level comes from changed: each
   experiment now stores a `confidence_level` (0.80 to 0.99, default 0.95) and a
@@ -299,7 +349,8 @@ Three things to read off it:
   draft, and `/results` uses them unless the request names its own `?confidence_level=` or
   `?correction_method=`. Choose 0.90 and the interval narrows to ±1.645·se and significance is
   p < 0.10. (Before the fix for the hard-coded-1.96 bug the interval ignored whatever level
-  you asked for; that fix shipped in engine version 1.2.0, and the engine is now at 1.4.0.)
+  you asked for; that fix shipped in engine version 1.2.0, and the engine is now at 1.8.0.
+  Part IV Hour 12 lists what each version moved.)
 - **The clamp.** `max(0, …)` and `min(100, …)` are the tell that the normal interval can
   leave [0, 1] near the edges.
 
@@ -315,6 +366,161 @@ numbers — which is how warehouse runs (Part III, "Analysing from sufficient st
 `/results` agree. `test_binomial_metric_result_characterisation.py` pins it to the output
 `/results` produced before it was extracted, and `test_sufficient_stats_fingerprint.py` pins
 its output per engine version.
+
+#### Means per assigned user
+
+A revenue, count, duration or custom metric goes to `per_user_mean_metric_result`.
+`AnalysisService` first reads one value for each assigned user who has one: for a count metric,
+the number of the metric's events they sent (`event_counts`); for the others, the total of those
+events' `value` (`value_totals`). The events are the ones `count_converting_users` would count —
+matching the metric's event name, tagged with the user's variant, from a user assigned to it. A
+value that is not a number, is infinite or is larger than 10¹² in size (`VALUE_BOUND`) adds
+nothing to its user's total, and the user still counts as converting. Every other assigned user
+is 0. Then:
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py  (abridged)
+    users = sum(n for _, n, _, _ in arms)
+    k = (
+        math.fsum(value for _, _, _, values in arms for value in values) / users
+        if users
+        else 0.0
+    )
+    sums: List[MeanSums] = []
+    means: Dict[str, float] = {}
+    for variant, n, _, values in arms:
+        zeros = n - len(values)
+        mean = math.fsum(values) / n if n else 0.0
+        means[str(variant.id)] = mean
+        sum_d = math.fsum([value - k for value in values] + [-k * zeros])
+        ...
+    compared = [row for row in sums if row[1] >= 2]
+    ...
+            result = mean_metric_result(
+                k, compared, alpha, correction_method, metric=metric
+            )
+            welch = _welch_differences(compared, alpha)
+```
+
+Three things in it deserve a pause.
+
+- **The zeros are users.** `zeros = n - len(values)` puts every non-buyer into the mean. A
+  treatment that sells to more people at a smaller basket can raise revenue per assigned user
+  while lowering revenue per buyer, and only the first answers "did this change make us money?"
+- **The sums are centred** on the grand mean `k` before anything is compared, for the reason
+  Part III's warehouse section gives: Σy² − (Σy)²/n cancels badly when the values sit far from
+  zero.
+- **The test is the warehouse's.** `mean_metric_result` runs
+  `ttest_ind_from_stats(..., equal_var=False)` on the centred means, so `/results` and a
+  warehouse run of the same per-user values give the same p-value. Each arm's interval is
+  `mean ± t(1 − α/2, n − 1)·s/√n`; the effect size is Cohen's d.
+
+`statistical_test_used` is `"welch_t_test"`, `analysis` is `"mean"`, and `conversions` is still
+the number of users who converted, so a revenue metric's row says both how many users bought and
+how much the average assigned user spent. An arm with fewer than 2 users is reported with its mean
+and no comparison.
+
+> **Watch Out!** Welch's t-test leans on the difference of the means being close to normal, and
+> on zero-inflated, right-skewed revenue in a **small** arm it is not.
+> `backend/tests/unit/stats_validation/test_false_winner_unequal_split.py` runs 2,000 A/A
+> experiments — both arms drawn from one distribution: 5% of users buy, a buyer orders again
+> with probability 0.3, each order is lognormal(3, 1) — through `per_user_mean_metric_result` and
+> the recommendation, exactly as `/results` does. With 3,000 users in each arm, 46 of the 2,000
+> are recommended `SHIP_VARIANT`, inside the 29–74 band that α = 0.05 allows in one direction.
+> With 600 in the control and 5,400 in the treatment, **150** are: 7.5% where 2.5% is the
+> promise, and the arm wrongly named is the larger one every time. The mechanism is in the small
+> arm. Its mean and its standard deviation rise and fall together (one big spender lifts both; a
+> correlation above 0.8 over 2,000 draws of a 600-user arm), so a control that drew low also
+> looks precise, and the larger treatment is then called significantly higher. The product's own
+> limitations page states it (#1736), and no lopsided split size is known at which revenue meets
+> α. Keep revenue experiments evenly split, and treat a revenue win from a lopsided split as a
+> hypothesis.
+
+#### The difference, the lift and the impact
+
+Since engine 1.8.0 (#1496) every treatment of every metric on `/results` carries five more
+fields, all null on the control (a warehouse run's mean metrics do not carry them; Part III):
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py
+DIFFERENCE_FIELDS = (
+    "absolute_difference",
+    "absolute_difference_ci",
+    "relative_improvement_pct_ci",
+    "incremental_impact",
+    "incremental_impact_ci",
+)
+```
+
+One construction covers both analyses. Each arm gets a point estimate and two-sided limits at
+the response's level, and the intervals are built from those limits by **MOVER** (the method of
+variance estimates recovery). For a proportion the arm limits are Wilson's (`wilson_limits`), and
+the difference's interval is Newcombe's hybrid score interval:
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py
+def newcombe_interval(treatment: ArmLimits, control: ArmLimits) -> Tuple[float, float]:
+    """The MOVER interval of ``treatment.mean - control.mean`` from each arm's
+    limits: Newcombe's hybrid score interval when the limits are Wilson's.
+
+    ``d - sqrt((m_t - l_t)^2 + (u_c - m_c)^2)`` to
+    ``d + sqrt((u_t - m_t)^2 + (m_c - l_c)^2)``, with ``d = m_t - m_c``.
+    """
+    d = treatment.mean - control.mean
+    return (
+        d - math.hypot(treatment.mean - treatment.lower, control.upper - control.mean),
+        d + math.hypot(treatment.upper - treatment.mean, control.mean - control.lower),
+    )
+```
+
+Read the lower bound: the difference could be smaller than `d` if the treatment's true rate is
+lower than its estimate (by up to `m_t − l_t`) or the control's higher (by up to `u_c − m_c`),
+and the two distances add in quadrature. Wilson limits are asymmetric near 0, so this interval
+is too, which a symmetric `d ± z·se` is not. For a mean the arm limits are `mean ± c·se` with
+Welch's critical value `c`, and the difference's interval is Welch's own. The **relative**
+change's interval (`relative_change_interval`) is the MOVER-R interval of the ratio on the same
+limits — Fieller's interval, for a mean — and because the ratio's bound is 1 exactly where the
+difference's bound is 0, the three intervals always agree on whether 0 is inside. For a
+proportion the ratio is taken over values of 0 and above, so the lift's lower end is never below
+−100%; it is null only when an arm has no users or the control has no conversions. The
+**incremental impact** is the difference, and its interval, times the treatment's own assigned
+users: a plain number, with no currency and no projection to other traffic or a later period.
+
+> **Watch Out!** None of these intervals is adjusted for multiple comparisons, and
+> `is_significant` is decided by the test, not by an interval. With two or more treatments under
+> a correction an interval can exclude 0 on a treatment that is not significant. For a
+> proportion near the threshold the interval and Fisher's test can also disagree, either way:
+> 128 of 1,000 against 100 of 1,000 has p = 0.057 while its interval runs from +0.0001 to
+> +0.056, and 3 of 50 against 18 of 100 has p = 0.049 while its interval reaches +0.00003. Take
+> the verdict from `is_significant` and the size from the interval.
+
+#### The winner has a direction
+
+Some metrics are better when they fall: checkout errors, latency, uninstalls. A metric
+definition's `lower_is_better` decides which side of the control a winner must be on (engine
+1.5.0, #1377):
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py  (in binomial_metric_result)
+    lower_is_better = metric_lower_is_better(metric)
+    if lower_is_better:
+        winners = [
+            v
+            for v in results
+            if not v["is_control"]
+            and v["is_significant"]
+            and (v["relative_improvement_pct"] or 0) < 0
+        ]
+        winner = min(winners, key=lambda v: v["mean"]) if winners else None
+```
+
+`mean_metric_result` has the same branch on the centred means. `relative_improvement_pct` stays
+the signed change whatever the direction (−42.3% is the good news on an error metric), and the
+recommendation's sentence says "it fell by 42.3%, and lower is better for this metric" rather
+than printing a negative improvement. `KEEP_CONTROL` flips with it: on a lower-is-better metric
+it means every treatment is significantly _higher_. Only `True` counts: a definition without the
+attribute, or with a stored NULL, is higher-is-better (`metric_lower_is_better`). The Bayesian
+decision and the bandit read the same flag (Part III, Hours 8 and 9).
 
 #### The textbook helpers
 
@@ -405,10 +611,12 @@ change at a rate where the variance is small; the second is a 2.5% relative chan
 h sees that; a raw difference doesn't.
 
 **Welch's t-test** — which doesn't assume equal variances between arms, the right default
-for a continuous metric — is used by the results engine in exactly one place: **warehouse
-mean metrics** (`mean_metric_result`, full profile; Part III). `/results` never runs it.
+for a continuous metric — runs in two places, and both are `mean_metric_result`: `/results`,
+for revenue, count, duration and custom metrics (through `per_user_mean_metric_result`, above),
+and **warehouse mean metrics** (full profile; Part III). `AnalysisService.welch_t_test`, the
+textbook helper, is on neither path.
 
-> **Watch Out!** The numerator is **converting users**, not events. Every analysis path —
+> **Watch Out!** A conversion is a **converting user**, not an event. Every analysis path —
 > `/results`, the summary, `/daily`, `/sequential`, `/bayesian`, breakdowns, the bandit
 > scheduler's PostgreSQL fallback — counts a user once if they are assigned to the variant
 > and have at least one event that matches the metric's event name and is tagged with their
@@ -416,8 +624,12 @@ mean metrics** (`mean_metric_result`, full profile; Part III). `/results` never 
 > purchased three times counts once; an event from a user with no assignment to that variant
 > does not count; so conversions can never exceed assignments, and the rate is a true
 > proportion. `/daily` reports each user on the day of their _first_ conversion, so its
-> cumulative series ends at the `/results` count. If you need "purchases per user", that is
-> a mean metric, and only a warehouse run analyses means.
+> cumulative series ends at the `/results` count. "Purchases per user" is a **count** metric
+> and "revenue per user" a revenue metric, and `/results` analyses both as a mean per assigned
+> user from the same matched events. Only `/results`' own metric rows do, though: the
+> sequential, Bayesian and sample-size analyses, `/daily`, the Live tab and the breakdowns
+> analyse a revenue, count, duration or custom metric as the share of users who sent its event
+> (`docs/getting-started/limitations.md`).
 
 > **Did You Know?** A p-value is _not_ "the probability the null is true," and 1 − p is
 > _not_ "the probability the treatment is better." It's the probability of data at least
@@ -460,23 +672,76 @@ Now the engine itself, at two confidence levels:
 ```
 
 Same p-value (Fisher doesn't depend on the level), a narrower interval and a higher observed
-power at 0.10. Then take a demo experiment's counts from the results API and reproduce
-`p_value`, `confidence_interval` and `relative_improvement_pct` for one variant by passing
-its `sample_size` and `conversions` to `binomial_metric_result` with
-`alpha = 1 − confidence_level`.
+power at 0.10. Now the difference fields on the same counts, then the same 40 and 52 buyers as a
+revenue metric, each with a basket:
+
+```python
+>>> t = binomial_metric_result([(C, 1000, 40), (T, 1000, 52)], 0.05, "none", metric=M)["variants"][1]
+>>> round(t["absolute_difference"], 4), [round(x, 4) for x in t["absolute_difference_ci"]], [round(x, 1) for x in t["relative_improvement_pct_ci"]]
+(0.012, [-0.0065, 0.0308], [-13.0, 94.0])
+>>> round(t["incremental_impact"], 1), [round(x, 1) for x in t["incremental_impact_ci"]]
+(12.0, [-6.5, 30.8])
+>>> import numpy as np
+>>> from backend.app.services.sufficient_stats_analysis import per_user_mean_metric_result
+>>> class R: id = "r"; name = "revenue"; metric_type = "revenue"; is_primary = True
+>>> rng = np.random.default_rng(6)
+>>> spend_c, spend_t = rng.lognormal(3, 1, 40).round(2), rng.lognormal(3, 1, 52).round(2)   # each buyer's total
+>>> r = per_user_mean_metric_result([(C, 1000, 40, spend_c.tolist()), (T, 1000, 52, spend_t.tolist())], 0.05, "none", metric=R)
+>>> c, t = r["variants"]; r["analysis"], t["statistical_test_used"], t["conversions"]
+('mean', 'welch_t_test', 52)
+>>> round(c["mean"], 4), round(t["mean"], 4), round(t["relative_improvement_pct"], 1), round(t["p_value"], 4)
+(1.4449, 1.4947, 3.4, 0.9037)
+>>> round(t["absolute_difference"], 4), [round(x, 4) for x in t["absolute_difference_ci"]], [round(x, 1) for x in t["relative_improvement_pct_ci"]]
+(0.0498, [-0.7572, 0.8568], [-41.9, 88.5])
+>>> w = stats.ttest_ind(np.r_[spend_t, np.zeros(948)], np.r_[spend_c, np.zeros(960)], equal_var=False)   # every user, 0 for a non-buyer
+>>> round(float(w.pvalue), 4), [round(float(x), 4) for x in w.confidence_interval()]
+(0.9037, [-0.7572, 0.8568])
+```
+
+Thirty per cent more buyers is a 3.4% lift in revenue per assigned user here, at p = 0.90, with a
+lift interval from −42% to +89%: the baskets, not the buyers, carry the variance. scipy's Welch
+test on all 2,000 per-user values, zeros included, gives the platform's p-value and interval to
+four decimals. On the conversion metric the impact reads as a sentence: about 12 more converting
+users, somewhere between 6.5 fewer and 30.8 more. And the direction:
+
+```python
+>>> class E: id = "e"; name = "checkout_error"; metric_type = "conversion"; is_primary = True; lower_is_better = True
+>>> e = binomial_metric_result([(C, 1000, 52), (T, 1000, 30)], 0.05, "none", metric=E)   # errors: 5.2% → 3.0%
+>>> e["winning_variant_id"], round(e["variants"][1]["p_value"], 4), round(e["variants"][1]["relative_improvement_pct"], 1)
+('t', 0.0174, -42.3)
+>>> AnalysisService._summarise_decision(None, [e])["recommendation"]      # the experiment argument is not read
+'SHIP_VARIANT'
+>>> E.lower_is_better = False; h = binomial_metric_result([(C, 1000, 52), (T, 1000, 30)], 0.05, "none", metric=E)
+>>> h["winning_variant_id"] is None, AnalysisService._summarise_decision(None, [h])["recommendation"]
+(True, 'KEEP_CONTROL')
+```
+
+The same counts, the opposite recommendation. Then take a demo experiment's counts from the
+results API and reproduce `p_value`, `confidence_interval`, `relative_improvement_pct` and
+`absolute_difference_ci` for one variant of a conversion metric by passing its `sample_size` and
+`conversions` to `binomial_metric_result` with `alpha = 1 − confidence_level`.
 
 ### Key takeaways
 
-- `/results` analyses every metric as a proportion from `(assigned, converting users)` with
-  one function, `binomial_metric_result`: Fisher's exact test always; normal interval at the
-  requested `confidence_level`; significance at `1 − confidence_level`; Cohen's h; observed
-  power.
-- The pooled z-test and the Wilson interval are used only in `?breakdown=` segments; Welch's
-  t only for warehouse mean metrics. `select_statistical_test` and the other `AnalysisService`
-  helpers have no caller.
-- Cohen's h (arcsine scale) with negligible/small/medium/large labels separates "real"
+- `/results` routes each metric by its type (`MEAN_METRIC_TYPES`). A conversion metric is a
+  proportion from `(assigned, converting users)` through `binomial_metric_result`: Fisher's
+  exact test always, a normal interval per arm, Cohen's h, observed power. A revenue, count,
+  duration or custom metric is a mean per assigned user, zeros included, through
+  `per_user_mean_metric_result`: Welch's t on centred sums (the warehouse's own function),
+  a t-interval per arm, Cohen's d. Both decide significance at `1 − confidence_level`.
+- Every treatment carries its difference (Newcombe for a proportion, Welch for a mean), its
+  lift's interval (MOVER-R, Fieller for a mean) and the incremental impact. None is adjusted for
+  multiple comparisons, and `is_significant` comes from the test, not the interval.
+- `lower_is_better` decides which side of the control a winner is on; `relative_improvement_pct`
+  stays the signed change.
+- The pooled z-test is used only in `?breakdown=` segments, whose intervals are Wilson's;
+  Wilson's limits also build Newcombe's interval. `select_statistical_test` and the other
+  `AnalysisService` helpers have no caller.
+- Cohen's h (arcsine scale) and d, with negligible/small/medium/large labels, separate "real"
   from "big."
 - Conversions are converting users, each counted once; a rate never exceeds 1.
+- On zero-inflated revenue a lopsided split names a false winner about three times as often as
+  α allows: keep revenue experiments evenly split.
 
 ---
 
@@ -587,6 +852,10 @@ check, Hour 1, can still override either with `INCONCLUSIVE`.)
   MDE pushes to 100% or more, or a size that is not finite, is refused with 422.
 - `guide_only_reasons` lists why a fixed sample size is only a guide for this experiment:
   `adaptive_allocation` (a bandit), `unequal_allocation`, `sequential_testing`, `bayesian`.
+- It plans a **proportion** whatever the primary metric's type. For a revenue primary metric
+  the baseline is the share of users who sent its event, not its mean per user, so the plan is
+  for "did they buy", not "how much". To plan a mean, call `POST /power/sample-size` with
+  `metric_type: "mean"` and a `baseline_std`; `POST /power/mde` plans a proportion only.
 
 The dashboard's meter shows `current / required` and turns red below 80%.
 
@@ -650,7 +919,8 @@ than chance, which is the point. At the n the formula gave you (39,475) it detec
   setup and the power calculator; corrections are applied by passing a smaller α.
 - `/sample-size` plans from the control's observed rate with a relative MDE (default 5%),
   says when it cannot (`unavailable_reason`) and when its answer is only a guide
-  (`guide_only_reasons`).
+  (`guide_only_reasons`). It plans a proportion even for a revenue metric;
+  `POST /power/sample-size` with `metric_type: "mean"` plans a mean.
 - `minimum_sample_size` on the metric gates `SHIP_VARIANT`; its default (100) is a
   placeholder — set it from the planner.
 - Fixed-horizon power assumes one look; daily peeking needs Part II.
@@ -672,10 +942,12 @@ aren't exchangeable, so no test is valid.
 
 **Q3. Which test produces the `p_value` on a `/results` metric, and does it change with
 sample size or metric type?**
-Fisher's exact test, always: every metric is analysed as converting users over assigned
-users, at every n, and `statistical_test_used` is `fisher_exact`. A 2×2 Fisher is cheap and
-exact at any size. The pooled z-test appears only in `?breakdown=` segments, and Welch's t
-only for warehouse mean metrics. `select_statistical_test` exists but nothing calls it.
+Not with sample size; with metric type, yes. A conversion metric gets Fisher's exact test at
+every n (`statistical_test_used: "fisher_exact"`): a 2×2 Fisher is cheap and exact at any size.
+A revenue, count, duration or custom metric gets Welch's t-test on its mean per assigned user
+(`"welch_t_test"`), the same function a warehouse mean run uses. The pooled z-test appears only
+in `?breakdown=` segments. `select_statistical_test`, which would choose by sample size, exists
+but nothing calls it.
 
 **Q4. Why can the `/results` confidence interval need `max(0, ...)`, and what sets its
 width?**
@@ -693,6 +965,20 @@ change at a low rate is a bigger effect than a 2.5% relative change at a high ra
 **Q6. What does `minimum_sample_size` gate, and what happens if it's left at the default?**
 The `SHIP_VARIANT` recommendation (every variant must reach it). At 100 it barely gates
 anything; a real experiment sets it from the planner (`/sample-size` or the power calculator).
+
+**Q7. A revenue experiment split 10/90 recommends `SHIP_VARIANT` for the 90% arm at p = 0.03.
+What do you check before believing it?**
+The split, first. On zero-inflated, right-skewed revenue a lopsided split names the larger arm
+a false winner far more often than α says (150 of 2,000 A/A
+experiments at 600/5,400, against about 50 expected). Look at `absolute_difference_ci` and the
+lift interval for the size, rerun with an even split if the decision matters, and do not take
+the p-value at face value.
+
+**Q8. An error-rate metric falls from 5.2% to 3.0% and `relative_improvement_pct` is −42.3.
+Why is that the good news, and what makes the platform treat it as a win?**
+The metric's `lower_is_better` is true, so the winner must be significantly _below_ the
+control; the signed change stays signed. With the flag left false, the same counts recommend
+`KEEP_CONTROL`.
 
 **Quiz.** Halve the MDE. Sample size changes by what factor?
 → ×4 — n scales with 1/(p₂ − p₁)².
@@ -717,6 +1003,11 @@ approximation interval and the Wilson interval; state which is usable and why.
 **E1.5 — Plan a test.** Baseline 3%, you want to detect a 15% relative lift with 80% power
 at α = 0.05, three treatments plus control, 8,000 eligible users a day. Compute users per
 arm with Bonferroni and estimate the run time.
+
+**E1.6 — A false winner on revenue.** Using the battery in
+`backend/tests/unit/stats_validation/test_false_winner_unequal_split.py`, count how many of
+2,000 A/A revenue experiments are recommended `SHIP_VARIANT` and `KEEP_CONTROL` at 600/5,400
+and at 3,000/3,000 users, and compare each count with the 29–74 band.
 
 ---
 
@@ -753,6 +1044,19 @@ costs a third more users). Four arms → ~129,000 users; at 8,000/day that's ~16
 full weekly cycle if day-of-week effects matter, so plan three weeks. On the platform, the
 Sample Size tab with `correction_method=bonferroni` and `mde=0.15` plans exactly this
 (α / (4 − 1) per comparison).
+
+**S1.6**
+
+```python
+from backend.tests.unit.stats_validation.test_false_winner_unequal_split import recommendations
+recommendations(600, 5_400, 1_736_001), recommendations(3_000, 3_000, 1_736_002)   # ((150, 12), (46, 45))
+```
+
+At 600/5,400 the treatment is recommended in 150 of 2,000 (7.5%, above the band's top of 74)
+and the control in 12; at 3,000/3,000, 46 and 45, both inside the band. The band is the central
+99.9% of Binomial(2,000, 0.025), one direction at α = 0.05. Each battery is one seeded generator,
+so the counts are the same on every run; the test asserts the band before the exact counts, so a
+change in numpy's random stream and a change in the method fail differently.
 
 ---
 
