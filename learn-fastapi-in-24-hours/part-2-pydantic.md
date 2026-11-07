@@ -64,10 +64,12 @@ class MetricBase(BaseModel):
     event_name: str = Field(
         ..., min_length=1, max_length=100, description="Event name to track"
     )
-    metric_type: MetricType = Field(MetricType.CONVERSION, description="Type of metric")
+    metric_type: MetricType = Field(
+        MetricType.CONVERSION, description=METRIC_TYPE_DESCRIPTION
+    )
     is_primary: bool = Field(False, description="Whether this is the primary metric")
     aggregation_method: str = Field(
-        "average", max_length=50, description="How to aggregate the metric"
+        "average", max_length=50, description=AGGREGATION_METHOD_DESCRIPTION
     )
     minimum_sample_size: int = Field(
         100,
@@ -87,7 +89,7 @@ class MetricBase(BaseModel):
     event_value_path: Optional[str] = Field(
         None,
         max_length=100,
-        description="JSON path to extract value from event payload",
+        description=EVENT_VALUE_PATH_DESCRIPTION,
     )
     lower_is_better: bool = Field(False, description="Whether lower values are better")
 
@@ -114,6 +116,38 @@ instead of a 422 naming the field. `max_length` on a string does the same job fo
 `VARCHAR`. A schema's constraints should mirror the column's limits, not just the business
 rules. The
 `json_schema_extra` example is what the docs page shows in the request body box.
+
+Three of the descriptions are not strings at all but names. They are module constants, written
+once at the top of the file:
+
+```python
+# 📁 backend/app/schemas/experiment.py
+#: What a metric's type means to the analysis (#439).  The same words on the
+#: request (``MetricBase``) and the response (``MetricResponse``).
+METRIC_TYPE_DESCRIPTION = (
+    "What the metric measures.  conversion: the share of assigned users who "
+    "sent event_name.  count: the number of event_name events per assigned "
+    "user; their value is not read.  revenue, duration and custom: the total "
+    "value of a user's event_name events, per assigned user.  In each mean a "
+    "user with none counts as 0."
+)
+
+#: ``aggregation_method`` and ``event_value_path`` are accepted, stored and
+#: returned, and no analysis reads them (#439).  Their descriptions say so.
+AGGREGATION_METHOD_DESCRIPTION = (
+    "Not read: the analysis does not use it, and how a metric is analysed "
+    "follows from metric_type (see analysis in the results).  Stored and "
+    "returned as sent."
+)
+```
+
+Two lessons in one move. A description is part of the published contract — it is what an
+integrator reads in `/api/v1/docs` and in the OpenAPI document — so the request model and the
+response model (`MetricResponse` uses the same three constants) must say the same thing, and a
+constant is how you make them unable to drift. And a description must be **true**:
+`aggregation_method` used to read "How to aggregate the metric", which promised behaviour no
+code had. When a field is accepted but ignored, say so in the field's own words; a reader who
+trusts the docs should never be surprised by the code.
 
 The flag request models share a private base, `_FeatureFlagRequest`, and nothing else:
 
@@ -146,12 +180,17 @@ class FeatureFlagCreate(_FeatureFlagRequest):
     rollout_percentage: int = Field(0, ge=0, le=100)
     ...
     default_value: StrictBool = Field(
-        False,
-        description=(
-            "What the flag serves when it is off. Only false is accepted for now."
-        ),
+        False, description=DEFAULT_VALUE_REQUEST_DESCRIPTION
+    )
+    value_type: ValueType = Field(BOOLEAN, description=VALUE_TYPE_DESCRIPTION)
+    on_value: Any = Field(
+        None, description=ON_VALUE_DESCRIPTION + VALUE_LIMITS_DESCRIPTION
+    )
+    off_value: Any = Field(
+        None, description=OFF_VALUE_DESCRIPTION + VALUE_LIMITS_DESCRIPTION
     )
     tags: Optional[List[str]] = None
+    ...
 
 
 class FeatureFlagUpdate(_FeatureFlagRequest):
@@ -163,7 +202,7 @@ class FeatureFlagUpdate(_FeatureFlagRequest):
     ...
 ```
 
-Four decisions to read in it:
+Five decisions to read in it:
 
 - **`extra="forbid"`.** A misspelt field (`"rollout_percent": 50`) is a 422, not a silently
   ignored key and a flag that did not change. On a public API that is the friendlier
@@ -173,9 +212,17 @@ Four decisions to read in it:
   schema) so a client can `GET` a flag, change one field and `PUT` the whole body back. The
   service drops them; a `status` that differs from the stored one is refused, with a message
   pointing at `is_active`.
-- **`StrictBool`.** `default_value` accepts only a real JSON boolean — `"false"` is a 422,
-  where plain `bool` would coerce it — and a validator then accepts only `false` (a flag whose
-  off-value is `true` would keep serving `true` after being turned off).
+- **A `Literal` for a closed set.** `value_type: ValueType` is
+  `Literal["boolean", "string", "number", "json"]`, so `"list"` is a 422 naming the four
+  values. What the flag serves is `on_value` to the users it is on for and `off_value` to
+  everyone else; both are typed `Any` because their JSON type depends on `value_type`, which
+  is a rule across fields — a model validator's job (Hour 6).
+- **`StrictBool` on a deprecated field.** `default_value` accepts only a real JSON boolean —
+  `"false"` is a 422, where plain `bool` would coerce it — and a validator then accepts only
+  `false` (a boolean flag whose off-value is `true` would keep serving `true` after being
+  turned off). It is deprecated in favour of `off_value` rather than removed, and under
+  `extra="forbid"` that difference matters: a removed field would turn every client that
+  still sends `"default_value": false` into a 422.
 - **`FeatureFlagUpdate` types `key: str = Field(None, ...)`, not `Optional[str]`.** Pydantic
   does not validate a default, so leaving `key` out still means "not sent"; but an explicit
   `"key": null` is validated, and a `before` validator refuses it (Hour 6). The column is
@@ -203,20 +250,28 @@ class FeatureFlagRead(BaseModel):
     )
     is_active: bool = Field(..., description='True exactly when status is "active".')
     ...
+    value_type: str = Field(..., description=VALUE_TYPE_DESCRIPTION)
+    on_value: Any = Field(..., description=ON_VALUE_DESCRIPTION)
+    off_value: Any = Field(..., description=OFF_VALUE_DESCRIPTION)
+    ...
 
     @model_validator(mode="before")
     @classmethod
     def _normalise(cls, data: Any) -> Any:
-        """Read a stored row (or a mapping), lower-case ``status`` and derive
-        ``is_active`` from it."""
+        """Read a stored row (or a mapping), lower-case ``status``, derive
+        ``is_active`` from it, and read a boolean flag's two values."""
         ...
 ```
 
 It holds types only — no key pattern, no length limit — because a response model that refuses
-a stored row turns a read into a 500. Its one piece of logic is a `mode="before"` model
-validator that reads the ORM row (or a dict), lower-cases `status` and derives `is_active`
-from it, so the two can never disagree. Every flag route answers with it through one
-function, `flag_to_read(flag)`.
+a stored row turns a read into a 500. Compare `value_type` on the two sides: the request types
+it `ValueType`, the four-value `Literal`, and the response types it plain `str`. The comment in
+the class gives the reason: an older image must still answer a row of a type a later release
+added, so a value this release has never heard of is read, not refused. Strict on the way in,
+tolerant on the way out. Its one piece of logic is a `mode="before"` model validator that reads
+the ORM row (or a dict), lower-cases `status` and derives `is_active` from it, so the two can
+never disagree, and gives a boolean flag (whose two value columns are NULL) its `true` and
+`false`. Every flag route answers with it through one function, `flag_to_read(flag)`.
 
 A pattern constraint that becomes a documented regex and a friendlier message than the raw
 `pattern` error:
@@ -260,6 +315,7 @@ FeatureFlagCreate(key="k", name="n", colour="red")             # ValidationError
 FeatureFlagCreate(key="k", name="n", default_value="false")    # ValidationError: bool_type (StrictBool)
 FeatureFlagUpdate(name=None)                                   # ValidationError: name cannot be null
 FeatureFlagUpdate(description=None).model_dump(exclude_unset=True)   # {'description': None}: clears it
+FeatureFlagCreate(key="k", name="n", value_type="list")        # ValidationError: literal_error, the four types listed
 ```
 
 (The `maximum` is `INT32_MAX`: the column is a 32-bit integer, so a larger value is a 422
@@ -343,16 +399,28 @@ class EventFields(BaseModel):
 
     @field_validator("properties", "metadata", mode="before")
     @classmethod
-    def parse_json_string(cls, v: Any) -> Any:
-        """Accept a JSON-encoded string for the free-form attribute fields."""
+    def parse_json_string(cls, v: Any, info: ValidationInfo) -> Any:
+        """Accept a JSON-encoded string for the free-form attribute fields.
+        ...
+        """
         if isinstance(v, str):
             import json
 
             try:
-                return json.loads(v) if v.strip() else None
+                decoded = json.loads(v) if v.strip() else None
             except json.JSONDecodeError as exc:
                 raise ValueError(f"must be a JSON object: {exc}") from exc
+            except RecursionError:
+                # Nested past the parser's own limit: far past the depth
+                # limit, so the same refusal as any other over-deep value.
+                raise ValueError(
+                    f"{info.field_name} must not be nested more than "
+                    f"{EVENT_METADATA_MAX_DEPTH} levels deep"
+                ) from None
+            ...
+            return decoded
         return v
+...
 
 
 class EventBase(EventFields):
@@ -366,10 +434,14 @@ class EventBase(EventFields):
         return self
 ```
 
-Three details to copy: one validator can guard **several fields** (`"properties",
+Four details to copy: one validator can guard **several fields** (`"properties",
 "metadata"`); `mode="before"` runs on the raw input so a string can be turned into a dict
-_before_ the `Dict[str, Any]` type check; and `raise ... from exc` keeps the JSON error as the
-cause. The model validator returns `self` — mandatory in `mode="after"`. Note the split: the
+_before_ the `Dict[str, Any]` type check; `raise ... from exc` keeps the JSON error as the
+cause; and the optional second parameter, `info: ValidationInfo`, tells a validator shared by
+several fields which one it is checking (`info.field_name`), so its message can name it. The
+`RecursionError` branch is a reminder that `json.loads` has limits of its own: a string nested
+deeply enough makes the parser itself give up, and that is turned into the same 422 as any
+other value nested too deep. The model validator returns `self` — mandatory in `mode="after"`. Note the split: the
 field-level parsing lives on `EventFields` and the "names an experiment or a flag" rule on
 its subclass `EventBase`, because one caller (`UntaggedEventCreate`, an event that names
 neither) needs the fields without the rule. Put a rule on the narrowest class that needs it.
@@ -416,6 +488,87 @@ would turn it into a generic "Input should be a valid string". And it raises
 the error's `type` (what a client can branch on) and its message exactly, without the
 `"Value error, "` prefix a `ValueError` gets.
 
+The flag's values take that idea all the way. Whether `on_value` and `off_value` are acceptable
+depends on `value_type` — a string flag needs two strings, a boolean flag `true` and `false` —
+so the rule is cross-field and belongs in a model validator. But a model validator's
+`ValueError` is reported at the model (`loc: ["body"]`), and a client fixing a form wants to know
+_which_ field. `FeatureFlagCreate` gets both:
+
+```python
+# 📁 backend/app/schemas/feature_flag.py
+    @model_validator(mode="after")
+    def values_fit_the_type(self) -> "FeatureFlagCreate":
+        """The two values follow the value rules for ``value_type``.
+
+        A string, number or json flag sends both, of its type and within the
+        limits, and different; a boolean flag sends neither, or ``true`` and
+        ``false``.  Each refusal is at its own field.
+        """
+        sent = {
+            field: getattr(self, field)
+            for field in VALUE_FIELDS
+            if field in self.model_fields_set
+        }
+        errors = write_errors(self.value_type, sent, None)
+        if errors:
+            raise value_errors_to_raise(type(self).__name__, errors)
+        return self
+```
+
+The rules themselves live in one plain module, `backend/app/core/flag_values.py`, with no
+Pydantic model in it at all. Each rule returns a `PydanticCustomError` rather than raising:
+
+```python
+# 📁 backend/app/core/flag_values.py
+    if value_type == BOOLEAN:
+        if value is (field == "on_value"):
+            return None
+        return PydanticCustomError("boolean_values", BOOLEAN_VALUES)
+    if not _of_type(value_type, value):
+        return PydanticCustomError(
+            "value_type_mismatch",
+            f"{field} must be {_TYPE_WORDS.get(value_type, value_type)}, "
+            f"because value_type is {value_type}",
+        )
+```
+
+and the schema turns the `(field, error)` pairs into one `ValidationError` whose errors each sit
+at their own place:
+
+```python
+# 📁 backend/app/schemas/feature_flag.py
+def value_errors_to_raise(
+    title: str, errors: List[Any], prefix: tuple = ()
+) -> ValidationError:
+    ...
+    return ValidationError.from_exception_data(
+        title,
+        [
+            InitErrorDetails(type=error, loc=(*prefix, field), input=None)
+            for field, error in errors
+        ],
+    )
+```
+
+Three design decisions are worth stealing:
+
+- **The rules are not in the model.** An update is checked against the _stored_ flag's type,
+  which the request model cannot see, so `FeatureFlagService` calls the same `write_errors`
+  with the stored values; the evaluate route reads a stored row through the same module. One
+  module, three callers, no way for them to disagree.
+- **Built errors, not raised ones.** `ValidationError.from_exception_data` with
+  `InitErrorDetails` is how you raise several precise errors at once from one validator. Over
+  HTTP a string flag sent with only `on_value` answers
+  `{"type": "value_required", "loc": ["body", "off_value"], ...}`, and a number flag sent
+  `"on_value": "1"` answers `value_type_mismatch` at `["body", "on_value"]`. `input=None` keeps
+  the submitted value out of the error, as the 422 handler from Hour 1 does.
+- **`model_fields_set`.** "Sent" means present in the request, not "not `None`". A field left
+  out is not type-checked; on a create it is then reported as required (for a string, number or
+  json flag), and on an update the stored value stands in for it.
+
+The database holds the same rule as a `CHECK` constraint (Hour 14): the schema gives a client a
+422 naming the field, and the constraint gives the system its guarantee.
+
 A model validator with **three cross-field rules** and clear messages for each:
 
 ```python
@@ -426,10 +579,16 @@ A model validator with **three cross-field rules** and clear messages for each:
         if not self.stages:
             raise ValueError("At least one stage is required")
 
-        # Check that stages have increasing percentages
-        stage_percentages = [stage.target_percentage for stage in self.stages]
+        # Check that the targets do not decrease in stage_order, whatever
+        # order the list is in: the scheduler starts stages by stage_order
+        # (#1460). A stable sort, so stages that share an order (refused
+        # below) are compared in list order.
+        stage_percentages = [
+            stage.target_percentage
+            for stage in sorted(self.stages, key=lambda stage: stage.stage_order)
+        ]
         if not all(a <= b for a, b in zip(stage_percentages, stage_percentages[1:])):
-            raise ValueError("Stage percentages must be non-decreasing")
+            raise ValueError("Stage percentages must be non-decreasing in stage_order")
 
         # Check that max stage percentage doesn't exceed the schedule max
         if max(stage_percentages) > self.max_percentage:
@@ -448,6 +607,16 @@ A model validator with **three cross-field rules** and clear messages for each:
 
         return self
 ```
+
+The first rule carries the best bug in this Part. It used to read the targets **in list
+order** — `[stage.target_percentage for stage in self.stages]` — while the scheduler starts
+stages **by `stage_order`**. So a request listing `{stage_order: 2, target: 10}` before
+`{stage_order: 1, target: 50}` passed (10 then 50, non-decreasing) and then ran 50% followed by
+10%: exactly the decrease the rule exists to refuse (#1460). A validator has to judge the data
+in the order its _consumer_ will use it, not in the order the request happened to be written.
+Sorting by `stage_order` first is the fix here, and the message now says which order it means.
+The same change made the service apply the rule to every later stage change too, because a
+rule checked only on create is checked once.
 
 The last rule counts rather than builds: `n` orders are consecutive exactly when they are all
 different and the highest is `n - 1` above the lowest. (An earlier version compared
@@ -544,6 +713,13 @@ EventRequest(event_type="purchase", user_id="u", experiment_key="k", metadata='{
 
 from backend.app.schemas.rollout_schedule import RolloutScheduleCreate
 # build a schedule with stages 10 → 50 → 25 and read the message; then fix the order and gap the stage_order
+# then list {stage_order: 2, target_percentage: 10} before {stage_order: 1, target_percentage: 50}:
+# rising in the list, falling in stage_order → "Stage percentages must be non-decreasing in stage_order"
+
+from backend.app.schemas.feature_flag import FeatureFlagCreate
+FeatureFlagCreate(key="k", name="n", value_type="string", on_value="a")                  # value_required at ('off_value',)
+FeatureFlagCreate(key="k", name="n", value_type="string", on_value="a", off_value="a")   # values_equal at ('off_value',)
+FeatureFlagCreate(key="k", name="n", value_type="number", on_value=True, off_value=0)    # value_type_mismatch: a bool is not a number
 ```
 
 `EventCreate` inherits `parse_json_string` from `EventFields` (through `EventBase`); the public tracking API's
@@ -566,13 +742,17 @@ to `POST /experiments/` to see what the API does today.
 - **Reading `info.data` for a field declared later.** It isn't there yet; use a model
   validator.
 - **Validating what a DB constraint should guarantee, and only there.** Do both.
+- **Checking a list in the order it arrived** when its consumer reads it in another order
+  (`stage_order`). Sort the way the consumer will.
 
 ### Key takeaways
 
 - `field_validator`: one field, normalise or refuse; `mode="before"` for raw input; can cover
   several fields.
 - `model_validator(mode="after")`: cross-field rules; return `self`.
-- Raise `ValueError` with the sentence you want the user to read.
+- Raise `ValueError` with the sentence you want the user to read; raise
+  `PydanticCustomError` for a stable `type` a client can branch on; build a `ValidationError`
+  from `InitErrorDetails` to put a model validator's errors at their own fields.
 - Declaration order matters for `info.data`; validators run for every construction.
 - Schema validation for messages, database constraints for guarantees — both.
 

@@ -5,8 +5,8 @@
 > **Preface.** Most FastAPI tutorials stop at `@app.get("/items/{id}")` and a `BaseModel` with
 > two fields. This book is different. Every concept is taught **twice**: once in the abstract,
 > and once with a real snippet pulled from the **Controlvar** backend (an open-source FastAPI +
-> SQLAlchemy + PostgreSQL experimentation platform: about 78,000 lines of typed Python in the
-> core `backend/app`, and some 24,900 tests). By Hour 24 you won't
+> SQLAlchemy + PostgreSQL experimentation platform: about 86,000 lines of typed Python in the
+> core `backend/app`, and some 34,000 tests). By Hour 24 you won't
 > just _know_ FastAPI — you'll know how a production team uses it to run an API with
 > thirty-seven core routers (plus the optional modules' routers, mounted through a seam),
 > several authentication paths, five background schedulers, and a test harness that spins up
@@ -47,10 +47,11 @@ same rhythm so you can pace yourself:
 Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lock it in.
 
 > **Convention in this book.** Code blocks tagged `# 📁 path/to/file.py` are real, current
-> Controlvar source at v0.36.4. Blocks with no path are illustrative. `# ✅` marks the idiom we want;
-> `# ❌` marks the anti-pattern it replaces. You'll want the API running
-> (`make dev`; see the app's [CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/v0.36.4/CONTRIBUTING.md)) — many exercises are `curl`
-> against `http://localhost:8000`.
+> Controlvar source at commit `09d815ea` (`main` after v0.43.2). Blocks with no path are
+> illustrative. `# ✅` marks the idiom we want; `# ❌` marks the anti-pattern it replaces. You'll
+> want the API running (`make dev`; see the app's
+> [CONTRIBUTING.md](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/CONTRIBUTING.md))
+> — many exercises are `curl` against `http://localhost:8000`.
 
 ---
 
@@ -127,24 +128,27 @@ each over the next 24 hours; keep them in view:
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`). Controlvar was called Experimently before
-0.35.0; you will still meet the old name in some identifiers (the `experimently.bearer`
-WebSocket subprotocol, the `EXPERIMENTLY_VERSION` variable, the `experimently-local` token
-issuer), and they are quoted as the code spells them. Every snippet tagged `# 📁` was compared
-with the file at that tag, line by line (a script normalises whitespace and trailing commas
-and lists any line that is not in the file); where a snippet leaves lines out it says so with
-`...`. Counts were measured at the tag: lines with `wc -l` over `backend/app` (78,458),
-tests with `pytest --collect-only -q` (24,868: 21,487 under `backend/tests`, 3,381 under
-`modules/backend/tests`), the thirty-seven `include_router` calls in `register_core_routers`
-(and the eleven the modules add), the five schedulers started in the lifespan, and the
-pinned `fastapi==0.141.1`, `pydantic==2.13.5`, `SQLAlchemy==2.0.54`, `alembic==1.20.0` in
-`backend/requirements.txt`. The Try-It exercises that need a database, Redis, the dashboard or
-a running API were not run for this edition. Files move; if a path 404s, `git grep` the symbol
-(e.g. `git grep -n "def get_current_user"`). The _patterns_ outlast the line numbers.
+Verified against Controlvar `main` at `09d815ea` (after v0.43.2). Controlvar was called
+Experimently before 0.35.0; you will still meet the old name in some identifiers (the
+`experimently.bearer` WebSocket subprotocol, the `EXPERIMENTLY_VERSION` variable, the
+`experimently-local` token issuer), and they are quoted as the code spells them. Every snippet
+tagged `# 📁` was compared with the file at that commit, line by line (a script normalises
+whitespace and lists any line that is not in the file); where a snippet leaves lines out it
+says so with `...`, and a long call or signature is sometimes joined onto one line. Counts were
+measured at that commit: lines with `wc -l` over the `.py` files
+in `backend/app` (85,617), tests with `pytest --collect-only -q` (30,394 under `backend/tests`
+and 3,852 under `modules/backend/tests`, not counting eight warehouse test files that need the
+full image's `duckdb` and `sqlglot`), the thirty-seven `include_router` calls in
+`register_core_routers` (and the twelve the modules add), the five schedulers started in the
+lifespan, and the pinned `fastapi==0.141.1`, `pydantic==2.13.5`, `SQLAlchemy==2.0.54`,
+`alembic==1.20.0` in `backend/requirements.txt`. The Try-It exercises that need a database,
+Redis, the dashboard or a running API were not run for this edition; the ones that only import
+schemas and construct models were. Files move; if a path 404s, `git grep` the symbol (e.g.
+`git grep -n "def get_current_user"`). The _patterns_ outlast the line numbers.
 
 To re-check a quote yourself, clone [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar)
-at `v0.36.4`, then point this repository's `tools/check.sh` at it (see `tools/README.md`) to
-re-run the path, snippet and link checks over this book.
+and check out `09d815ea`, then point this repository's `tools/check.sh` at it (see
+`tools/README.md`) to re-run the path, snippet and link checks over this book.
 
 _Now turn to [Part I](./part-1-foundations.md) and start the clock. ⏱️_
 

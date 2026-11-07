@@ -146,12 +146,14 @@ on the API-key check, which depends on the session and on the `X-API-Key` header
 
 ```python
 # 📁 backend/app/api/sdk_scope.py
-def require_sdk_ruleset_key(
+async def require_sdk_ruleset_key(
     db: Session = Depends(deps.get_db),
     api_key_header: str = Depends(deps.API_KEY_HEADER),
     _owner: User = Depends(deps.get_api_key),
 ) -> APIKey:
-    """Return the presented ``APIKey`` row if it carries ``sdk:ruleset``."""
+    """Return the presented ``APIKey`` row if it carries ``sdk:ruleset``.
+    ...
+    """
     ...
     refusal = scope_refusal(db, api_key)
     if refusal is not None:
@@ -161,7 +163,7 @@ def require_sdk_ruleset_key(
 
 ```python
 # 📁 backend/app/api/v1/endpoints/sdk.py
-def get_ruleset(
+async def get_ruleset(
     request: Request,
     db: Session = Depends(deps.get_db),
     api_key: APIKey = Depends(require_sdk_ruleset_key),
@@ -176,9 +178,15 @@ endpoint's own `db: Session = Depends(deps.get_db)` gets the _same_ session — 
 The `_owner` parameter is never read: it is there so that `get_api_key`'s 401 for a missing or
 unknown key happens first, before the scope check can answer 403. The 403 has two reasons,
 both in `scope_refusal`: the key lacks the `sdk:ruleset` scope, or its _owner_ can no longer
-change feature flags (deactivated, or demoted to a role that cannot). A key is only as
-powerful as the person it was created by, and that is checked on every request, not once at
-creation.
+change feature flags (deactivated, or no longer holding a role — or, in the full profile, a
+custom role or direct grant — that may). That second test is one function,
+`may_use_server_key(owner)`, which is `check_permission(owner, FEATURE_FLAG, UPDATE)`: the
+same question every flag-changing route asks (Hour 12). A key is only as powerful as the
+person it was created by, and that is checked on every request, not once at creation, so it
+follows a demotion or a revoked grant at once. A second dependency stacks on this one:
+`require_batch_assign_key` (`POST /tracking/assign/batch`) depends on
+`require_sdk_ruleset_key` and then also asks that the owner can change experiments, so a chain
+can keep growing one rule at a time without any route repeating the rules below it.
 
 The override, from the test harness:
 
@@ -193,11 +201,20 @@ The override, from the test harness:
     ...
     app.dependency_overrides[deps.get_db] = override_get_db
     app.dependency_overrides[deps.get_current_user] = override_get_current_user
-    app.dependency_overrides[deps.get_current_active_user] = override_get_current_active_user
+    app.dependency_overrides[deps.get_current_active_user] = (
+        override_get_current_active_user
+    )
+    # The four read routes that also take an mcp:read key depend on this one,
+    # which an override of get_current_active_user does not reach.
+    app.dependency_overrides[get_current_reader] = override_get_current_active_user
 ```
 
 The endpoint code doesn't change; the tree's leaves do. Note the override `finally: pass` —
-the test session is owned by the fixture, not the request.
+the test session is owned by the fixture, not the request. And read the comment above the last
+line, because it is the subtle rule of overrides: **an override replaces a dependency only
+where FastAPI resolves it.** `get_current_reader` (Hour 11) calls `get_current_active_user`
+and `get_current_user` as plain functions in its body, not through `Depends`, so overriding
+those two changes nothing inside it. The harness has to override `get_current_reader` itself.
 
 > **Did You Know?** `Depends()` with no argument uses the parameter's type annotation as the
 > dependency — `commons: CommonParams = Depends()` calls `CommonParams(...)` with the
@@ -248,6 +265,9 @@ watch it open twice.
   object needs `use_cache=False`.
 - **Overriding the wrong object.** `dependency_overrides` is keyed by the exact function
   object the endpoint referenced (`deps.get_current_user`), not by name.
+- **Expecting an override to reach a plain call.** A dependency that calls another one as an
+  ordinary function (`get_current_reader` does) is untouched by an override of the callee;
+  override the dependency the route actually declares.
 
 ### Key takeaways
 
@@ -336,23 +356,32 @@ Composition passes the _same_ session down: `AssignmentService(db)` builds `Even
 so an assignment and its exposure event are written in one transaction, and the test's
 override session sees both.
 
-The schedulers, with no request, own theirs:
+The schedulers, with no request, own theirs — and open it in the worker thread that does the
+tick's database work (Hour 19), never on the event loop:
 
 ```python
 # 📁 backend/app/core/scheduler.py
+    def _process_due(self) -> "_DueWork":
+        """
+        The tick's database work; runs in a worker thread.
+        ...
+        """
+        ...
         # Use a new database session for this task
         db = SessionLocal()
         try:
             current_time = datetime.now(timezone.utc)
-            experiments_to_activate = db.query(Experiment).filter(...).all()
             ...
-            db.commit()
         except Exception as e:
+            failed_count += 1
             logger.error(f"Error processing scheduled experiments: {e!s}")
-            db.rollback()
         finally:
             db.close()
 ```
+
+There is no `db.rollback()` in that `except`, and none is needed: each row is written inside its
+own savepoint (Hour 16), and `close()` ends the session's transaction, discarding anything not
+committed, before it hands the connection back to the pool.
 
 And the WebSocket handler shows the subtle case — a dependency-provided session used only
 for authentication, then released early so a long-lived socket doesn't pin a pooled
@@ -427,13 +456,17 @@ provides **security schemes** (`OAuth2PasswordBearer`, `APIKeyHeader`, `HTTPBear
 extract the credential from the request _and_ register themselves in the OpenAPI document,
 so the docs show which endpoints need which credential and the "Authorize" button works.
 
-Controlvar has two schemes and one dispatcher:
+Controlvar has two credentials and one dispatcher for each:
 
 - `oauth2_scheme = OAuth2PasswordBearer(tokenUrl=".../auth/token", auto_error=False)` reads
   `Authorization: Bearer <token>`; `get_current_user` resolves it (dev bypass → local JWT →
   Cognito).
 - `API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)` reads the SDK header;
   `get_api_key` resolves it to the key's owner.
+
+and, since keys gained a read scope, one dependency that accepts either on four read routes
+(`get_current_reader`, below), with a third scheme object that reads the same header under its
+own name in the OpenAPI document.
 
 #### Why `auto_error=False`
 
@@ -588,7 +621,7 @@ def get_current_superuser(current_user: User = Depends(get_current_active_user))
 
 The API-key path is separate on purpose: SDK endpoints declare `Depends(deps.get_api_key)`
 and never accept a bearer; dashboard endpoints declare `get_current_active_user` and never
-accept a key:
+accept a key — with one deliberate, fenced exception, shown after this:
 
 ```python
 # 📁 backend/app/api/deps.py
@@ -621,6 +654,59 @@ def get_api_key(db: Session = Depends(get_db), api_key_header: str = Depends(API
 The `update_last_used` call records when the key was last seen (throttled inside the model
 method; Hour 16 shows how). A failure there is bookkeeping, not authentication, so it is
 caught, rolled back and logged — it never turns a valid key into an error.
+
+The two doors meet in exactly one place. An API key may carry the `mcp:read` scope (for the
+Controlvar MCP server, which runs on a developer's computer and reads flags, experiments and
+results through this API), and four read routes — the flag list, the experiment list, one
+experiment and its results — take a sign-in _or_ such a key. They do it through one dependency
+whose docstring states the order as a contract:
+
+```python
+# 📁 backend/app/api/read_scope.py
+MCP_READ_KEY_HEADER = APIKeyHeader(
+    name="X-API-Key",
+    scheme_name="MCPReadAPIKey",
+    ...
+    auto_error=False,
+)
+...
+def get_current_reader(
+    db: Session = Depends(deps.get_db),
+    token: Optional[str] = Depends(oauth2_scheme),
+    api_key_header: Optional[str] = Depends(MCP_READ_KEY_HEADER),
+) -> User:
+    """The signed-in user, or the owner of a presented ``mcp:read`` key."""
+    if token or not api_key_header or deps.dev_auth_bypass_active():
+        return get_current_active_user(get_current_user(token=token, db=db))
+
+    owner = get_api_key(db=db, api_key_header=api_key_header)
+    api_key = (
+        db.query(APIKey).filter(APIKey.key == hash_api_key(api_key_header)).first()
+    )
+    if api_key is None or not api_key.is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+            headers={"WWW-Authenticate": "APIKey"},
+        )
+    if not has_scope(api_key.scopes, MCP_READ_SCOPE):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=MISSING_SCOPE_DETAIL
+        )
+    return owner
+```
+
+Read the first line of the body as the rule: **a bearer token wins, and is judged alone** — even
+an invalid token next to a valid key is a 401, never "fall back to the key" — so adding the key
+door cannot weaken the sign-in door. Only with no token does the key count, and then it is
+validated exactly as `get_api_key` validates it, and the scope is checked on the _presented_
+key (re-hashed from the header), so another key of the same owner grants nothing. What comes
+back is the key's owner, and the route's own role checks run unchanged: the scope admits a
+reader, it does not make one. The dependency calls `get_current_user`, `get_current_active_user`
+and `get_api_key` as plain functions — the "dependencies are functions" property again — which is
+also why the test harness must override it separately (Hour 9). The second `APIKeyHeader` exists
+only for the documentation: `scheme_name="MCPReadAPIKey"` makes the OpenAPI document say which
+key these four routes take.
 
 The dev bypass is the one place a dependency returns an identity without a credential, and
 it's guarded twice — in `Settings` at startup (a validator refuses `DEV_AUTH_BYPASS=true`
@@ -663,9 +749,10 @@ start-up validator and this call-time check cannot drift apart; `is True` makes 
 Send each credential to the wrong door and read the `WWW-Authenticate` header:
 
 ```bash
-curl -si $API/experiments/ | grep -i "HTTP/\|www-authenticate"                 # no credential → 401 Bearer
-curl -si $API/experiments/ -H "X-API-Key: $KEY" | grep -i "HTTP/\|www-authenticate"   # key on a bearer route → 401
+curl -si $API/users/me | grep -i "HTTP/\|www-authenticate"                     # no credential → 401 Bearer
+curl -si $API/users/me -H "X-API-Key: $KEY" | grep -i "HTTP/\|www-authenticate"       # key on a bearer route → 401
 curl -si -X POST $API/tracking/assign -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"experiment_key":"x","user_id":"u"}' | grep -i "HTTP/\|www-authenticate"   # bearer on a key route → 401 APIKey
+curl -si $API/experiments/ -H "X-API-Key: $KEY" | grep -i "HTTP/"               # the reader door: 403 without mcp:read, 200 with it
 ```
 
 Then decode your token's claims without verifying (to _see_ `iss`, `sub`, `exp`; never do
@@ -676,7 +763,10 @@ this in code): `python -c "import jwt; print(jwt.decode('$TOKEN', options={'veri
 - **`auto_error=True` (the default) on a scheme where "missing" needs a decision.** The
   scheme 401s before your dependency runs.
 - **Accepting both bearer and API key on one endpoint "for convenience."** The two carry
-  different trust and different rate limits; keep the doors separate.
+  different trust and different rate limits; keep the doors separate. Where a route truly
+  needs both, write one dependency that fixes the precedence, requires a scope and returns the
+  same `User` the route already checks — `get_current_reader` — and pin the routes that use it
+  (`backend/tests/smoke/test_mcp_read_routes.py`).
 - **Verifying a JWT without pinning `algorithms` and `issuer`.** `alg: none` and cross-service
   replay are the classic failures.
 - **Storing API keys in plaintext.** Hash with SHA-256 (fast, one-way); bcrypt is for
@@ -691,8 +781,9 @@ this in code): `python -c "import jwt; print(jwt.decode('$TOKEN', options={'veri
   (the account linked to the Cognito user ID, created on first sign-in; every refusal the
   same 401).
 - `get_current_active_user` / `get_current_superuser` stack on it; `get_api_key` is a separate
-  door for SDKs.
-- Dependencies are functions — the WebSocket handler calls them by hand.
+  door for SDKs; `get_current_reader` is the one ordered door to both, on four read routes,
+  for a key with `mcp:read` (a bearer token always wins and is judged alone).
+- Dependencies are functions — the WebSocket handler and `get_current_reader` call them by hand.
 
 ---
 
@@ -701,8 +792,8 @@ this in code): `python -c "import jwt; print(jwt.decode('$TOKEN', options={'veri
 ### What & why
 
 Authentication (Hour 11) answers _who is this_. Authorization answers _may they do this to
-that_. In Controlvar the answer comes from the caller's **role**, never from who created
-the thing:
+that_. In Controlvar the answer comes from the caller's **permissions** — their role, plus, in
+the full profile, any custom roles and direct grants — never from who created the thing:
 
 - **ADMIN** and **DEVELOPER** read, create, change and delete any experiment and any feature
   flag.
@@ -710,12 +801,18 @@ the thing:
 - A **superuser** may do anything. That is a separate bit on the user, not the ADMIN role
   (an ADMIN who is not a superuser cannot open the admin area, whose routes depend on
   `get_current_superuser`).
+- In the full profile, the RBAC module's **custom roles and direct grants** add to that, and
+  only add: they can give an ANALYST `feature_flag (update)`, say, but never take anything a
+  built-in role holds away. Only eleven pairs can be granted at all — create, read, update,
+  delete and list on experiments and on feature flags, and read on the audit log — and the
+  module refuses any other with a 422 of type `not_grantable`.
 
 The creator is still recorded (`owner_id`) and shown in the dashboard. It is just not an
 access rule. Everything is built from one primitive in `core/permissions.py`:
 
 - `check_permission(user, ResourceType, Action)` — superuser shortcut, then the role matrix
-  `ROLE_PERMISSIONS[role][resource]`;
+  `ROLE_PERMISSIONS[role][resource]`, then (only if the role said no) the user's granted
+  pairs;
 - `get_permission_error_message(...)` — the sentence a 403 carries ("You don't have
   permission to update experiments").
 
@@ -848,11 +945,15 @@ def can_act_on_feature_flag(
     action: Action,
     scope_table: Optional[Dict[UserRole, Dict[Action, Scope]]] = None,
 ) -> bool:
+    ...
     if getattr(user, "is_superuser", False):
         return True
-    if not check_permission(user, ResourceType.FEATURE_FLAG, action):
-        return False
-    role = getattr(user, "role", UserRole.VIEWER)
+    try:
+        role = getattr(user, "role", UserRole.VIEWER)
+    except (AttributeError, TypeError):
+        role = UserRole.VIEWER
+    if not has_permission(role, ResourceType.FEATURE_FLAG, action):
+        return _pair(ResourceType.FEATURE_FLAG, action) in granted_permissions(user)
     table = FEATURE_FLAG_SCOPE if scope_table is None else scope_table
     scope = table.get(role, {}).get(action, Scope.OWN)
     if scope is Scope.ANY:
@@ -860,12 +961,16 @@ def can_act_on_feature_flag(
     return owner_id is not None and str(owner_id) == str(getattr(user, "id", None))
 ```
 
-Read it in order. The role matrix comes **first**, so owning a flag can never let a read-only
-role change it. Only then does `FEATURE_FLAG_SCOPE` say _whose_ flags the permission covers —
-and today every entry is `Scope.ANY`. The `Scope.OWN` branch is deliberately kept as the
-lever for a future per-flag restriction (locking a flag to its owner, approvals): that would
-be a change to this table, not to twenty routes. The `scope_table` parameter exists so tests
-can exercise that branch.
+Read it in order. The built-in role's matrix comes **first**, so owning a flag can never let a
+read-only role change it. A role that lacks the action falls through to the grants: a custom
+role or direct grant of `feature_flag (<action>)` admits any flag, and without one the answer
+is no — ownership is still never consulted. Only for a role that _has_ the action does
+`FEATURE_FLAG_SCOPE` say _whose_ flags the permission covers — and today every entry is
+`Scope.ANY`. The `Scope.OWN` branch is deliberately kept as the lever for a future per-flag
+restriction (locking a flag to its owner, approvals): that would be a change to this table, not
+to twenty routes. The comment above the table records the catch: the table binds the built-in
+roles only, so such a lock would have to be checked on the grant path too. The `scope_table`
+parameter exists so tests can exercise that branch.
 
 And a route calling it — load, decide, then act:
 
@@ -908,6 +1013,7 @@ The matrix primitive underneath everything:
 ```python
 # 📁 backend/app/core/permissions.py
 def check_permission(user: Any, resource: ResourceType, action: Action) -> bool:
+    ...
     # Superusers always have all permissions
     if hasattr(user, "is_superuser") and user.is_superuser:
         return True
@@ -919,13 +1025,32 @@ def check_permission(user: Any, resource: ResourceType, action: Action) -> bool:
         # Default to Viewer role if there's any issue
         role = UserRole.VIEWER
 
-    # Check role permissions
-    return has_permission(role, resource, action)
+    # Check role permissions. A user whose role is None gets nothing here.
+    if has_permission(role, resource, action):
+        return True
+
+    # Then what the user's custom roles and direct grants hold (full profile;
+    # always empty in the core profile). Asked only when the role says no, so
+    # a check the role allows reads nothing more.
+    return _pair(resource, action) in granted_permissions(user)
 ```
 
 It is deliberately tolerant of mocks (`hasattr`, `getattr` with a `VIEWER` default) — a test
 can pass a `SimpleNamespace` user, and a malformed row degrades to least privilege rather
-than raising.
+than raising. `granted_permissions(user)` keeps that property and adds three of its own:
+
+- **Core never imports the RBAC module.** It asks the `hooks` seam (Hour 2) for an
+  `rbac.granted_permissions` capability; in a core build nothing registered one, and the
+  answer is an empty set.
+- **Only a real, session-bound row is asked about.** A `SimpleNamespace`, a `MagicMock`, a
+  transient or detached instance gets nothing (the docstring notes that `inspect` of a
+  `MagicMock` answers a mock whose "session" is a mock too, so the test is strict).
+- **One query per user per session.** The answer is kept in `session.info`, so a request that
+  checks ten flags reads the grants once, and because every request has its own session
+  (Hour 10), a grant or revoke made by one request is seen by the next.
+
+And whatever a stored grant says, only the `GRANTABLE` pairs take effect: the set is
+intersected on the way out, so a pair stored before the 422 existed is shown but never acts.
 
 **A rule is only as good as the routes that call it.** A new flag route that forgets
 `can_act_on_feature_flag` is open to every signed-in user. So a smoke test pins the exact set
@@ -1035,14 +1160,15 @@ The same cases, and the experiment ones, are pinned in
 - **Forgetting the `raise`.** `can_act_on_feature_flag` returns a `bool`; it refuses nothing
   on its own.
 - **A new resource type checked with ad-hoc `if user.role == ...`** instead of the matrix —
-  now there are two sources of truth.
+  now there are two sources of truth, and the second cannot see a custom role or a grant.
 - **Assuming `ADMIN` role ⇒ superuser.** They're different bits; `get_current_superuser`
   checks only the bit.
 
 ### Key takeaways
 
-- Access is by role, never by who created the resource; the creator is recorded and shown,
-  not consulted.
+- Access is by permission — the role, then (full profile) custom roles and direct grants,
+  which only add — never by who created the resource; the creator is recorded and shown, not
+  consulted.
 - Experiments: `get_experiment_read_access` / `get_experiment_change_access(..., action)`,
   sync, called with the loaded experiment. Flags: `can_act_on_feature_flag(user,
   flag.owner_id, action)`, sync, called inline by every flag route; only create is an async
@@ -1141,38 +1267,71 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 ```
 
-Timing with **label normalisation** — the detail that keeps Prometheus from exploding on
-UUIDs in paths:
+Timing with a **bounded label** — the detail that keeps Prometheus from exploding on ids in
+paths. The label is not the path the client sent but the template of the route it matched,
+read _after_ the request has been handled:
 
 ```python
 # 📁 backend/app/middleware/prometheus_metrics_middleware.py
-# Matches UUID v4 segments in URL paths
-_UUID_PATTERN: re.Pattern = re.compile(
-    r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE,
-)
-# Matches purely-numeric path segments (e.g. /users/42)
-_NUMERIC_PATTERN: re.Pattern = re.compile(r"/\d+")
+UNMATCHED_ENDPOINT = "unmatched"
+...
+def route_template(scope: Scope) -> str:
+    """The template of the route this request matched, or ``UNMATCHED_ENDPOINT``.
 
-
-def normalize_path(path: str) -> str:
-    """Replace dynamic path segments with ``{id}`` for stable metric labels.
-
+    Read once the request has been handled: routing records what it matched
+    in the scope, which every layer of the stack shares. Nothing here reads
+    the request path, so the label takes only the values the application's
+    routes define, plus ``UNMATCHED_ENDPOINT``.
     ...
     """
-    path = _UUID_PATTERN.sub("/{id}", path)
-    path = _NUMERIC_PATTERN.sub("/{id}", path)
-    return path
+    fastapi_scope = scope.get("fastapi")
+    if isinstance(fastapi_scope, dict):
+        template = _template(fastapi_scope.get("effective_route_context"))
+        if template is not None:
+            return template
+    ...
+    return UNMATCHED_ENDPOINT
 
 
 class PrometheusMetricsMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next) -> Response:
+    ...
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         start_time: float = time.time()
         response: Response = await call_next(request)
         duration: float = time.time() - start_time
-        endpoint: str = normalize_path(request.url.path)
-        record_request(method=request.method, endpoint=endpoint, status_code=response.status_code, duration=duration)
+
+        record_request(
+            method=request.method,
+            endpoint=route_template(request.scope),
+            status_code=response.status_code,
+            duration=duration,
+        )
         return response
 ```
+
+This is the ASGI onion paying off. The middleware runs _outside_ routing, so before
+`call_next` it cannot know which route will answer. But the ASGI `scope` is one dictionary
+shared by every layer, and routing writes what it matched into it, so after `call_next` the
+outer layer can read the inner layer's decision. For a route in an included router FastAPI
+keeps the full template (`/api/v1/feature-flags/user/{user_id}`) in
+`scope["fastapi"]["effective_route_context"]` (`scope["route"].path` would give only the part
+relative to its router, `/user/{user_id}`). A 404, the trailing-slash redirect and a response a
+middleware gave before routing (a 429, a refused `Host`) are all `unmatched`. The label can now
+take only the values the application's own routes define.
+
+Until #1611 the label was the request path with UUID and numeric segments replaced by `{id}`,
+so any other segment that varies — a flag key, a user id that is not a UUID — still made a new
+label value: the label set was whatever clients sent. Recognising the dangerous shapes was the
+wrong way round; taking the label from a closed set is the right one. The docstring is honest
+about the price: that `scope` key is not public FastAPI API, so
+`test_metric_labels_stay_bounded_route_templates` fails, naming this function, if a FastAPI
+upgrade ever drops it. (`record_request` also maps the method to a fixed set — an unknown verb
+is counted as `other` — and the rate limiter labels its metrics by the limit, not the path, as
+the next snippet shows.)
 
 A middleware that **short-circuits** — returns its own response without calling `call_next`:
 
@@ -1181,7 +1340,7 @@ A middleware that **short-circuits** — returns its own response without callin
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if not self._enabled:
             return await call_next(request)
-
+        ...
         if request.method == "OPTIONS" and "access-control-request-method" in (
             request.headers
         ):
@@ -1190,12 +1349,25 @@ A middleware that **short-circuits** — returns its own response without callin
         path = request.url.path
         client_ip = _get_client_ip(request)
 
-        # Determine the applicable limit for this path
-        limit, window = resolve_rate_limit(path, self._sdk_limit)
+        # Determine the applicable limit for this path, and its name
+        bucket, (limit, window) = resolve_rate_limit_bucket(path, self._sdk_limit)
 
         rate_key = rate_limit_key(client_ip, path)
         allowed, remaining = self._limiter.is_allowed(rate_key, limit, window)
-        ...
+
+        # Record Prometheus metrics, labelled by the limit, not the path
+        try:
+            from backend.app.core.metrics import (
+                record_rate_limit_hit,
+                record_rate_limit_rejection,
+            )
+
+            record_rate_limit_hit(bucket)
+            if not allowed:
+                record_rate_limit_rejection(bucket)
+        except Exception:
+            pass  # Metrics are best-effort
+
         if not allowed:
             ...
             return JSONResponse(
@@ -1221,7 +1393,11 @@ A middleware that **short-circuits** — returns its own response without callin
         return response
 ```
 
-It is constructed with an argument — `app.add_middleware(RateLimitMiddleware,
+`resolve_rate_limit_bucket` returns the limit _and its name_: the path of a route with a limit
+of its own (`/api/v1/auth/login`), or `export`, `ai_interpret`, `sdk` or `default`. The counter
+is still keyed per client address and path (`rate_limit_key`), but the metric label is the
+bucket's name, a closed set, for the same reason as the route template above. It is
+constructed with an argument — `app.add_middleware(RateLimitMiddleware,
 enabled=_rate_limit_enabled)`, off under the test runner — and the 429 body uses the same
 `{"detail": ...}` shape as `HTTPException`, so clients don't need a special case. The
 response headers on success let SDKs back off _before_ they're rejected. The preflight skip
@@ -1378,7 +1554,9 @@ applies.)
   SecurityHeaders → TrustedHost → RateLimit → RelativeSlashRedirect → RequestBodyLimit →
   UnhandledError → router. Every refusal and every 500 passes back out through CORS, the request id and the
   security headers.
-- Normalise labels (UUIDs → `{id}`) before recording metrics.
+- Take metric labels from a closed set — the matched route's template, a limit's name — never
+  from the path a client sent; an outer middleware can read what routing decided from the
+  shared `scope` after `call_next`.
 - Short-circuit responses use the same `{"detail": ...}` shape; success responses carry
   informational rate-limit headers; CORS must `expose_headers` for browsers to read them.
 
@@ -1404,14 +1582,17 @@ the dev-bypass user (development/test only) or raise its own 401.
 **Q4. A `VIEWER` calls `PUT /feature-flags/{flag_id}` on a flag they created. Result?**
 403 "Not enough permissions to update this feature flag". The route loads the flag (it
 exists, so no 404), then asks `can_act_on_feature_flag(user, flag.owner_id, Action.UPDATE)`.
-The role matrix is checked first and gives `VIEWER` no UPDATE on flags, so it returns `False`
-before ownership is ever looked at. A `DEVELOPER` making the same call on a flag someone else
-created succeeds: access is by role, not by who created the flag.
+The role matrix is checked first and gives `VIEWER` no UPDATE on flags, so the answer comes
+from the user's grants — none, for a plain VIEWER — and it returns `False` without ownership
+ever being looked at. A `DEVELOPER` making the same call on a flag someone else created
+succeeds, and so, in the full profile, would that VIEWER after an admin granted them
+`feature_flag (update)`: access is by permission, not by who created the flag.
 
-**Q5. In what order do the eight middleware run for a request, and which headers does a 429
+**Q5. In what order do the nine middleware run for a request, and which headers does a 429
 carry?**
 CORS → RequestID → Prometheus → SecurityHeaders → TrustedHost → RateLimit →
-RelativeSlashRedirect → UnhandledError → router. The 429 comes from RateLimit, which does not
+RelativeSlashRedirect → RequestBodyLimit → UnhandledError → router. The 429 comes from
+RateLimit, which does not
 call the layers inside it. Everything outside it still runs on the way out, so the 429 carries
 the security headers, an `X-Request-ID`, the CORS headers (for an allowed `Origin`) and its own
 `Retry-After`/`X-RateLimit-*`, and Prometheus times it.
@@ -1452,8 +1633,9 @@ creation.
 bind `workspace_id` into the log context, and must apply to rate-limited (429) responses'
 logs too. Where do you register it, and why? Which layer must stay outermost?
 
-**E3.5 — A scoped API key.** The codebase has one scoped-key dependency,
-`require_sdk_ruleset_key` (Hour 9). Generalise it: sketch a `require_scope(scope: str)`
+**E3.5 — A scoped API key.** The codebase enforces two scopes, each with its own code:
+`require_sdk_ruleset_key` for `sdk:ruleset` (Hour 9) and `get_current_reader` for `mcp:read`
+(Hour 11). Generalise the first: sketch a `require_scope(scope: str)`
 dependency _factory_ that returns a dependency requiring the presented key's `scopes` to
 include `scope`, and show its use on `POST /tracking/errors`.
 
@@ -1561,7 +1743,10 @@ header), not on "some key of this user", because `get_api_key` returns the `User
 another key of the same user carrying the scope must grant nothing; and scope membership is
 `has_scope` from `backend/app/core/api_key_scopes.py` (exact, case-sensitive), not a substring
 test. The real dependency adds one more rule — the key's owner must still be allowed to
-change flags — which a generic factory would take as a second parameter.
+change flags (`may_use_server_key`) — which a generic factory would take as a second
+parameter. (A factory would also hide that the two real scopes differ in more than their
+name: `sdk:ruleset` refuses on the owner's permissions, while `mcp:read` returns the owner and
+leaves the decision to the route's own role checks.)
 
 ---
 

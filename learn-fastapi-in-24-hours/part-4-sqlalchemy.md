@@ -115,6 +115,22 @@ class FeatureFlag(Base, BaseModel):
     default_value = Column(
         Boolean, nullable=False, default=False, server_default=false()
     )
+    # The flag's value type (boolean, string, number or json) and the two values
+    # a string, number or json flag serves: ``on_value`` to the users it is on
+    # for, ``off_value`` to everyone else (#1497).  A boolean flag keeps both
+    # NULL.  ``check_flag_values`` in ``__table_args__`` holds the combinations;
+    # the API writes them through ``backend.app.core.flag_values``'s rules and
+    # the evaluate route serves them.  ``server_default`` is load-bearing, as
+    # for ``default_value``.  ``none_as_null``: Python ``None``
+    # is stored as SQL NULL, not as JSON ``null``, which the check refuses.
+    value_type = Column(
+        String(16),
+        nullable=False,
+        default="boolean",
+        server_default=text("'boolean'"),
+    )
+    on_value = Column(JSONB(none_as_null=True), nullable=True)
+    off_value = Column(JSONB(none_as_null=True), nullable=True)
     variants = Column(JSONB)  # For multivariate flags
     tags = Column(JSONB)  # For categorization
     ...
@@ -135,6 +151,7 @@ class FeatureFlag(Base, BaseModel):
                 "rollout_percentage >= 0 AND rollout_percentage <= 100",
                 name="check_rollout_percentage",
             ),
+            CheckConstraint(FLAG_VALUES_CHECK_SQL, name=FLAG_VALUES_CHECK),
             {"schema": schema_name},
         )
 
@@ -142,12 +159,19 @@ class FeatureFlag(Base, BaseModel):
         return f"<FeatureFlag {self.key}>"
 ```
 
-Two columns in that model teach more than their size. `default_value` has a `server_default`
-as well as a Python `default`, and the comment beside it says why: during a rolling deploy the
-*previous* release's image is still inserting rows without naming the column, and only a
-database-side default fills it. `workspace_id` is a bare indexed UUID with no `ForeignKey`,
-because the `workspaces` table belongs to an optional module and a core model must import
-without it; the module attaches the constraint from its own side when it is loaded.
+Four things in that model teach more than their size. `default_value` and `value_type` have
+a `server_default` as well as a Python `default`, and the comments in the file say why: during a
+rolling deploy the *previous* release's image is still inserting rows without naming the
+column, and only a database-side default fills it. `JSONB(none_as_null=True)` settles an
+ambiguity every JSON column has — is Python `None` SQL `NULL` or the JSON value `null`? — in
+favour of SQL `NULL`, which is what the check constraint expects for a boolean flag.
+And `check_flag_values` is Hour 6's value rules again, as SQL (`FLAG_VALUES_CHECK_SQL` at the
+top of the file: `value_type = 'boolean' AND on_value IS NULL AND off_value IS NULL`, or two
+values whose `jsonb_typeof` matches the type and which differ): the schema answers a client
+with a 422 naming the field, the constraint guarantees the table for every writer. Finally,
+`workspace_id` is a bare indexed UUID with no `ForeignKey`, because the `workspaces` table
+belongs to an optional module and a core model must import without it; the module attaches
+the constraint from its own side when it is loaded.
 
 Column types worth knowing: `String(n)` (varchar with a length the database enforces),
 `Text` (unbounded), `Integer`, `Float`, `Boolean`, `DateTime` (naive here),
@@ -324,7 +348,7 @@ A one-to-one:
         "FeatureFlagSafetyConfig",
         back_populates="feature_flag",
         cascade="all, delete-orphan",
-        uselist=False  # One-to-one relationship
+        uselist=False,  # One-to-one relationship
     )
 ```
 
@@ -524,20 +548,39 @@ deleted objects in memory, which is right when nothing in the session references
         self.db.commit()
 ```
 
-A no-request session with explicit error handling — the scheduler's tick:
+A no-request session with a savepoint per row — the experiment scheduler's tick, which
+activates every experiment that is due:
 
 ```python
 # 📁 backend/app/core/scheduler.py
-        db = SessionLocal()
-        try:
-            ...
-            db.commit()
+            for experiment in experiments_to_activate:
+                experiment_id = experiment.id
+                savepoint = db.begin_nested()
+                try:
+                    ...
+                    savepoint.commit()
+                except Exception:
+                    savepoint.rollback()
+                    failed_count += 1
+                    logger.exception("Error activating experiment %s", experiment_id)
+                    continue
+                ...
+            # Commit all activation changes before checking for experiments to complete
+            if activated_count > 0:
+                db.commit()
+                ...
         except Exception as e:
+            failed_count += 1
             logger.error(f"Error processing scheduled experiments: {e!s}")
-            db.rollback()
         finally:
             db.close()
 ```
+
+The savepoint is what makes a batch job forgiving. One experiment the database refuses is rolled
+back on its own and counted as failed; the others are still committed together by the
+`db.commit()` after the loop. The outer `except` is for a failure outside any row (the query
+itself), and `finally: db.close()` ends whatever transaction is left and returns the connection.
+This whole method runs in a worker thread, not on the event loop (Hour 19).
 
 And a write on the hottest path in the app, done as a race-safe Core `UPDATE` rather than
 "load, set, commit". `get_api_key` calls it on every authenticated SDK request, so it writes at
@@ -637,7 +680,8 @@ is disposed before the test database is dropped — and why.
 - `add` → `flush` (ids, still uncommitted) → `commit` (durable, objects expire) → `refresh`
   (re-read one).
 - `autoflush=False`: flush explicitly when you need generated ids before a query.
-- Services commit; endpoints don't; schedulers own `try/commit/except/rollback/finally/close`.
+- Services commit; endpoints don't; schedulers own their session (`try/…/finally: close()`), with
+  a savepoint per row so one bad row is rolled back alone.
 - The pool is tuned for Aurora (`pool_pre_ping`, recycle, keepalives); tests use `NullPool`
   and `expire_on_commit=False`.
 
@@ -1158,9 +1202,9 @@ docker compose exec postgres psql -U postgres -d experimentation -c "select * fr
 ls backend/app/db/migrations/versions modules/backend/app/db/migrations/versions
 ```
 
-`heads` prints two lines in a full checkout — the core head, and
-`modules_0002_warehouse_analysis (modules) (head)` — and `alembic_version` holds one row per
-head. Compare the `down_revision` of `modules_0001_rbac` with `alembic history` to find the
+`heads` prints two lines in a full checkout — the core head (`7b6b4b4fe246` at the commit this
+book was checked against), and `modules_0004_rbac_activation (modules) (head)` — and
+`alembic_version` holds one row per head. Compare the `down_revision` of `modules_0001_rbac` with `alembic history` to find the
 core revision the branch forks from. Finally, find the revisions the
 bootstrap docstring blames for the non-replayable chain
 (`git grep -n "re-create" backend/app/db/bootstrap.py`).
@@ -1358,7 +1402,7 @@ $ALEMBIC heads                     # note the core head id (the line without "(m
 $ALEMBIC revision --autogenerate --head <core head id> -m "add decision_logs"
 $EDITOR backend/app/db/migrations/versions/*add_decision_logs.py   # read it: down_revision = the core head id
 $ALEMBIC upgrade heads
-$ALEMBIC heads                     # still two: the new revision and modules_0002_warehouse_analysis
+$ALEMBIC heads                     # still two: the new revision and modules_0004_rbac_activation
 ```
 
 `decision_logs` is a core table, so the revision extends the core head, not `modules@head`,

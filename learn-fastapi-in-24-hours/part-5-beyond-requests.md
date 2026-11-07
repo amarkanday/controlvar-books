@@ -26,10 +26,11 @@ A scheduler is an `asyncio.Task`: `asyncio.create_task(coro)` schedules a corout
 running event loop and returns a handle you can cancel. The loop it runs is the same one
 serving requests, which has two consequences:
 
-1. **A tick must not block.** Synchronous work (SQLAlchemy queries) inside an `async`
-   scheduler blocks every request for its duration. The experiment/rollout/safety
-   schedulers accept that because their ticks are a few short queries; the bandit runner —
-   which does Monte Carlo — offloads with `asyncio.to_thread` so the loop stays free.
+1. **A tick must not block.** Synchronous work (SQLAlchemy queries, an HTTP call) inside an
+   `async` scheduler stops the API answering anything else until it finishes. So every
+   scheduler hands its tick's synchronous work to a worker thread — the bandit runner with
+   `asyncio.to_thread`, the others through the shared helper `run_in_worker` — and only the
+   coordination (the lock, the sleep, cancellation) runs on the loop.
 2. **Shutdown is cancellation.** `task.cancel()` raises `CancelledError` inside the coroutine
    at its next `await`; the loop must let it propagate (not swallow it), and anything holding
    a lock must release it on the way out.
@@ -110,6 +111,7 @@ class ExperimentScheduler:
     """Handles scheduled tasks for experiments."""
 
     def __init__(self, interval_minutes: int = 15):
+        ...
         self.interval_minutes = interval_minutes
         self.is_running = False
         self.task: Optional[asyncio.Task] = None
@@ -145,8 +147,11 @@ class ExperimentScheduler:
         while self.is_running:
             try:
                 # One tick under the advisory lock; records the run and
-                # skips when another replica holds the lock.
-                await run_locked_tick(SCHEDULER_NAME, self.process_scheduled_experiments)
+                # skips when another replica holds the lock. Its database
+                # work runs in a worker thread.
+                await run_locked_tick(
+                    SCHEDULER_NAME, self.process_scheduled_experiments
+                )
 
                 # Wait for the next interval
                 await asyncio.sleep(self.interval_minutes * 60)
@@ -164,7 +169,96 @@ loop (a bare `except Exception` would _not_ catch it in Python ≥ 3.8, because
 `except` logs and sleeps 60 s so one bad tick doesn't hot-loop; and `stop()` awaits the
 cancelled task so the lifespan doesn't exit with a task still unwinding.
 
-The bandit runner is the one that offloads its work — a synchronous scheduler with its own
+"Its database work runs in a worker thread" is the most important line in that loop, and the
+tick itself shows how:
+
+```python
+# 📁 backend/app/core/scheduler.py
+    async def process_scheduled_experiments(self) -> Dict[str, int]:
+        ...
+        # self._process_due is read here, at call time: the tests replace it
+        # on the instance.
+        work = await run_in_worker(self._process_due, label=f"{SCHEDULER_NAME} tick")
+
+        if work.activated_ids:
+            await experiment_cache.drop_cached_experiment_details(work.activated_ids)
+            await _send_each(
+                self._notification_service.notify_experiment_started, work.started
+            )
+        ...
+```
+
+The tick is split in two. `_process_due` is a plain `def` that opens its own session, does every
+query and commit (Hour 16 shows its savepoints), and returns a small result object; it runs in a
+thread. What comes back is handled on the event loop: dropping cached experiment details (the
+Redis pool belongs to the loop) and sending notifications, each send itself pushed to a thread
+because it is a synchronous HTTP call. The reason is written down in `scheduler_tick.py`, next to
+the one write the runner itself makes, the run record:
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+    if record:
+        # In a worker thread, like the tick bodies (#1690): the write checks a
+        # connection out of the pool, and when every connection is held by a
+        # request waiting for this event loop, a checkout made on the loop's
+        # own thread waits the whole pool timeout and stops the API answering
+        # for that long -- and then the run record is lost as well.
+        await run_in_worker(
+            functools.partial(
+                _persist_run, name, started_at, completed_at, status, result, error
+            ),
+            label=f"{name} run record",
+        )
+```
+
+Read that comment slowly. Under load every pooled connection can be held by a request that is
+waiting for the event loop. A synchronous pool checkout made _on the loop's thread_ then waits —
+for the pool timeout, 30 seconds here — and while it waits the loop runs nothing else, those
+requests included. From outside, the API stops answering for about 30 seconds at a time, which
+is how issue #1756 described it. Made in a worker thread, the same checkout waits without
+stopping the loop. Blocking the loop is not only slow: here it holds up the very requests that
+would have handed a connection back.
+
+`run_in_worker` is small, and two details in its docstring are worth knowing before you write
+your own:
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+async def run_in_worker(work: Callable[[], Any], *, label: str) -> Any:
+    """
+    Run *work* in a worker thread; the event loop awaits it (#1690).
+
+    For a tick whose body is synchronous (SQLAlchemy queries, HTTP sends): run
+    on the event loop, it stops the API answering anything else until it
+    finishes. *work* must be a plain callable. A coroutine function cannot be
+    handed over as it is -- ``asyncio.to_thread`` on one only creates the
+    coroutine and never runs it, and the tick is recorded as a success that
+    did nothing -- so wrap it to create and run the coroutine inside the
+    thread, on a private event loop: ``lambda: asyncio.run(body())``.
+    ...
+    """
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, functools.partial(contextvars.copy_context().run, work)
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await _wait_for_worker(worker, label)
+        raise
+```
+
+First, **`to_thread` on an `async def` is a quiet no-op**: the thread calls the function, gets a
+coroutine object back, and returns it unawaited — no exception, no work, at most a
+`RuntimeWarning: coroutine ... was never awaited` in a log nobody reads. Second, **a thread cannot be
+cancelled**, so on shutdown `run_in_worker` waits for the thread to finish before it re-raises the
+cancellation. `asyncio.shield` keeps the cancel from reaching the future, and the future comes
+from `run_in_executor` rather than being wrapped in a task, so tearing down the loop doesn't
+cancel it either. That matters because `run_locked_tick` releases the advisory lock when the tick
+returns: returning early would let another replica start the same tick while this thread is still
+writing. (`contextvars.copy_context().run` carries the log context into the thread, which is what
+`asyncio.to_thread` does for you.)
+
+The bandit runner shows the plainest form of offloading — a synchronous scheduler with its own
 session, run in a thread:
 
 ```python
@@ -176,6 +270,7 @@ class BanditSchedulerRunner:
     Each pass opens a fresh ``SessionLocal()`` session and executes the
     synchronous scheduler in a worker thread so the event loop is never
     blocked.  Errors are logged and the loop keeps going.
+    ...
     """
     ...
     async def run_once(self) -> Dict[str, int]:
@@ -184,7 +279,7 @@ class BanditSchedulerRunner:
         self.run_count += 1
         self.last_result = result
         return result
-
+    ...
     @staticmethod
     def _run_sync() -> Dict[str, int]:
         """Open a session, run the scheduler once, close the session."""
@@ -253,7 +348,10 @@ connections, exactly the two-replica situation the lock exists for).
 
 ### Common mistakes
 
-- **Doing slow sync work in an `async` tick** — the whole API stalls. `asyncio.to_thread`.
+- **Doing sync work in an `async` tick** — the whole API stalls, and a pool checkout made on the
+  loop's thread can stall it for the full pool timeout. Run it in a worker thread
+  (`run_in_worker`, or `asyncio.to_thread` for a plain function).
+- **Handing `asyncio.to_thread` an `async def`.** It creates the coroutine and never runs it.
 - **Swallowing `CancelledError`** with `except Exception` in older Python or a
   `except BaseException` — the task never ends and shutdown hangs.
 - **Starting schedulers at import time** instead of in the lifespan — tests and scripts that
@@ -267,7 +365,9 @@ connections, exactly the two-replica situation the lock exists for).
 - A scheduler = `create_task` + a `while` loop of `run_locked_tick(tick)` + `sleep`;
   `stop()` cancels and awaits.
 - Let `CancelledError` propagate; log-and-sleep on other errors.
-- Offload CPU-heavy or long sync work with `asyncio.to_thread`; each tick owns its session.
+- A tick's synchronous work — every query, commit and HTTP send — runs in a worker thread
+  (`run_in_worker`), which on cancellation waits for the thread before re-raising; each tick
+  owns its session, opened in that thread.
 
 ---
 
@@ -450,8 +550,9 @@ async def stream_audit_logs(
     Returns recent audit log entries as Server-Sent Events.
     Useful for real-time audit dashboards.
     Streams up to `limit` entries (default 50, max 100) then closes.
-    Superusers, ADMIN and ANALYST receive every entry; DEVELOPER and VIEWER
-    receive only their own.
+    Superusers, ADMIN and ANALYST, and in the full profile anyone whose custom
+    role or direct grant gives audit_log (read), receive other users' entries
+    too. Anyone else receives only their own.
     """
     # Resolved in the handler, before the response starts, not inside the
     # generator.
@@ -480,7 +581,8 @@ async def stream_audit_logs(
 ```
 
 Note where the role check sits: `own_only` is worked out in the handler, **before**
-`StreamingResponse` starts. Once the first chunk is sent the status line (200) is already on
+`StreamingResponse` starts — by `can_read_all_audit_logs`, the one predicate that knows the
+roles _and_ the `audit_log (read)` grant, so the stream follows a grant like every other check. Once the first chunk is sent the status line (200) is already on
 the wire, so a decision that could refuse or narrow the response has to be made first. The
 generator only runs the query it was handed.
 
@@ -894,10 +996,14 @@ against the test database mid-suite, patching and opening connections unpredicta
 Scheduler logic is tested by calling tick methods directly.
 
 **Q2. What happens on `stop()` if a tick is mid-query?**
-`task.cancel()` raises `CancelledError` at the tick's next `await`; `run_locked_tick`
-re-raises it (releasing the advisory lock via the context manager) without recording a
-failed run; the scheduler loop's `except CancelledError: break` ends the loop; `stop()`
-awaits the task. A sync query in flight completes first — cancellation is cooperative.
+The query is running in a worker thread, and the task is parked in `run_in_worker`'s `await`.
+`task.cancel()` raises `CancelledError` there; `run_in_worker` catches it, waits for the thread
+to finish (a thread cannot be interrupted), and re-raises. Only then does `run_locked_tick`
+re-raise it (releasing the advisory lock via the context manager) without recording a failed
+run; the scheduler loop's `except CancelledError: break` ends the loop; `stop()` awaits the task.
+The order matters: the lock is released only after the thread is done, so no other replica can
+start the same tick beside it. (The experiment tick then drops no cache entries and sends no
+notifications, as its docstring says.)
 
 **Q3. Why does the WebSocket handler `accept()` before closing an unauthorised connection?**
 So the client receives the application close code (`4401`, "Unauthorized"). Closing before
@@ -937,9 +1043,9 @@ read task alive across timeouts.
 than 90 days once a day, using the house skeleton and `run_locked_tick`. What does its tick
 return, and where would its cadence setting live?
 
-**E5.2 — Offload.** The retention tick might delete millions of rows. Rewrite the tick to run
-the delete in a thread (`asyncio.to_thread`) in batches of 10,000 with a commit per batch, and
-explain why batching matters for the advisory lock's holder.
+**E5.2 — Batch.** The retention tick might delete millions of rows. Rewrite its worker-thread
+body to delete in batches of 10,000 with a commit per batch, and explain why batching matters
+for the advisory lock's holder.
 
 **E5.3 — SSE.** Write an SSE endpoint that streams the safety scheduler's last ten runs (from
 `scheduler_runs`) and then a live `{"event": "tick"}` every time a new run appears, polling
@@ -982,28 +1088,29 @@ class RetentionScheduler:
                 await asyncio.sleep(60)
 
     async def purge_old_metrics(self) -> Dict[str, int]:
+        # Every query in a worker thread, never on the event loop.
+        return await run_in_worker(self._purge_sync, label=f"{SCHEDULER_NAME} tick")
+
+    def _purge_sync(self) -> Dict[str, int]:
         cutoff = datetime.utcnow() - timedelta(days=settings.RAW_METRICS_RETENTION_DAYS)
         db = SessionLocal()
         try:
             deleted = db.query(RawMetric).filter(RawMetric.timestamp < cutoff).delete(synchronize_session=False)
             db.commit()
             return {"items_processed": deleted, "items_failed": 0}
-        except Exception:
-            db.rollback(); raise
         finally:
             db.close()
 ```
 
 The tick returns `{items_processed, items_failed}` for the run record; the cadence is a
-`Settings` field like `SAFETY_CHECK_INTERVAL_MINUTES`. Add `"retention"` wherever
-`SchedulerName` enumerates the five.
+`Settings` field like `SAFETY_CHECK_INTERVAL_MINUTES`. The split is the house shape: an
+`async def` the runner awaits, and a plain `def` that owns the session, in a thread. (No
+`rollback()` in an `except`: `close()` discards an uncommitted delete.) Add `"retention"`
+wherever `SchedulerName` enumerates the five.
 
 **S5.2**
 
 ```python
-    async def purge_old_metrics(self) -> Dict[str, int]:
-        return await asyncio.to_thread(self._purge_sync)
-
     def _purge_sync(self) -> Dict[str, int]:
         cutoff = datetime.utcnow() - timedelta(days=settings.RAW_METRICS_RETENTION_DAYS)
         total = 0
@@ -1023,8 +1130,10 @@ The tick returns `{items_processed, items_failed}` for the run record; the caden
 
 Batching keeps each transaction short (less lock contention on the table, less WAL per
 commit) and — because the tick holds the `retention` advisory lock for its whole duration —
-keeps the _tick_ bounded so a replica that skipped isn't waiting an hour for the next chance;
-`to_thread` keeps the event loop serving requests during the deletes.
+keeps the _tick_ bounded so a replica that skipped isn't waiting an hour for the next chance.
+The method is still the worker-thread half from S5.1, so the event loop serves requests
+throughout the deletes; and since a cancelled tick waits for its thread, short batches also
+make shutdown prompt.
 
 **S5.3**
 

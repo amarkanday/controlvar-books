@@ -115,9 +115,14 @@ def client(db_session, monkeypatch):
     app.dependency_overrides[deps.get_current_active_user] = (
         override_get_current_active_user
     )
+    # The four read routes that also take an mcp:read key depend on this one,
+    # which an override of get_current_active_user does not reach.
+    app.dependency_overrides[get_current_reader] = override_get_current_active_user
     app.dependency_overrides[deps.get_current_superuser] = (
         override_get_current_superuser
     )
+    # Reaches only routes that inject get_cache_control via Depends; a route that
+    # calls deps.get_cache_control() directly (the flag list, #427) is not.
     app.dependency_overrides[deps.get_cache_control] = override_get_cache_control
     app.dependency_overrides[deps.get_api_key] = override_get_api_key
 
@@ -135,7 +140,11 @@ reference: the fixture overrides `deps.get_db`, so it reaches exactly the routes
 `Depends(deps.get_db)`. A route that imported a different function object, even one with the
 same name and body, would not be overridden and would open a real session against whatever
 database the settings point at; that is one reason the house rule is to always depend on
-`deps.get_db`. The client is built **without** `with`, so the app's lifespan never runs in
+`deps.get_db`. The two comments in the block are the same rule seen from the other side: an
+override reaches a dependency only where FastAPI _resolves_ it, so `get_current_reader`, which
+calls `get_current_active_user` as a plain function, needs its own override, and a route that
+calls `deps.get_cache_control()` directly is not reached by that one at all. The client is
+built **without** `with`, so the app's lifespan never runs in
 this fixture (no scheduler, no start-up checks). The API-key dependency is overridden too, so
 SDK routes called through this client authenticate as the test user. The auth overrides
 return a real `User` _row_ (with a real bcrypt hash, so nothing downstream trips on a
@@ -266,9 +275,9 @@ regression` runs just those, and a CI job (`regression-guard`) fails a pull requ
 > non-test settings in a test and enter it as a context manager, you'll start them.
 
 > **Did You Know?** The `-x` flag on the CI unit job (stop at first failure) plus
-> `--tb=short` is a deliberate feedback-speed choice for a suite of several thousand tests
-> (the app README counts 5,400+ backend tests); the nightly run drops `-x` so you see
-> everything. Locally, `-p no:cov -q` is the fast form; coverage is
+> `--tb=short` is a deliberate feedback-speed choice for a suite of this size
+> (`pytest --collect-only` counts 30,394 tests under `backend/tests`); the nightly run drops
+> `-x` so you see everything. Locally, `-p no:cov -q` is the fast form; coverage is
 > explicit (`--cov=backend.app --cov-report=term`) and configured in `pyproject.toml`.
 
 ### Try It Yourself
@@ -588,8 +597,9 @@ def _inject_context(logger: Any, method: str, event_dict: dict) -> dict:
     return event_dict
 ```
 
-Metrics are a registry of typed series with label-safe recorders; the middleware normalises
-paths so UUIDs don't explode the label space:
+Metrics are a registry of typed series with label-safe recorders; the middleware labels each
+request with its route's template (Hour 13), so the `endpoint` label takes only as many values
+as there are routes, plus `unmatched`:
 
 ```python
 # 📁 backend/app/core/metrics.py
@@ -675,8 +685,9 @@ it's a comment; if it violates several, it's a conversation.
 **Requests and responses**
 
 - Inputs are declared (`Path`, `Query`, `Body`, `Depends`) with constraints and descriptions;
-  nothing is parsed by hand except URL-encoded JSON in a query string, which raises the same
-  422.
+  every number that reaches a query has `ge`/`le`; nothing is parsed by hand except URL-encoded
+  JSON in a query string and case-insensitive enum filters (`enum_filter`), which raise the same
+  422 the framework would.
 - Schemas are Pydantic v2 (`field_validator`, `model_validator`, `ConfigDict`). Request
   models refuse what they don't understand (the flag requests use `extra="forbid"`); a
   response model never refuses a stored row and has `from_attributes=True`; updates use
@@ -692,8 +703,12 @@ it's a comment; if it violates several, it's a conversation.
 - `db: Session = Depends(deps.get_db)` in every endpoint; services receive the session;
   schedulers and scripts own theirs with `try/finally`.
 - Dashboard endpoints depend on `get_current_active_user` (or `get_current_superuser`); SDK
-  endpoints on `get_api_key`. Never both.
-- Access is by **role**, never by who created the thing. Every route that changes a flag
+  endpoints on `get_api_key`. Never both on one route, except through the one dependency that
+  fixes the order and requires a scope (`get_current_reader`, four read routes, pinned by a
+  smoke test).
+- Access is by **permission** — the role, plus (full profile) custom roles and direct grants,
+  which only add — never by who created the thing. Ask `check_permission`, never `user.role`.
+  Every route that changes a flag
   calls the sync `can_act_on_feature_flag(user, flag.owner_id, action)` inline; only create is
   an async `Depends(deps.can_create_feature_flag)`. Experiment routes use
   `get_experiment_read_access` / `get_experiment_change_access(experiment, user, action)`.
@@ -721,7 +736,8 @@ it's a comment; if it violates several, it's a conversation.
 **Beyond requests**
 
 - Long-lived tasks start in the lifespan, skip under test, run ticks via `run_locked_tick`,
-  offload heavy sync work with `asyncio.to_thread`, let `CancelledError` propagate.
+  run every query, commit and HTTP send of a tick in a worker thread (`run_in_worker`), let
+  `CancelledError` propagate.
 - WebSockets authenticate at the handshake (the subprotocol, or a bearer header), accept-then-close
   with `4401`, release the auth session, use a session factory per snapshot.
 - Redis is optional everywhere: fallback limiter, disabled cache, readiness unaffected unless
@@ -745,7 +761,8 @@ it's a comment; if it violates several, it's a conversation.
 **Operations**
 
 - Every log line has a request id; every response echoes `X-Request-ID`.
-- New metrics go in `core/metrics.py` with bounded label cardinality.
+- New metrics go in `core/metrics.py` with bounded label cardinality: labels from a closed set
+  (a route template, a limit's name), never from the request.
 - `/health/live` never touches dependencies; `/health/ready` decides load-balancer
   membership; it reports an error's type, never its text.
 
@@ -779,7 +796,7 @@ curl -s -o /dev/null -w "live=%{http_code} " localhost:8000/health/live; curl -s
 ### Key takeaways
 
 - Logs: structlog, JSON outside dev, request id via `ContextVar`; metrics: one registry,
-  normalised labels; probes: live vs ready, scrubbed errors.
+  labels from closed sets (route templates); probes: live vs ready, scrubbed errors.
 - The style guide is the book: structure, requests/responses, dependencies/auth, data,
   beyond-requests, configuration, tests, operations.
 - Review against it; ship when the gates are green.
@@ -866,7 +883,9 @@ def test_deactivated_flag_evaluates_inactive(client, api_key_header, db_session)
     assert client.post(f"/api/v1/feature-flags/{created['id']}/activate").status_code == 200
     assert client.post(f"/api/v1/feature-flags/{created['id']}/deactivate").status_code == 200
     resp = client.get(f"/api/v1/feature-flags/evaluate/{key}", params={"user_id": "u"}, headers=api_key_header)
-    assert resp.status_code == 200 and resp.json() == {"key": key, "enabled": False, "config": None, "reason": "inactive"}
+    assert resp.status_code == 200 and resp.json() == {
+        "key": key, "enabled": False, "value": False, "value_type": "boolean", "config": None, "reason": "inactive",
+    }
     assert db_session.get(FeatureFlag, uuid.UUID(created["id"])).status == FeatureFlagStatus.INACTIVE.value
 
 
@@ -883,7 +902,10 @@ def test_deactivate_sets_inactive(_to_read):
 
 (The service stores the status as its string value and returns `flag_to_read(flag)`, a
 response model built from the row; patching `flag_to_read` keeps the unit test about the
-transition and the commit, not about serialising a `MagicMock`.)
+transition and the commit, not about serialising a `MagicMock`. The API test compares the whole
+evaluate answer on purpose: a boolean flag that is off serves `value: false`, and an exact
+comparison is what notices when a release adds a key to that answer, as `value` and
+`value_type` were added.)
 
 **S6.2** — The session fixture doesn't truncate, so a previous test in the same process (or
 an earlier fixture) already inserted `tester@example.com`; the unique index on `users.email`
@@ -952,8 +974,9 @@ Call it in `SafetyScheduler.check_feature_flags_safety` right after `rollback_re
 exhaust the registry — labels must be bounded sets (flag keys, trigger types).
 
 **S6.5** — (1) `SessionLocal()` in a handler — must be `Depends(deps.get_db)`. (2) Accepting
-bearer _or_ API key — one door per endpoint; reports are a dashboard resource →
-`get_current_active_user` plus a role check. (3) An
+bearer _or_ API key — one door per endpoint unless a dependency like `get_current_reader`
+fixes the order and requires a scope, and a PDF export is not one of the reads that warrants
+it; reports are a dashboard resource → `get_current_active_user` plus a role check. (3) An
 f-string interpolating `id` into `text()` — SQL injection; bind it (`:id`), and use the
 builder anyway. (4) `response_model=Dict[str, Any]` for a known shape, and base64 in JSON for
 bytes — return a `StreamingResponse`/`Response(media_type="application/pdf")`. (5) `except

@@ -149,7 +149,7 @@ makes those decisions once, in the schema, and the error shape is the same for t
 ### Try It Yourself
 
 With the API running and a token (`make dev`; login as in the
-[quick start](https://github.com/Controlvar/controlvar/blob/v0.36.4/docs/getting-started/quick-start.md)):
+[quick start](https://github.com/Controlvar/controlvar/blob/09d815ea18273982d710fb444ba76f05a18bc5c6/docs/getting-started/quick-start.md)):
 
 ```bash
 API=http://localhost:8000/api/v1
@@ -221,7 +221,7 @@ routers, and `api.py` runs whatever was registered after the core list. That reg
 `backend/app/core/hooks.py` — `hooks.register_router()` for routers, `hooks.register_tags()`
 for their OpenAPI tag descriptions, `hooks.register_model_module()` for their SQLAlchemy models
 (Hour 14) — and `backend/app/modules_loader.py` decides whether `import modules` succeeds. In a
-full checkout the modules add 11 more `include_router` calls this way.
+full checkout the modules add 12 more `include_router` calls this way.
 
 ### In the wild
 
@@ -309,6 +309,7 @@ app = FastAPI(
     # it is read here after `api_router` has been imported above.
     openapi_tags=tags_metadata,
     lifespan=lifespan,
+    ...
 )
 ...
 # Include API router
@@ -487,7 +488,8 @@ A GET with every kind of parameter:
 @router.get("/", response_model=ExperimentListResponse, summary="List experiments", ...)
 async def list_experiments(
     db: Session = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_active_user),
+    # A sign-in, or an API key with the mcp:read scope (read_scope.py).
+    current_user: User = Depends(get_current_reader),
     cache_control: Dict[str, Any] = Depends(deps.get_cache_control),
     status_filter: Optional[str] = Query(
         None,
@@ -500,6 +502,88 @@ async def list_experiments(
     sort_order: Optional[str] = Query("desc", description="Sort order (asc, desc)"),
 ) -> ExperimentListResponse:
 ```
+
+(`get_current_reader` is the one user dependency that also accepts an API key; Hour 11 shows
+how it stays a single, ordered door.)
+
+The bounds are worth more than they look. The scheduler's run history declared its limit as a
+plain `limit: int = 20` until a contributor fixed it (#1485): the value went straight into the
+database query, and a negative limit answered 500. The fix is the declaration:
+
+```python
+# 📁 backend/app/api/v1/endpoints/scheduler_health.py
+@router.get("/{name}/history", response_model=List[SchedulerRunRecord])
+def get_run_history(
+    name: SchedulerName,
+    limit: int = Query(20, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> Any:
+```
+
+Now 0, −1 and 1001 are 422s before the history is read, the OpenAPI document shows
+`minimum: 1` and `maximum: 1000`, and two `@pytest.mark.regression` tests pin both bounds.
+`name: SchedulerName` does the same for the path: it is a `str, Enum` of the five scheduler
+names, so `/scheduler/nonsense/history` is a 422 that lists them.
+
+An enum is not always the right declaration, though. The list routes filter on a stored status
+and accept it in any case — `?status=ARCHIVED` and `?status=archived` alike — which an enum-typed
+parameter would not. So the flag list takes a plain string under an alias and resolves it in
+the body:
+
+```python
+# 📁 backend/app/api/v1/endpoints/feature_flags.py
+    # `status` in the URL only: a Python parameter called `status` hid the
+    # `fastapi.status` module in this body, so reaching the 403 below raised
+    # AttributeError and answered 500.
+    status_filter: Optional[str] = Query(
+        None, alias="status", description=FLAG_STATUS_FILTER_DESCRIPTION
+    ),
+    ...
+    # After the permission check (#955): a caller who may not list is told
+    # nothing about the enum. The member goes to the query, never the text.
+    status_member = enum_filter(
+        status_filter, FeatureFlagStatus, "status", FLAG_STATUS_SPELLINGS
+    )
+```
+
+`alias="status"` gives the URL the name clients expect while the Python name stays out of the
+way of `from fastapi import status`. And `enum_filter` is one rule for the four list routes that
+filter this way (#1574):
+
+```python
+# 📁 backend/app/api/enum_filters.py
+def enum_filter(
+    value: Optional[str],
+    enum_cls: Type[E],
+    param: str,
+    spellings: Sequence[str],
+) -> Optional[E]:
+    ...
+    if not value:
+        return None
+    folded = value.lower()
+    for member in enum_cls:
+        if str(member.value).lower() == folded:
+            return member
+    raise RequestValidationError(
+        [
+            {
+                "type": "enum",
+                "loc": ("query", param),
+                "msg": enum_filter_message(param, spellings),
+            }
+        ]
+    )
+```
+
+Raising `RequestValidationError` from your own code gives exactly the 422 the framework gives
+for a declared parameter — the same `detail` list, `loc: ["query", "status"]`, rendered by the
+same handler as in Hour 1 — so a client cannot tell a hand-written check from a declared one.
+The message lists the allowed values and never repeats the one sent. Before this function, four
+routes passed the text on unchecked, and a value outside the enum, or in a case the enum does
+not spell, answered 500. And note where it runs: after the permission check, so a caller who
+may not list flags learns nothing about the enum.
 
 A path parameter with a type that does validation for free — a malformed UUID is a 422 —
 and a required query parameter next to an optional one:
@@ -611,6 +695,9 @@ curl -s "$API/experiments/?limit=9999" -H "Authorization: Bearer $TOKEN" | pytho
 curl -s -X POST $API/tracking/assign -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"experiment_key":"x"}' | python -m json.tool
 # query-string JSON: not an object → the hand-written 422
 curl -s "$API/feature-flags/evaluate/anything?user_id=u&context=%5B1%5D" -H "X-API-Key: $KEY"
+# a status filter in any case → 200; an unknown one → 422 type "enum", loc ["query","status"]
+curl -s -o /dev/null -w "%{http_code}\n" "$API/feature-flags/?status=ACTIVE" -H "Authorization: Bearer $TOKEN"
+curl -s "$API/feature-flags/?status=bogus" -H "Authorization: Bearer $TOKEN"
 ```
 
 Then write the declaration for a hypothetical `GET /experiments/{id}/events?since=<iso
@@ -627,6 +714,10 @@ validate each part without a line of parsing.
   With a plain default (`limit: int = 100`) the parameter is optional with that default.
 - **Using `Header("X-API-Key")` for auth.** Use a security scheme (`APIKeyHeader`,
   `OAuth2PasswordBearer`) so the docs and the lock icons work.
+- **An unbounded number that reaches a query.** `limit: int = 20` accepts −1, and the
+  database answers for you with a 500. Give it `ge`/`le`.
+- **Naming a parameter after a module you use.** A parameter called `status` hides
+  `fastapi.status` inside the function; keep the URL name with `alias=`.
 
 ### Key takeaways
 
@@ -636,6 +727,8 @@ validate each part without a line of parsing.
   descriptions that become both 422s and docs.
 - Query strings can't carry objects; decode a JSON string (raising 422 yourself) or offer a
   POST.
+- A check you must write in the body raises `RequestValidationError`, so its 422 has the
+  framework's shape (`enum_filter`).
 - Headers used for auth are security schemes, wrapped in dependencies.
 
 ---
@@ -671,9 +764,15 @@ and it's worth understanding rather than copying. Here is the end of `start_expe
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Experiment must have at least one metric defined",
             )
-
-        # Start experiment
-        started_experiment = experiment_service.start_experiment(experiment)
+        ...
+        # Start experiment. A start whose start date would not be before the
+        # end date is refused before anything is written (#953).
+        try:
+            started_experiment = experiment_service.start_experiment(experiment)
+        except EndDatePassedError as err:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=END_DATE_PASSED
+            ) from err
         ...
         return ExperimentResponse.model_validate(started_experiment)
     except HTTPException:
@@ -690,10 +789,13 @@ and it's worth understanding rather than copying. Here is the end of `start_expe
 ```
 
 The first `except` re-raises what the framework already knows how to render; the second
-converts everything else into a 500. Without the first clause, the deliberate 400 above
-becomes a `500` with `detail="Could not start the experiment (request ID: …)."` — wrong
+converts everything else into a 500. Without the first clause, the deliberate 400s above
+become a `500` with `detail="Could not start the experiment (request ID: …)."` — wrong
 status, and a dashboard that shows a generic failure instead of "Experiment must have at least
-one metric defined".
+one metric defined". The inner `try` shows the other half of the idiom: a service raises a
+_domain_ exception (`EndDatePassedError`), and the endpoint, which owns the HTTP contract,
+translates it into a 400 with a fixed message; `from err` keeps the original as the cause in
+the log.
 
 #### `unexpected_failure`: what a 500 says, and what it doesn't
 
@@ -736,12 +838,21 @@ handlers that log for themselves.
 #### Why status codes carry meaning here
 
 The platform uses status codes as part of the contract, not decoration. `POST /tracking/assign`
-returns **200** for an ineligible user (with `assigned: false` and a `reason`) because "not in
-the experiment" is a normal outcome, and **404** only when the experiment isn't active or
-doesn't exist — so an SDK can distinguish "render the default" from "log a problem". Login
-returns **423** with `Retry-After` for a locked account. A flag that's been killed evaluates
-to **200** `enabled: false, reason: inactive`, never 404. Get these wrong and every SDK's error
-handling changes.
+returns **200** for an ineligible user (with `assigned: false` and a `reason`: `holdout`,
+`mutual_exclusion` or `targeting`) because "not in the experiment" is a normal outcome. It
+returns **200** for an experiment that isn't running, too: a draft, paused, completed or
+archived experiment answers every user with its control variant, `assigned: false` and the
+status as the `reason` (`"paused"`), and records nothing (#1362). **404** is left for "no
+experiment has this key" — so an SDK can distinguish "render the default" from "log a
+problem". (The one other 404 is an experiment with no control variant to serve, which the API
+itself never lets you create.) Login returns **423** with `Retry-After` for a locked account. A
+flag that's been killed evaluates to **200** `enabled: false, reason: inactive`, never 404. Get
+these wrong and every SDK's error handling changes.
+
+It was not always so: until #1362 every experiment that was not ACTIVE answered 404, so pausing
+or completing a test turned each assignment call into an error. A status code is a promise
+about what the client should _do_, and "this test is paused" is not something a client should
+do anything about.
 
 ### In the wild
 
@@ -823,6 +934,16 @@ message is written for the caller), anything else is a 500 with a fixed sentence
 
 ```python
 # 📁 backend/app/api/v1/endpoints/tracking.py
+    except ValidationError as e:
+        # A response that does not build is not the caller's mistake, and
+        # pydantic's text repeats the values: answer as an unexpected failure.
+        raise unexpected_failure(
+            e,
+            "Tracking assign",
+            "Could not assign the user to the experiment",
+            db=db,
+            logger=logger,
+        )
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -836,6 +957,13 @@ message is written for the caller), anything else is a 500 with a fixed sentence
         )
 ```
 
+The first clause is there because of a Pydantic fact worth memorising: **`pydantic`'s
+`ValidationError` is a subclass of `ValueError`**. Without `except ValidationError` first, a
+response model that fails to build would land in `except ValueError` and go back to the SDK as
+a 400 "your input was wrong", with Pydantic's message — which quotes the values — as the
+detail. Order `except` clauses from the most specific class to the most general, and check
+what inherits from what.
+
 The dashboard's client turns all of these into one `ApiError` because they all share the
 `{"detail": ...}` shape — a string, an object, or Pydantic's validation list:
 
@@ -845,12 +973,20 @@ The dashboard's client turns all of these into one `ApiError` because they all s
  * Error thrown for every failed request. `detail` is the parsed `{"detail": …}`
  * body from FastAPI (string, object or validation list). When the backend
  * returns a typed error such as `{"detail": {"code": "workspace_role_required"}}`
- * the code is exposed as `code`. `status === 0` means the API was unreachable.
+ * the code is exposed as `code`. `status === 0` means no answer arrived: the
+ * API was unreachable, or (`timedOut`) it did not answer before the deadline.
+ * A timed-out write is `outcomeUnknown`: the API may still carry it out, so
+ * the message says so, and a page must not present it as a failure.
  * `requestId` is the response's `X-Request-ID` header (the API lists it in
  * CORS `expose_headers`, so a cross-origin dashboard can read it too); an
  * administrator finds the request in the API log by it.
  */
 ```
+
+The middle of that comment is a lesson for any client of an HTTP API. The dashboard gives every
+request a deadline (`DEFAULT_REQUEST_TIMEOUT_MS`, 30 seconds), and a write that hits it has an
+_unknown_ outcome, not a failed one: the server may have committed it a moment after the client
+stopped waiting. Saying "failed" invites the user to click again and do it twice.
 
 > **Watch Out!** Returning a dict that doesn't match `response_model` is a **500** at
 > serialisation time, not a 422 — and it happens after your code ran and committed. The
@@ -870,7 +1006,9 @@ Observe the codes the SDKs depend on:
 ```bash
 # 200 with assigned:false — not an error
 curl -s -o /dev/null -w "%{http_code}\n" -X POST $API/tracking/assign -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"experiment_key":"<a targeted experiment>","user_id":"nobody"}'
-# 404 — experiment not active / unknown
+# 200 with the control, assigned:false, reason "paused" — pause an experiment first
+curl -s -X POST $API/tracking/assign -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"experiment_key":"<a paused experiment>","user_id":"u"}'
+# 404 — no experiment has the key
 curl -s -w "\n%{http_code}\n" -X POST $API/tracking/assign -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"experiment_key":"does-not-exist","user_id":"u"}'
 # 423 + Retry-After — lock an address on purpose: 10 failures lock it...
 for i in $(seq 1 10); do curl -s -o /dev/null -w "%{http_code} " -X POST $API/auth/login -H 'Content-Type: application/json' -d '{"email":"lockme@example.com","password":"x"}'; done; echo
@@ -891,8 +1029,10 @@ fail with a 500 and compare the `request ID` in the body with the `X-Request-ID`
 
 - **`except Exception` without `except HTTPException: raise` first.** Deliberate 4xx become
   500s.
-- **A 404 for "not eligible" / "flag off".** Those are 200s with a reason; clients must be
-  able to tell "default experience" from "something's wrong".
+- **A 404 for "not eligible" / "flag off" / "experiment paused".** Those are 200s with a
+  reason; clients must be able to tell "default experience" from "something's wrong".
+- **`except ValueError` before `except ValidationError`.** Pydantic's error is a `ValueError`;
+  the broad clause catches it first.
 - **Returning ORM objects from a schema without `from_attributes`.** Hour 7.
 - **Hand-built error bodies.** Use `HTTPException` so `detail` is uniform.
 - **`detail=str(e)` in a catch-all.** The exception's text is for the log; the client gets a
@@ -904,8 +1044,8 @@ fail with a 500 and compare the `request ID` in the body with the `X-Request-ID`
 - `HTTPException(status, detail, headers)` is the one way to refuse; `except HTTPException:
   raise` protects it from generic handlers, and `raise unexpected_failure(...)` is the generic
   handler: rollback, a log line with the exception type, a fixed message with the request ID.
-- Status codes are contract: 200 + `reason` for normal negatives, 404 for unknown, 423 +
-  `Retry-After` for lockout, 422 for malformed.
+- Status codes are contract: 200 + `reason` for normal negatives (ineligible, flag off,
+  experiment not running), 404 for unknown, 423 + `Retry-After` for lockout, 422 for malformed.
 - A `response_model` mismatch is a 500 at serialisation — test endpoints, not just services.
 
 ---
@@ -926,8 +1066,9 @@ The query string; required (`...`). `Query(None)` would make it optional.
 
 **Q4. Why does `POST /tracking/assign` return 200 for a user in the holdout?**
 Because not being in the experiment is a normal outcome; the response carries the control
-variant, `assigned: false` and `reason: "holdout"`. 404 is reserved for an unknown or inactive
-experiment so SDKs can distinguish the cases.
+variant, `assigned: false` and `reason: "holdout"`. A paused or completed experiment is a normal
+outcome too (200, the control, `reason: "paused"` or `"completed"`). 404 is reserved for a key
+no experiment has, so SDKs can distinguish the cases.
 
 **Q5. What goes wrong if you remove `except HTTPException: raise` from `start_experiment`?**
 The 404/400/403 raised inside the `try` are caught by `except Exception` and turned by
