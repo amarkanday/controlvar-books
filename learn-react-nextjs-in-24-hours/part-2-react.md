@@ -8,8 +8,8 @@ React in five hours, the way the dashboard uses it: components as functions retu
 (Hour 5), the one-way flow of props in and state held by `useState` (Hour 6), effects for
 "do something after render" and the cancellation discipline that stops stale responses
 (Hour 7), custom hooks — the unit of reuse — and the rules that make them work (Hour 8), and
-context for the two things every page needs without prop-drilling: who's logged in and how
-to show a toast (Hour 9). Have `make web` running and edit a component to see it hot-reload.
+context for the things every page needs without prop-drilling: who's logged in, what they may
+do, and how to show a toast (Hour 9). Have `make web` running and edit a component to see it hot-reload.
 
 ---
 
@@ -127,15 +127,14 @@ nesting" rule the Python book teaches. `{cond && <X/>}` renders `X` only when `c
 truthy; `{a ? <X/> : <Y/>}` picks one. And after the guards, the compiler knows
 `experiment` is not null.
 
-A list with keys — the lifecycle buttons, driven by the status table from Hour 2 and by the
-user's role (abridged where marked `...`):
+A list with keys — the lifecycle buttons, driven by the status table from Hour 2 and by what
+the user may do (abridged where marked `...`):
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
   const statusActions = ACTIONS_BY_STATUS[status] ?? [];
-  const mayChange = canChangeExperiment(user);
-  // Offer only what the API would accept: a role without EXPERIMENT UPDATE is
-  // refused every lifecycle change, including on an experiment it owns.
+  const mayChange = canChangeExperiment(user, effective);
+  ...
   const actions = mayChange ? statusActions : [];
   ...
               {actions.map((action) => {
@@ -159,13 +158,14 @@ user's role (abridged where marked `...`):
 `key={action}` — stable and unique per item. `onClick={() => onActionClick(action)}` — an
 arrow so the handler is _called_ on click, not during render.
 
-`canChangeExperiment(user)` (from `frontend/src/utils/experimentPermissions.ts`) is a plain
-function of the user, not of the experiment: ADMIN and DEVELOPER (or a superuser) may start,
-pause, complete and archive **any** experiment; ANALYST and VIEWER may change none, even one
-they created. It mirrors the API's own check, so the page never offers a button the API would
-refuse. An ANALYST sees the status and a sentence instead of buttons
-(`data-testid="experiment-role-note"`), worded differently when they own the experiment. Hour
-16 comes back to this.
+`canChangeExperiment(user, effective)` (from `frontend/src/utils/experimentPermissions.ts`) is a
+plain function of the user and the user's **effective permissions**, never of the experiment:
+ADMIN and DEVELOPER (or a superuser) may start, pause, complete and archive **any** experiment;
+ANALYST and VIEWER may change none, even one they created, unless a custom role or a direct grant
+gives them `experiment: update` (the `effective` map, Hour 9). It mirrors the API's own check, so
+the page never offers a button the API would refuse. An ANALYST without such a grant sees the
+status and a sentence instead of buttons (`data-testid="experiment-role-note"`), worded
+differently when they own the experiment. Hour 16 comes back to this.
 
 Composition — a page assembling feature components, each with one prop:
 
@@ -194,10 +194,12 @@ A fragment (`<>...</>`) to return siblings without a wrapper element, from the a
       </Head>
       <ModulesProvider>
         <AuthProvider>
-          <NotificationProvider>
-            {page}
-            <ToastContainer />
-          </NotificationProvider>
+          <EffectivePermissionsProvider navigationKey={navigationKey}>
+            <NotificationProvider>
+              {page}
+              <ToastContainer />
+            </NotificationProvider>
+          </EffectivePermissionsProvider>
         </AuthProvider>
       </ModulesProvider>
     </ErrorBoundary>
@@ -295,11 +297,18 @@ value or explicitly:
   const [confirming, setConfirming] = useState<LifecycleAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // While "Edit variants and metrics" is open its form stands in for the
+  // read-only Variants and Metrics cards. The form exists on a draft only.
+  const [designOpen, setDesignOpen] = useState(false);
 ```
 
 `useState<Experiment | null>(null)` — the explicit type parameter because `null` alone
-would infer `null` forever. Six booleans-or-nulls rather than one big object: each changes
-independently, and separate state keeps updates simple.
+would infer `null` forever. Seven small values beside the experiment rather than one big object:
+each changes independently, and separate state keeps updates simple. The newest, `designOpen`, is
+set by a child: the page passes `onDesignOpenChange={setDesignOpen}` to `ExperimentManageSection`
+(Hour 15), and while the child's edit form is open on a draft the page hides its own read-only
+cards. A setter is a function like any other, so lifting state up can be as small as handing it
+down.
 
 Immutable updates on arrays of records — add, remove, change one field, set exactly one
 control. In the new-experiment form these live in a **reducer** (a pure function from the old
@@ -353,7 +362,13 @@ export function allocationTotalOf(variants: VariantFormData[]): number {
 
 ```tsx
 // 📁 frontend/src/components/experiments/new/VariantsEditor.tsx
-export function VariantsEditor({ variants, dispatch, revealProblems = 0 }: VariantsEditorProps) {
+export function VariantsEditor({
+  variants,
+  dispatch,
+  revealProblems = 0,
+  invalid = null,
+  invalidDescribedBy,
+}: VariantsEditorProps) {
   const allocationTotal = allocationTotalOf(variants);
 ```
 
@@ -451,6 +466,19 @@ Inside `case 'removeVariant':` the compiler knows `action.index` exists; in `cas
 3. **Child components stay dumb.** `VariantsEditor` takes `variants` and `dispatch` and
    says what happened; it does not know how the state is shaped above it.
 
+The decision has since paid a second time. A draft experiment's page now has an **Edit variants
+and metrics** form, and it is not a new form: it runs the same reducer with the same
+`VariantsEditor` and `MetricsEditor`, starting from the stored experiment instead of an empty one.
+
+```tsx
+// 📁 frontend/src/components/experiments/ExperimentDesignForm.tsx
+  const [state, dispatch] = useReducer(experimentFormReducer, experiment, formStateFromExperiment);
+```
+
+That is `useReducer`'s third argument earning its place: `init(initialArg)` builds the first state
+from whatever the caller passes, here `formStateFromExperiment(experiment)`. Hour 15 shows what the
+edit form does differently.
+
 Reach for `useReducer` when several fields change together or more than one component
 changes the same state; keep `useState` for independent values like `pendingAction` above.
 
@@ -539,23 +567,41 @@ demo apps and identical in shape to the dashboard's own:
 // 📁 sdk/react/src/hooks/useExperiment.ts
 export function useExperiment(experimentKey: string): ExperimentAssignment {
   const { client, user } = useExperimentation();
-  const [state, setState] = useState<ExperimentAssignment>(() =>
-    defaultAssignment(experimentKey, { loading: true })
+  const bootstrap = useBootstrap();
+  const [seed] = useState<Seed<ExperimentAssignment> | null>(() => {
+    const value = bootstrap.experiments.get(experimentKey);
+    return value ? { key: experimentKey, user, value } : null;
+  });
+  const [state, setState] = useState<ExperimentAssignment>(
+    () => seed?.value ?? defaultAssignment(experimentKey, { loading: true })
   );
+  // The bootstrapped assignment while the hook still shows it; cleared by its
+  // own answer and by a change of key or user.
+  const seeded = useRef(seed);
 
   useEffect(() => {
     let cancelled = false;
-    setState(defaultAssignment(experimentKey, { loading: true }));
+    const kept =
+      seeded.current && seeded.current.key === experimentKey && seeded.current.user === user
+        ? seeded.current.value
+        : null;
+    if (!kept) {
+      seeded.current = null;
+      setState(defaultAssignment(experimentKey, { loading: true }));
+    }
 
     client
       .assignExperiment(user, experimentKey)
       .then(assignment => {
-        if (!cancelled) setState(assignment);
+        if (!cancelled) {
+          seeded.current = null;
+          setState(assignment);
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           const error = err instanceof Error ? err : new Error(String(err));
-          setState(defaultAssignment(experimentKey, { error }));
+          setState(kept ? { ...kept, error } : defaultAssignment(experimentKey, { error }));
         }
       });
 
@@ -571,8 +617,18 @@ export function useExperiment(experimentKey: string): ExperimentAssignment {
 Trace a key change: effect 1 runs (key A), request in flight; key becomes B; React calls
 effect 1's cleanup (`cancelled = true` for A), then runs effect 2 (key B). When A's response
 arrives, `if (!cancelled)` is false — ignored. When B's arrives, it's applied. Note also
-`useState(() => ...)` — a **lazy initialiser** so the default object is built once, not on
+`useState(() => ...)` — a **lazy initialiser** so the first value is built once, not on
 every render.
+
+The rest of the hook is newer, and it is the same discipline with one more input. An app's own
+server can fetch a user's answers ahead of time (`ServerClient.bootstrap()`) and hand them to the
+Provider as its `bootstrap` prop; the hook then *starts* from that assignment, with
+`loading: false`, instead of from control. `seed` is computed once, by a
+lazy initialiser whose setter is thrown away (`const [seed] = ...`): it is a value fixed at mount,
+not state that changes. `seeded` is a ref, because whether the screen still shows the seed must not
+cause a render of its own. The effect still asks the server every time; it only skips the reset to
+"loading" when the seed is for this key and this user, and if the request fails it keeps the seed
+and adds the `error` rather than falling back to control.
 
 The dashboard's `useApi` hook does the same with a ref that outlives renders:
 
@@ -922,8 +978,9 @@ export function useVariant(flagKey: string): string | null {
 
 > **Watch Out!** A hook called after an early return — `if (!id) return null; const { data }
 > = useApi(...)` — changes the number of hooks between renders and React throws "Rendered
-> fewer hooks than expected." Hooks first, returns after. The page in Hour 5 declares all
-> seven `useState`s and the `useCallback`/`useEffect` before its first `return`.
+> fewer hooks than expected." Hooks first, returns after. The page in Hour 5 calls
+> `useRouter`, `useAuth` and `useEffectivePermissions`, declares all eight `useState`s and its
+> `useCallback`s and `useEffect` before its first `return`.
 
 > **Did You Know?** `useCallback(fn, deps)` with the _caller's_ `deps` (as `useApi` does)
 > is a deliberate trade: the hook can't know what `fetcher` closes over, so it trusts the
@@ -985,9 +1042,10 @@ programming error caught at the first render, not a `undefined is not a function
 
 Use context for app-wide concerns that many components need and few change: the current
 user, toasts, which optional modules this server has. Don't use it for data one page owns —
-that's state (Hour 6) or a service call. `_app.tsx` mounts three providers once, around every
-page: `ModulesProvider` (what `GET /api/v1/modules` says is installed), `AuthProvider` and
-`NotificationProvider`. A fourth, `WorkspaceProvider`, belongs to the optional workspaces
+that's state (Hour 6) or a service call. `_app.tsx` mounts four providers once, around every
+page: `ModulesProvider` (what `GET /api/v1/modules` says is installed), `AuthProvider`,
+`EffectivePermissionsProvider` (what the signed-in user may do beyond their role, below) and
+`NotificationProvider`. A fifth, `WorkspaceProvider`, belongs to the optional workspaces
 module (`modules/frontend/src/contexts/WorkspaceContext.tsx`) and is mounted by that module's
 own pages, not by `_app`.
 
@@ -1006,6 +1064,15 @@ The auth context's contract and provider:
 // 📁 frontend/src/contexts/AuthContext.tsx
 export type AuthStatus = 'loading' | 'authenticated' | 'anonymous';
 
+export interface LogoutOptions {
+  /**
+   * The page the next sign-in should open, for a caller that signs out on
+   * purpose to come back (an invitation meant for another account). Without
+   * it the next sign-in opens the default page.
+   */
+  next?: string;
+}
+
 export interface AuthContextValue {
   user: UserMe | null;
   status: AuthStatus;
@@ -1013,8 +1080,19 @@ export interface AuthContextValue {
   isAuthenticated: boolean;
   /** `POST /api/v1/auth/login`; stores the token and resolves with the user. */
   login: (email: string, password: string) => Promise<UserMe>;
-  /** `POST /api/v1/auth/logout` (best effort), then clears the token. */
-  logout: () => Promise<void>;
+  /**
+   * Signs out at once: clears the token and the user before anything else,
+   * then sends `POST /api/v1/auth/logout` without waiting for it (best effort;
+   * its answer, failure or silence changes nothing). Resolves straight away.
+   */
+  logout: (options?: LogoutOptions) => Promise<void>;
+  /**
+   * Where a protected page sends this tab after `logout()`: `/login`, or
+   * `/login?next=` when the logout named a `next`. Never the page the
+   * signed-out user was on, so the next person to sign in does not land there
+   * (#1006). `null` until this tab logs out, and again after a sign-in.
+   */
+  afterLogoutPath: string | null;
   /** Re-fetch `/auth/me` (e.g. after a profile change). */
   refresh: () => Promise<UserMe | null>;
   /** True when the current user has one of the given roles. */
@@ -1028,7 +1106,7 @@ export interface AuthContextValue {
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
-
+...
 /**
  * Only the bearer token is persisted (`localStorage["experimently.token"]`).
  * The user object is always re-derived from `GET /api/v1/auth/me` on mount so
@@ -1038,6 +1116,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserMe | null>(null);
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [afterLogoutPath, setAfterLogoutPath] = useState<string | null>(null);
   const mounted = useRef(true);
 
   const applyAnonymous = useCallback(() => {
@@ -1057,6 +1136,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(me);
         setStatus('authenticated');
         setSessionError(null);
+        setAfterLogoutPath(null);
       }
       return me;
     } catch (err) {
@@ -1093,9 +1173,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(result.user);
       setStatus('authenticated');
       setSessionError(null);
+      setAfterLogoutPath(null);
     }
     return result.user;
   }, []);
+
+  const logout = useCallback(
+    async (options: LogoutOptions = {}): Promise<void> => {
+      const token = getToken();
+      // Sign out here first (#1040): awaiting the server left the user signed
+      // in for as long as a stalled API took to answer. These updates are made
+      // together, so a protected page sees `anonymous` and `afterLogoutPath`
+      // in the same render and never redirects with this page as `next`.
+      clearToken();
+      setSessionError(null);
+      setAfterLogoutPath(loginPathWithNext(options.next));
+      applyAnonymous();
+      if (!token) return;
+      // Then tell the server, without waiting. The token is passed by hand
+      // with `auth: false`, so an answer arriving after the next sign-in
+      // (even a 401) cannot clear that session's token. The API revokes
+      // nothing at logout (tokens are stateless), so nothing depends on the
+      // request arriving.
+      void apiFetch<void>(LOGOUT_PATH, {
+        method: 'POST',
+        auth: false,
+        redirectOn401: false,
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => undefined);
+    },
+    [applyAnonymous],
+  );
 ```
 
 Three states, not a boolean: `loading` (we don't know yet), `authenticated`, `anonymous`. A
@@ -1110,6 +1218,19 @@ the user deserves to know which. `sessionError` carries the second kind:
 "Signed out because the server returned an error (HTTP 503). Request ID: ...", and the login
 page shows it. A rejected token sets nothing: being asked to sign in again explains itself.
 
+`logout` is a lesson in **ordering**. It used to send `POST /api/v1/auth/logout` first and clear
+the token after, as its old doc comment said, so a stalled API kept the user signed in for as long as
+it stalled. Now the client's half happens first and at once — clear the token, clear the error,
+record where to go, become `anonymous` — and the comment relies on React batching those state
+updates into one render (Hour 6's **Did You Know?**), so that no page ever sees `anonymous`
+without `afterLogoutPath`. The request to the server is fire-and-forget
+(`void apiFetch(...).catch(() => undefined)`): nothing waits for it, and nothing depends on it,
+because the API keeps no session to revoke. Two smaller decisions ride along. The request carries the
+old token by hand with `auth: false`, so a late 401 cannot make `apiFetch` clear the token of
+whoever signs in next. And `afterLogoutPath` exists for `RequireAuth` (Hour 12): without it the gate
+would redirect with the page on screen as `next=`, and the next person to sign in on that browser
+would land on the previous user's page.
+
 The value is assembled with `useMemo` so consumers don't re-render on every provider
 render, and the hook throws without a provider:
 
@@ -1122,11 +1243,12 @@ render, and the hook throws without a provider:
       isAuthenticated: status === 'authenticated',
       login,
       logout,
+      afterLogoutPath,
       refresh: loadMe,
       hasRole,
       sessionError,
     }),
-    [user, status, login, logout, loadMe, hasRole, sessionError],
+    [user, status, login, logout, afterLogoutPath, loadMe, hasRole, sessionError],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -1140,6 +1262,7 @@ export function useAuth(): AuthContextValue {
   return ctx;
 }
 
+/** Like `useAuth` but returns `null` outside an `AuthProvider`. */
 export function useOptionalAuth(): AuthContextValue | null {
   return useContext(AuthContext) ?? null;
 }
@@ -1202,14 +1325,15 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
 ```
 
 Consumers read what they need — the nav reads `status` and `user`; the detail page reads
-`user` to decide which buttons to offer (by role) and how to word the note it shows instead
-(by ownership):
+`user`, and the effective permissions from the next context, to decide which buttons to offer,
+and `user` alone to word the note it shows instead (by ownership):
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
   const { user } = useAuth();
+  const { effective, loading: permissionsLoading } = useEffectivePermissions();
   ...
-  const mayChange = canChangeExperiment(user);
+  const mayChange = canChangeExperiment(user, effective);
   ...
   // A null owner (the creator's account was removed) is nobody, so it is
   // never you.
@@ -1218,7 +1342,95 @@ Consumers read what they need — the nav reads `status` and `user`; the detail 
 ```
 
 Ownership labels; it does not grant. Notice the null check: `owner_id` is `string | null` (Hour 1), and
-a removed creator must never compare equal to anyone. Access to experiments and flags is by role (Hour 16).
+a removed creator must never compare equal to anyone. Access to experiments and flags is by permission
+— the role, or a grant — never by ownership (Hour 16).
+
+#### A context built from two others: `EffectivePermissionsContext`
+
+In the full profile an administrator can give a user more than their built-in role: a **custom
+role** or a **direct grant** of, say, `experiment: update` to an ANALYST. The API then admits that
+user. A dashboard that read only `user.role` would hide controls the API would accept — safe, but
+wrong. So the dashboard asks the API for the signed-in user's own map,
+`GET /api/v1/rbac/users/{id}/permissions`, and puts it in a context of its own:
+
+```tsx
+// 📁 frontend/src/contexts/EffectivePermissionsContext.tsx
+export interface EffectivePermissionsValue {
+  /** The current user's map, or `undefined`: only the role lists apply. */
+  effective: EffectivePermissions | undefined;
+  /** True while an answer that could widen the role lists may still come. */
+  loading: boolean;
+}
+
+/** Outside the provider, a core profile, no user, a superuser: role lists only. */
+export const ROLE_LISTS_ONLY: EffectivePermissionsValue = { effective: undefined, loading: false };
+...
+export function EffectivePermissionsProvider({ children, navigationKey }: EffectivePermissionsProviderProps) {
+  const auth = useOptionalAuth();
+  const user = auth?.user ?? null;
+  const userId = user && user.is_superuser !== true ? user.id : null;
+  const { isLoading: modulesLoading, hasModule } = useModules();
+  const rbac = !modulesLoading && hasModule(MODULES.RBAC);
+  const [answer, setAnswer] = useState<Answer | null>(null);
+
+  useEffect(() => {
+    if (!rbac || userId === null) return undefined;
+    let current = true;
+    RbacService.getUserPermissions(userId).then(
+      (body) => {
+        if (current) setAnswer({ userId, effective: effectiveFromAnswer(body) });
+      },
+      () => {
+        if (current) setAnswer({ userId, effective: undefined });
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [rbac, userId, navigationKey]);
+
+  const value = useMemo<EffectivePermissionsValue>(() => {
+    if (userId === null) return ROLE_LISTS_ONLY;
+    if (modulesLoading) return PENDING;
+    if (!rbac) return ROLE_LISTS_ONLY;
+    if (answer === null || answer.userId !== userId) return PENDING;
+    return { effective: answer.effective, loading: false };
+  }, [userId, modulesLoading, rbac, answer]);
+```
+
+Nearly every idea of Part II is in those forty lines:
+
+- **A provider may read other contexts.** It sits *inside* `AuthProvider` and `ModulesProvider`
+  in `_app.tsx` because it needs both: it asks nothing for nobody, nothing for a superuser (who
+  passes every check before any map is read), and nothing in the core profile, where the rbac
+  route does not exist and the stub `RbacService` (`frontend/src/modules-stub/rbac.ts`) would
+  throw.
+- **The cancelled flag** (Hour 7), here called `current`, so a slow answer for one user never
+  lands after the next user signed in. The `answer.userId !== userId` check in the memo is the
+  same guard a second time, against a stored answer that belongs to someone else.
+- **Derive, don't store** (Hour 6). The provider stores only the last answer; whether the
+  value is "role lists only", "pending" or a map is computed in `useMemo` from four inputs.
+- **Fail closed.** A failed request is an answer with no map, `effective: undefined`, which every
+  helper reads as "the role lists only". `effectiveFromAnswer` refuses anything that is not an
+  object of string lists the same way, "never as a grant".
+- **A dependency that is not read.** `navigationKey` is in the effect's list but not in its body.
+  `_app.tsx` passes the page's path (query and hash cut off), so the map is asked for again on
+  every navigation, and a grant or a revoke reaches the dashboard by the next page. Until then the
+  API decides.
+
+And `loading` is the reason for a third state on every gated control. While a map that *could*
+add a permission is on its way, a page shows neither the control nor its refusal note, so nothing
+flashes "you may not" and then changes its mind. The detail page's version is one line,
+`const mayChangePending = !mayChange && permissionsLoading;`. A DEVELOPER never waits: the role
+list already says yes.
+
+Outside any provider, `useEffectivePermissions()` returns `ROLE_LISTS_ONLY` — the context's
+**default value**, passed to `createContext(ROLE_LISTS_ONLY)`. That is why the page tests, which
+render pages without this provider, need no mock for it, and why a forgotten provider can only
+under-offer. The tests for the provider itself are a good read:
+`frontend/src/tests/contexts/EffectivePermissionsContext.test.tsx` names each rule in a test title
+("a failed or odd answer gives the role lists only (fail closed)", "one user's map is never shown
+for the next user").
 
 And the providers are mounted once, in order, around every page:
 
@@ -1226,10 +1438,12 @@ And the providers are mounted once, in order, around every page:
 // 📁 frontend/src/pages/_app.tsx
       <ModulesProvider>
         <AuthProvider>
-          <NotificationProvider>
-            {page}
-            <ToastContainer />
-          </NotificationProvider>
+          <EffectivePermissionsProvider navigationKey={navigationKey}>
+            <NotificationProvider>
+              {page}
+              <ToastContainer />
+            </NotificationProvider>
+          </EffectivePermissionsProvider>
         </AuthProvider>
       </ModulesProvider>
 ```
@@ -1240,17 +1454,33 @@ core profile**, so a dashboard that cannot reach its backend never shows module 
 back. Its hook, `useModules()`, returns that same core default when there is no provider at
 all — the opposite choice from `useAuth()`, which throws. Both are deliberate: rendering the
 shell without module chrome is always safe, rendering a page without knowing the user is not.
+`EffectivePermissionsProvider` comes next because it reads both of the providers above it.
 
 The React SDK's provider shows the memoisation rule for a context whose value is an object —
 recreate only when the primitives that matter change:
 
 ```tsx
 // 📁 sdk/react/src/context/ExperimentationProvider.tsx
-export function ExperimentationProvider({ config, user, children }: ProviderProps) {
+export function ExperimentationProvider({ config, user, bootstrap, children }: ProviderProps) {
+  // The client below only ever sees the wrapper, so the Provider refuses a
+  // value that is not a function itself, as the client's constructor would.
+  const onExposure = checkOnExposure(config.onExposure);
+  // The latest render's onExposure, set during render (an effect does not run
+  // in a server render, and useLayoutEffect warns there), so the wrapper calls
+  // it without the client being recreated when an inline function changes.
+  const exposureRef = useRef(onExposure);
+  exposureRef.current = onExposure;
+
   // Stabilise the client — only recreate when a config primitive changes, so
   // callers may pass an inline config object without losing the cache.
   const client = useMemo(
-    () => new ExperimentationClient(config),
+    () =>
+      new ExperimentationClient({
+        ...config,
+        // Returns what the hook returns, so the client's guard sees a Promise
+        // it returns and handles its rejection.
+        onExposure: (exposure: Exposure) => exposureRef.current?.(exposure),
+      }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [config.apiKey, config.baseUrl, config.timeoutMs, config.cacheTtlMs]
   );
@@ -1268,6 +1498,16 @@ export function ExperimentationProvider({ config, user, children }: ProviderProp
 Without that, an inline `user={{ userId, attributes }}` in a parent would be a new object
 every render, every hook depending on `user` would re-run, and every experiment would be
 re-assigned on every keystroke.
+
+The newer `onExposure` callback shows the problem one level down. An app passes it inline
+(`config={{ ..., onExposure: (e) => analytics.track(e) }}`), so it is a new function on every
+render — but it is not in the client's dependency list, and must not be, or every render would
+build a new client and empty its cache. The answer is the **latest-value ref**: the client is
+given a wrapper that is created once and calls `exposureRef.current`, and the ref is updated on
+every render. The comment says why the update happens during render rather than in the more usual
+effect: an effect does not run in a server render, and `useLayoutEffect` warns there. Writing a ref
+during render is normally a smell; here the value written is only ever read later, by a callback,
+never by the render itself, and the comment records the trade.
 
 > **Watch Out!** A context value that's a fresh object each render (`value={{ toasts,
 > addToast, removeToast }}` without memoisation) re-renders every consumer on every provider
@@ -1292,7 +1532,10 @@ proves that an ANALYST who owns an experiment still gets no lifecycle button?
 
 - **Context for page-local data.** State or a service call.
 - **A hook that returns `undefined` outside its provider** instead of throwing — unless, like
-  `useModules()` or `useOptionalAuth()`, a safe default is the documented contract.
+  `useModules()`, `useOptionalAuth()` or `useEffectivePermissions()`, a safe default is the
+  documented contract.
+- **Showing a refusal while the answer that could lift it is still on its way** — keep a
+  `loading` state and show neither the control nor the note until it resolves.
 - **Unmemoised object values** on hot providers — every consumer re-renders.
 - **Persisting the user object** instead of re-deriving it from the API.
 
@@ -1302,7 +1545,11 @@ proves that an ANALYST who owns an experiment still gets no lifecycle button?
   a provider.
 - Auth: three states (`loading | authenticated | anonymous`), token-only persistence, user
   re-derived from `/auth/me`, cross-tab sync, `hasRole`, and `sessionError` so a failed
-  restore is never a silent sign-out.
+  restore is never a silent sign-out; `logout` signs out locally first and tells the server
+  without waiting.
+- Effective permissions: a provider inside auth and modules that asks for the user's own map,
+  again on every navigation, with a cancelled flag, a `loading` state, and "role lists only" for
+  every failure and for no provider at all.
 - Notifications: `addToast`/`removeToast` with timers in a ref.
 - Memoise provider values (and the SDK client) on the primitives that matter; tests mock the
   `useX()` hook.
@@ -1344,6 +1591,15 @@ One copy of the form that two views (the guided wizard and the single-page form)
 and dispatch to, so switching views keeps every answer; a pure `experimentFormReducer` that
 tests can call without rendering anything; and child editors that only say what happened
 (`dispatch({ type: 'removeVariant', index })`) without knowing the state's shape.
+
+**Q8. An ANALYST has been granted `experiment: update` through a custom role. The experiment
+loads before their permissions map does. What does the page show, and then?**
+First, neither the lifecycle buttons nor the "needs permission" note: their role does not admit
+them, and `EffectivePermissionsProvider` is still `loading`, so `mayChangePending` is true. Once
+the map arrives with `experiment: ["update", ...]`, `canChangeExperiment(user, effective)` is
+true and the buttons appear. In the core profile, or if the request fails, the map is
+`undefined`, only the role lists apply, and they see the note — never a button the API might
+refuse.
 
 **Quiz.** Name the two rules of hooks and the lint rule that enforces them.
 → Top level only (no conditions/loops/after returns); from components or custom hooks only.

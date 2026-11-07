@@ -47,6 +47,7 @@ module.exports = {
     './src/pages/**/*.{js,ts,jsx,tsx,mdx}',
     './src/components/**/*.{js,ts,jsx,tsx,mdx}',
     './src/app/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/types/**/*.{js,ts,jsx,tsx}',
     // The modules' dashboard code (the `@modules/*` alias; absent from a core
     // tree, where the glob matches nothing). Without it a class used only by
     // a module page is never generated.
@@ -75,10 +76,20 @@ module.exports = {
 
 `extend` adds to Tailwind's defaults rather than replacing them; `primary` is a blue scale
 (mostly used as `blue-600` in practice — the dashboard leans on the default palette:
-`slate` for chrome, `blue` for primary actions, `green`/`red`/`amber` for status). The fourth
+`slate` for chrome, `blue` for primary actions, `green`/`red`/`amber` for status). The last
 `content` glob reaches outside `frontend/` into the modules tree: Tailwind generates only the
 classes it finds in scanned files, so without it a class used only by a module page would
-silently not exist. The `typography` plugin (`prose` classes) is still loaded, as a
+silently not exist.
+
+The `src/types` glob is the same lesson learned the hard way, and the pull request that added it
+(#1491) tells the story. `ROLE_COLORS` in `frontend/src/types/admin.ts` gives each role a chip
+colour — `ANALYST: 'bg-purple-100 text-purple-800'` — but `src/types` was not scanned. In a core
+build, where no scanned file happened to use those two classes, they were never generated, and the
+Analyst chip on Admin → Users rendered with no background and no text colour. Nothing failed; a
+style was simply absent. The fix is one line, and the regression test beside it
+(`frontend/src/tests/admin/UserTable.test.tsx`) asserts both halves: every role badge carries its
+`ROLE_COLORS` classes, and the config's `content` includes the `src/types` glob. If you put class
+strings in a new directory, add it here. The `typography` plugin (`prose` classes) is still loaded, as a
 devDependency, but nothing uses it any more: it served the in-app markdown docs pages, which
 are gone (Hour 10).
 
@@ -192,8 +203,10 @@ empty ruleset can say so):
 > `role="status"`/`aria-live="polite"` announce the spinner, `role="switch"`/`aria-checked`
 > make the toggle a real switch, `aria-current="page"` marks the active nav item, and the
 > shell's first element is a skip link. The nightly Playwright accessibility suite runs axe
-> on five pages (`/login`, `/`, `/experiments`, `/feature-flags`, `/admin`) plus keyboard,
-> label, contrast and alt-text checks.
+> on `/login`, `/`, the experiments list (with experiments and empty), the flag list, the new-flag
+> form, a value flag's page, `/admin` and the API-keys dialog, plus keyboard, label, contrast and
+> alt-text checks; and the pull-request check `Frontend Tests` runs axe over the public site's
+> four pages at phone width (the `site` project, Hour 22).
 
 ### Try It Yourself
 
@@ -205,6 +218,7 @@ literal and watch the colour vanish in `npm run build`'s output.
 ### Common mistakes
 
 - **Dynamic class fragments** — purged away.
+- **Class strings in a directory `content` does not scan** — complete strings, never generated.
 - **One giant `className` string** for conditional styling — use an array with one concern
   per line.
 - **Styling state with classes only** — add `data-*` for tests.
@@ -213,7 +227,8 @@ literal and watch the colour vanish in `npm run build`'s output.
 ### Key takeaways
 
 - Utilities in the element; tokens in `tailwind.config.js` (`primary`, Inter); `content`
-  must include the modules tree.
+  must include every directory that holds class strings — the modules tree, and `src/types`
+  since the Analyst chip lost its colour (#1491).
 - Arrays-joined class lists, named constants per page, complete class names only.
 - `data-state`/`data-is-control` for tests; `sr-only`, roles and `aria-*` for a11y.
 - Mobile-first responsive prefixes; skeletons with `animate-pulse`.
@@ -562,9 +577,10 @@ else is shown read-only as JSON, and the only change offered is to replace it. O
 `targetingPayload(rules, stored)` sends `rulesToJson`'s output (or `{}` for no rules) and
 carries the stored rule's top-level `id` back unchanged, because the server uses it to decide
 who a partial rollout admits. The experiment page (`TargetingSection`) allows editing only
-while the experiment is a draft or paused, and only for a role that may change it (Hour 16);
-the flag pages do the same with `isEditableFlagTargeting` in `frontend/src/utils/flagTargeting.ts`
-and send rules only when they changed.
+while the experiment is a draft or paused, and only for a user who may change it, by role or by
+grant (Hour 16); the flag pages do the same with `isEditableFlagTargeting` in
+`frontend/src/utils/flagTargeting.ts` and `canChangeFeatureFlags(user, effective)`, and send rules
+only when they changed.
 
 ### Try It Yourself
 
@@ -627,10 +643,32 @@ format axes:
 
 ```tsx
 // 📁 frontend/src/components/results/Visualizations/ConversionChart.tsx
+interface ConversionChartProps {
+  variants: VariantResult[];
+  /**
+   * How the metric was analysed (`analysedAsMean` on the metric): 'mean'
+   * plots each variant's value per user as a plain amount, 'proportion' (the
+   * default) its rate as a percentage.
+   */
+  analysis?: MetricAnalysis;
+  /**
+   * The metric's type, which names a mean: "Revenue per user", "Events per
+   * user", "Duration per user" or "Value per user".
+   */
+  metricType?: MetricResult['metric_type'];
+}
+...
 const CONTROL_COLOR = '#3b82f6'; // blue-500
 const VARIANT_COLORS = ['#10b981', '#f59e0b', '#ef4444', '#8b5cf6'];
 
-export function ConversionChart({ variants }: ConversionChartProps) {
+export function ConversionChart({
+  variants,
+  analysis = 'proportion',
+  metricType,
+}: ConversionChartProps) {
+  const mean = analysis === 'mean';
+  const meanLabel = capitalised(meanLabelForType(metricType ?? ''));
+
   if (!variants.length) {
     return (
       <div className="flex items-center justify-center h-48 text-slate-500">
@@ -647,7 +685,7 @@ export function ConversionChart({ variants }: ConversionChartProps) {
         className="flex items-center justify-center h-48 text-slate-500"
         data-testid="conversion-chart-empty"
       >
-        No conversions yet
+        {emptyText(mean, metricType)}
       </div>
     );
   }
@@ -673,9 +711,18 @@ export function ConversionChart({ variants }: ConversionChartProps) {
         >
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="name" />
-          <YAxis tickFormatter={(v: number) => `${(v * 100).toFixed(1)}%`} />
+          {mean ? (
+            // A mean is an amount per user: plain numbers, no "%" and no currency.
+            <YAxis tickFormatter={(v: number) => formatAmount(v)} />
+          ) : (
+            <YAxis tickFormatter={(v: number) => `${(v * 100).toFixed(1)}%`} />
+          )}
           <Tooltip
-            formatter={(v) => [`${((v as number) * 100).toFixed(2)}%`, 'Rate']}
+            formatter={(v) =>
+              mean
+                ? [formatAmount(v as number), meanLabel]
+                : [`${((v as number) * 100).toFixed(2)}%`, 'Rate']
+            }
           />
           <Legend />
           {chartData.map((entry) => (
@@ -695,8 +742,16 @@ export function ConversionChart({ variants }: ConversionChartProps) {
 ```
 
 The colour constants are Tailwind's palette as hex (`#3b82f6` is `blue-500`) because SVG
-fills can't use classes. `(v * 100).toFixed(1)}%` — rates arrive as fractions and are
-formatted at the edge. The odd-looking `{...({ 'data-is-control': ... } as object)}` spreads
+fills can't use classes. The `analysis` prop is the newest part, and it is about formatting at the
+edge. The results engine now analyses a revenue, count, duration or custom metric as a **mean per
+user** rather than as a rate, so one chart draws two kinds of number. A rate arrives as a fraction
+and is shown as `(v * 100).toFixed(1)}%`; a mean is an amount and is shown by `formatAmount`, with
+"no '%' and no currency", and the empty state says "No revenue yet" or "No events yet" instead of
+"No conversions yet". The chart does not decide which it is. The results dashboard asks
+`analysedAsMean(metric)` in `frontend/src/components/results/shared/resultFormat.ts`, the same
+function the comparison table and the chart's heading ask, and that function reads the result's own
+`analysis` field — "so the page reads what this server did, never a list of types". It is the mirror
+principle at its most careful: do not re-derive on the client what the server can simply tell you. The odd-looking `{...({ 'data-is-control': ... } as object)}` spreads
 a custom attribute Recharts' `Bar` props don't declare — a typed escape hatch so the mock
 (and the DOM) can expose control-ness. (`Tooltip formatter={(v) => ... (v as number)}` is
 the recharts 3.10 typing fix from the Dependabot upgrade.)
@@ -844,9 +899,11 @@ series in parallel, and the sample size **on its own**:
       // level. If the experiment cannot be read, the results are still asked
       // for, with no settings, and the server uses the stored ones.
       const experimentRequest = readExperiment(experimentId);
-      const resultsRequest = experimentRequest.then(({ settings, bayesianEnabled: b }) => {
+      const resultsRequest = experimentRequest.then((reading) => {
+        const { settings } = reading;
         setStored(settings);
-        setBayesianEnabled(b);
+        setBayesianEnabled(reading.bayesianEnabled);
+        setEventNames(reading.eventNames);
         return settings
           ? ResultsService.getResults(experimentId, settings)
           : ResultsService.getResults(experimentId);
@@ -880,9 +937,10 @@ only the call whose number is still the latest may write state. It is the same p
 called on demand rather than an effect. A ref, not state, because changing it must not
 re-render.
 
-The primary-metric chart's heading also depends on the metric's type (`primaryMetricHeading`):
-"Conversion Rates — Checkout" for a conversion metric, "… — mean" for a numeric one, so a
-revenue metric is never headed as a conversion rate.
+The primary-metric chart's heading also depends on how the metric was analysed
+(`primaryMetricHeading`): "Conversion Rates — Checkout" for a conversion metric, the metric's
+name and what its mean is for one analysed as a mean, so a revenue metric is never headed as a
+conversion rate.
 
 > **Watch Out!** `ResponsiveContainer` measures its parent, so the parent needs a real height
 > (`h-72`). Without it the chart renders at zero height and looks "broken" — a CSS bug that

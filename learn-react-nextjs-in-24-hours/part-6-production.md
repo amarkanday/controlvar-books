@@ -17,8 +17,8 @@ the live OpenAPI spec (Hour 23); and the style guide that collects the whole boo
 
 ### What & why
 
-The dashboard's tests — about 1,800 `it(` and `test(` calls, counted with `grep` across 131 test
-files under `frontend/src` and 23 more beside the modules' code — run in **Jest**
+The dashboard's tests — about 2,600 `it(` and `test(` calls, counted with `grep` across 175 test
+files under `frontend/src` and 24 more beside the modules' code — run in **Jest**
 with **jsdom** (a DOM in Node) and **React
 Testing Library** (RTL), whose philosophy shapes every test here: _test what the user sees
 and does_. Render a component, find elements the way a user would (by role, by text, by
@@ -292,9 +292,12 @@ above; this book quotes no percentage).
 ### Try It Yourself
 
 Write a page test for `/feature-flags/[id]` that: installs a routed mock for `GET` and
-`POST .../deactivate`, renders, awaits the detail, clicks the toggle (`getByRole('switch')`),
-and asserts `calledWith('POST', '/api/v1/feature-flags/<id>/deactivate')` and that the switch
-now has `aria-checked="false"`. Then run the existing one and compare:
+`POST .../disable`, renders, awaits the detail, clicks the toggle (`getByRole('switch')`),
+and asserts `calledWith('POST', '/api/v1/feature-flags/<id>/disable')` and that the switch
+now has `aria-checked="false"`. (The page turns a flag on and off with
+`FeatureFlagsService.setEnabled`, which posts to `/enable` or `/disable` — the explicit,
+audit-logged routes, not the `/toggle` that flips whatever the server holds.) Then run the
+existing one and compare:
 
 ```bash
 cd frontend && npx jest src/tests/pages/feature-flag-detail.test.tsx --watchAll=false
@@ -325,11 +328,14 @@ cd frontend && npx jest src/tests/pages/feature-flag-detail.test.tsx --watchAll=
 Jest proves components behave with a mocked API. **Playwright** proves the whole thing
 works in a real browser against a real backend: log in through the real `/login`, create an
 experiment through the real guided setup, start it, read results, archive it. The specs live
-under `frontend/tests/e2e/`, and `playwright.config.ts` sorts them into four **projects** by
+under `frontend/tests/e2e/`, and `playwright.config.ts` sorts them into five **projects** by
 file name:
 
-- **`journeys`** — the eight `*.journey.spec.ts` click paths: `login`, `experiment-lifecycle`,
-  `feature-flag`, `admin-panel`, `rbac`, `results-checks`, `segments` and `header-breakpoint`.
+- **`journeys`** — the thirteen `*.journey.spec.ts` click paths: `login`, `experiment-lifecycle`,
+  `experiment-design`, `experiment-schedule`, `feature-flag`, `rollout-schedule`,
+  `exclusion-groups`, `holdouts`, `admin-panel`, `rbac`, `results-checks`, `segments` and
+  `header-breakpoint`. Five of them are new since the last edition of this book, one for each of
+  the draft-edit, draft-schedule, rollout-schedule, exclusion-group and holdout screens (Hour 15).
   Serial, asserting on `data-testid`s. These are the
   **required `Browser E2E` check on every pull request**: CI builds the static export, starts a
   real seeded backend and runs `npx playwright test --project=journeys`. A journey that fails
@@ -338,10 +344,14 @@ file name:
   needs its own API process and a fake identity provider, which the same `Browser E2E` job
   starts as extra steps.
 - **`extended`** — everything else, which today means accessibility (`accessibility.spec.ts`,
-  `@axe-core/playwright` scans of five pages that fail on critical or serious WCAG 2.1 AA
-  violations, plus keyboard, label, contrast and alt-text checks). This runs **nightly**, not in
-  the PR gate: full-page audits are slower and noisier than a click path, but a failure there
-  fails the night.
+  `@axe-core/playwright` scans that fail on critical or serious WCAG 2.1 AA violations — the
+  login, home, experiment and flag pages, the admin panel and the API-keys dialog — plus
+  keyboard, label, contrast and alt-text checks). This runs **nightly**, not in the PR gate:
+  full-page audits are slower and noisier than a click path, but a failure there fails the night.
+- **`site`** — `marketing-site.site.spec.ts`, the public website rather than the dashboard. It
+  runs over the **marketing** export (Hour 13) at an iPhone 13's width, with axe and Tab-focus
+  checks, inside the `Frontend Tests` pull-request check, right after `npm run build:marketing`.
+  `extended` ignores it because the nightly run does not build that export.
 - **`visual`** — `visual-regression.spec.ts` only. It is a project of its own because **no
   baseline screenshot has been committed**, so every test in it fails on its first comparison, and
   no workflow runs it. `npm run test:visual` selects it by file name and
@@ -403,8 +413,18 @@ export default defineConfig({
       name: "extended",
       testMatch: /\.spec\.ts$/,
       // The visual spec has its own project below, until its baselines exist.
-      testIgnore: [/\.journey\.spec\.ts$/, /\.sso\.spec\.ts$/, /visual-regression\.spec\.ts$/],
+      // The site spec needs the marketing export, which nightly does not build.
+      testIgnore: [/\.journey\.spec\.ts$/, /\.sso\.spec\.ts$/, /\.site\.spec\.ts$/, /visual-regression\.spec\.ts$/],
       use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      // The public site over the MARKETING export (#1459): Frontend Tests runs
+      // it right after `npm run build:marketing`. The iPhone 13 descriptor
+      // names WebKit; CI installs only Chromium, and the phone checks were
+      // measured on Chromium, so `browserName` overrides it.
+      name: "site",
+      testMatch: /\.site\.spec\.ts$/,
+      use: { ...devices["iPhone 13"], browserName: "chromium" },
     },
     {
       // Not run by any workflow. Move it back into `extended` (delete the
@@ -429,7 +449,10 @@ already answering on the base URL; otherwise, if the dashboard's `out/` holds a 
 with `tests/e2e/static-server.mjs`, which proxies `/api` the way nginx does in the image (so
 the browser sends no CORS preflight); otherwise run `npm run dev`. `trace: "retain-on-failure"`
 keeps a trace for every failing test, not only for retries — in CI the first failure is the
-one you most want to read.
+one you most want to read. The `site` project shows one more habit worth copying: its comment
+records why a device descriptor is overridden (`browserName: "chromium"` on an iPhone 13
+profile), because the next person to read it would otherwise "fix" it back to WebKit, which CI does
+not install.
 
 The auth fixture — real credentials from the demo seed, real login, no bypass:
 
@@ -601,8 +624,9 @@ npx playwright test --project=journeys experiment-lifecycle --headed
 
 - Playwright: real browser, real backend, real login via fixtures; serial specs with
   timestamped data; page objects own selectors.
-- Four projects: `journeys` (eight `*.journey.spec.ts`) and `sso` are the required `Browser E2E`
-  PR check; `extended` (accessibility) runs nightly; `visual` is not run by any workflow until its
+- Five projects: `journeys` (thirteen `*.journey.spec.ts`) and `sso` are the required
+  `Browser E2E` PR check; `site` (the public website at phone width) runs in `Frontend Tests`;
+  `extended` (accessibility) runs nightly; `visual` is not run by any workflow until its
   baselines are committed.
 - `tests/e2e/env.ts` holds `BASE_URL` (3100 default) and `API_URL`; `PLAYWRIGHT_WEB_SERVER`
   picks reuse, static export or dev server; traces kept on failure; HTML report.
@@ -648,13 +672,13 @@ The guard's contract:
  *
  * ## Profiles
  *
- * The dump is taken from a full-profile build and carries 56 paths that only
+ * The dump is taken from a full-profile build and carries 58 paths that only
  * the modules serve. A core backend serves the rest, so the rule "every URL
  * literal exists in the dump" needs a profile, not a single document. Rather
  * than keeping two dumps in sync, one dump is kept and
  * `openapi.module-paths.json` names the modules' subset:
  *
- *   EXPERIMENTLY_PROFILE=core  →  those 56 paths are removed from the
+ *   EXPERIMENTLY_PROFILE=core  →  those 58 paths are removed from the
  *                                 document, and only the core tree
  *                                 (`frontend/src`, minus anything the manifest
  *                                 still lists there) is scanned.
@@ -667,8 +691,8 @@ The guard's contract:
 The profile matters here too. In a full run the guard scans both `frontend/src` and
 `modules/frontend/src` against the whole document; in a core run it removes the modules'
 paths from the document and scans only the core tree, so a core page that calls a module
-endpoint fails. (The comment's count of module paths is a snapshot; the list itself is
-`openapi.module-paths.json`.)
+endpoint fails. (The comment's count of module paths is a snapshot — it said 56 when this book
+was first written and says 58 now — and the list itself is `openapi.module-paths.json`.)
 
 A sibling guard does the same for documentation links. `src/tests/services/docs-links.test.ts`
 scans the sources for every `docsUrl('...')` literal (Hour 10) and fails if it does not name a
@@ -721,10 +745,11 @@ it no longer lints. CI splits the work:
   three things **as the core profile**: `npx tsc --noEmit -p tsconfig.core.json`,
   `EXPERIMENTLY_PROFILE=core npx jest`, and `EXPERIMENTLY_PROFILE=core npm run build`, failing if
   the core bundle mentions a module route (and, as the other half, if the stub page's text is
-  missing). It also runs `frontend/scripts/check-platform-export.mjs` over the export, which asserts that
-  the platform build carries none of the public site's walkthrough videos. Without the core steps every check would resolve
-  `@modules/*` to the real modules first, and a core page that leaned on module code would ship
-  through a green CI.
+  missing). Without the core steps every check would resolve `@modules/*` to the real modules
+  first, and a core page that leaned on module code would ship through a green CI. It also runs
+  `frontend/scripts/check-platform-export.mjs` over each export, which asserts that the platform
+  build carries none of the public site's walkthrough videos, and, last, builds the marketing site
+  (`npm run build:marketing`) and runs the `site` Playwright project over it (Hour 22).
 
 A page that doesn't compile, lint or pass in either profile can't merge.
 
@@ -904,7 +929,8 @@ judgement half is below.
 **Data**
 
 - One `apiFetch<T>()`; `ApiError` with `detail: unknown`; 401 clears the token and
-  redirects (unless told not to).
+  redirects (unless told not to); every request has a deadline (30 s, or the long one chosen in
+  the service for a slow read), and a timed-out write is reported as possibly done.
 - One service per resource; methods map 1:1 to routes; `BASE` + template literals; typed
   with mirror interfaces; no React, no state; `|| undefined` to drop empty optionals.
 - `useApi(fetcher, [deps])` for reads; lifecycle actions set pending state, use inline
@@ -912,18 +938,21 @@ judgement half is below.
 - Forms: controlled inputs over one reducer, a `validateForm` that mirrors the server (exported
   for tests), annotated payloads, `e.preventDefault()`, a ref-guarded `isSubmitting`; failures
   mapped by status (`describeCreateError`), server messages shown otherwise; never a 401
-  redirect that throws away answers.
+  redirect that throws away answers. An edit sends only what changed, and nothing at all for an
+  unchanged form; one body type per meaning of a route.
 - The rule builder's state is the API shape; `rulesToJson` strips client ids; operator
   unions mirror the backend adapter.
 
 **Access**
 
-- The UI is never more permissive than the API. Experiments and flags are by role, not
-  ownership (`canCreateExperiment`, `canChangeExperiment`); the admin area is superuser-only
-  (`withAdminGuard`, nav `superuser: true`); module links show only when the module is
-  installed.
+- The UI is never more permissive than the API. Experiments and flags are by permission, not
+  ownership: the role list or, in the full profile, the user's effective map
+  (`canChangeExperiment(user, effective)`, `canChangeFeatureFlags(user, effective)`), each action
+  asked separately; the admin area is superuser-only (`withAdminGuard`, nav `superuser: true`);
+  module links show only when the module is installed.
 - A hidden or refused control says why on screen (`experiment-role-note`,
-  `create-not-allowed`, the 403 view's "requires ...").
+  `create-not-allowed`, the 403 view's "requires ..."), and says it only once it is sure: while
+  the effective map is loading, show neither the control nor the refusal.
 
 **UI**
 
@@ -939,8 +968,9 @@ judgement half is below.
   `jest-dom` matchers.
 - Pages mock `apiFetch` with `routedApi` (misses throw), `useRouter`, `useAuth`, `next/head`;
   hooks and services mock `global.fetch`/`WebSocket`; `mockReset` in `beforeEach`.
-- Playwright: the `journeys` project is the required `Browser E2E` PR check, `extended`
-  (accessibility) runs nightly, the `visual` spec is run by nothing yet; fixtures log in for real; page objects own selectors;
+- Playwright: the `journeys` project is the required `Browser E2E` PR check, `site` runs in
+  `Frontend Tests`, `extended` (accessibility) runs nightly, the `visual` spec is run by nothing
+  yet; fixtures log in for real; page objects own selectors;
   timestamped data; serial specs; snapshots updated only with a reviewed diff.
 - The URL guard passes; `npm run openapi:dump` after backend route changes.
 
@@ -1002,10 +1032,11 @@ It installs exactly the lock file and fails if `package.json` and the lock disag
 catching a forgotten `npm install` instead of silently resolving new versions.
 
 **Q7. Which Playwright tests can block a merge, and which cannot?**
-The `journeys` project (the eight `*.journey.spec.ts` files) and the `sso` project run in the
-required `Browser E2E` check on every pull request. The `extended` project — the accessibility
-audit — runs nightly; it does not gate a merge, though a failure fails the night. The `visual`
-project runs nowhere until its baseline screenshots are committed.
+The `journeys` project (the thirteen `*.journey.spec.ts` files) and the `sso` project run in the
+required `Browser E2E` check on every pull request, and the `site` project runs inside
+`Frontend Tests`. The `extended` project — the accessibility audit — runs nightly; it does not
+gate a merge, though a failure fails the night. The `visual` project runs nowhere until its
+baseline screenshots are committed.
 
 **Q8. Why does CI build and test the dashboard a second time with `EXPERIMENTLY_PROFILE=core`?**
 Every other step resolves `@modules/*` to the real modules first, so a core page that imports

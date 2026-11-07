@@ -8,7 +8,7 @@ Data in, data out. This Part is the services layer — one typed object per API 
 mirroring the backend's routes (Hour 14); the new-experiment form — one reducer behind a
 guided wizard and a single-page view, validation that mirrors the server, and failures mapped
 by status (Hour 15); lists with filters, offset pagination and lifecycle actions that keep
-the UI honest while a request is in flight and never offer what the user's role cannot do
+the UI honest while a request is in flight and never offer what the user may not do
 (Hour 16); and a WebSocket hook with reconnect, terminal close codes and a
 subprotocol token (Hour 17).
 
@@ -114,16 +114,51 @@ Note the query mapping — the client-side name `status` becomes the server's `s
 and `undefined` values are dropped by `buildQuery`, so an unset filter sends no parameter at
 all. Two methods carry a decision from the API into the client: `create` accepts options so
 one caller can opt out of the 401 redirect, and `delete` sends the `experiment_key` the route
-requires as a confirmation. Three more methods you did not see in the excerpt are worth a look in
+requires as a confirmation. More methods you did not see in the excerpt are worth a look in
 the file: `estimateSampleSize` (advice for the wizard's Estimate step, also with
-`redirectOn401: false`), `updateDetails` (a `PUT` whose body type, `ExperimentDetailsUpdate`, has
-room for the name, description and hypothesis only, because the update route replaces variants and
-metrics wholesale when a request carries them, so the type refuses to carry them), and `clone`
-(`POST .../clone` with no body). Those last two, with `delete`, are driven by one component,
-`ExperimentManageSection` on the detail page: Clone for a role that may create, and Edit details
-and Delete draft for a role that may change experiments. It is the same shape as Hour 15's
-create form in small: every failure is mapped by status to a fixed sentence in the page's own
-words (`ERROR_COPY`), and nothing the server wrote in an error body is shown.
+`redirectOn401: false`), `clone` (`POST .../clone` with no body), `schedule`
+(`PUT .../schedule` with only the dates that changed), and two more `PUT`s to the same URL as
+`update`.
+
+That last point is a small lesson in what a type is for. `update`, `updateDetails` and
+`updateDesign` all send `PUT /api/v1/experiments/{id}`, and they differ only in their body type:
+
+```typescript
+// 📁 frontend/src/services/experiments.ts
+/**
+ * The body of a details edit: the changed subset of these three fields and
+ * nothing else. The update route replaces variants and metrics wholesale when
+ * a request carries them, so this type has no room for either.
+ */
+export interface ExperimentDetailsUpdate {
+  name?: string;
+  description?: string | null;
+  hypothesis?: string | null;
+}
+...
+  /**
+   * `PUT /api/v1/experiments/{id}` with exactly `{variants, metrics}`, both
+   * complete. The API replaces both lists in one commit, on a DRAFT
+   * experiment only (400 otherwise, for every role); `buildDesignPayload`
+   * builds the body.
+   */
+  async updateDesign(id: string, body: ExperimentDesignUpdate): Promise<Experiment> {
+    return apiFetch<Experiment>(`${BASE}/${id}`, { method: 'PUT', json: body });
+  },
+```
+
+The server route is one function with a dangerous default — send `variants` and it replaces every
+variant — so the client gives each caller a body type that can say only what that caller means. A
+details edit *cannot* carry variants by accident; it would not compile. `Partial<Experiment>`
+(the general `update`) can say anything; its one caller outside the tests, the targeting section,
+passes a literal `{ targeting_rules: ... }`, so what it sends is at least visible where it is sent.
+
+Those methods, with `delete`, are driven by one component, `ExperimentManageSection` on the detail
+page, and each button is offered by its own permission check: **Clone** for a user who may create
+experiments; **Schedule**, **Edit details** and **Edit variants and metrics** for a user who may
+change them, and only on a draft; **Delete draft** for a user who may delete them. It is the same
+shape as Hour 15's create form in small: every failure is mapped by status to a fixed sentence in
+the page's own words (`ERROR_COPY`), and nothing the server wrote in an error body is shown.
 
 A service that also owns the **normalisation** of two backend shapes for one resource — the
 comment explains a real inconsistency and the helpers hide it from pages:
@@ -184,6 +219,7 @@ export class ResultsService {
         correction_method: params?.correction_method,
         confidence_level: params?.confidence_level,
       },
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     });
   }
   ...
@@ -206,11 +242,17 @@ export class ResultsService {
         confidence_level: overrides?.confidence_level,
         correction_method: overrides?.correction_method,
       },
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     });
   }
   ...
 }
 ```
+
+Every method in this class passes `timeoutMs: LONG_REQUEST_TIMEOUT_MS`: computing results can take
+longer than `apiFetch`'s 30-second default (Hour 3), and these routes are reads or safe to repeat,
+which is the condition `api.ts` sets for the long deadline. The deadline is a property of the route,
+so the service is where it is chosen; no page or component passes one.
 
 `getResults` takes a typed `ResultsQuery`: `correction_method` and `confidence_level` are optional,
 and a setting left out is the experiment's own stored one (the results dashboard reads them from the
@@ -258,6 +300,15 @@ paths against the API:
 ```bash
 cd frontend && npm run openapi:dump && grep -o '"/api/v1/rollout-schedules[^"]*"' src/tests/fixtures/openapi.json | sort -u
 ```
+
+Then compare with the real one, which arrived with the flag page's rollout section:
+`frontend/src/services/rolloutSchedules.ts`. Three differences are worth a minute each. It has no
+`list` or `get`: the flag page reads schedules through `FeatureFlagsService.listRolloutSchedules`,
+filtered by the flag, and the comment at the top says so. Its request types are narrower than the
+API's: `DashboardTrigger` is `'manual' | 'time_based'`, because a `metric_based` stage "never starts
+by itself" and the dashboard does not offer one. And its header names the permission every route
+needs (UPDATE on the schedule's flag) and the date format it sends (naive UTC, which the API reads
+as UTC). A service file is where those facts belong: next to the calls they govern.
 
 ### Common mistakes
 
@@ -323,13 +374,18 @@ The page owns the state and the submit, and picks a view:
 export default function NewExperimentPage() {
   const router = useRouter();
   const auth = useOptionalAuth();
+  const { effective, loading: permissionsLoading } = useEffectivePermissions();
   const [state, dispatch] = useReducer(experimentFormReducer, undefined, createInitialFormState);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<CreateError | null>(null);
   ...
+  const allowed = canCreateExperiment(auth?.user, effective);
+
   // Nothing reads the query before the router has it: a static export renders
-  // first with an empty one, which would drop `?advanced` and `?step`.
-  if (!router.isReady) {
+  // first with an empty one, which would drop `?advanced` and `?step`. Nor is
+  // the notice shown while the effective map may still add EXPERIMENT CREATE
+  // (#891): neither the notice nor the form until it answers.
+  if (!router.isReady || (!allowed && permissionsLoading)) {
     return (
       <div className="flex-1 bg-slate-50">
         <PageTitle title="New Experiment" />
@@ -342,16 +398,17 @@ export default function NewExperimentPage() {
 
   // `?advanced` carries no value, so it parses to "" — check for the key.
   const advanced = 'advanced' in router.query;
-  const allowed = canCreateExperiment(auth?.user);
 ```
 
 Three details to notice. The page renders nothing but a loading marker until `router.isReady`
 (Hour 12): on a static export `query` is `{}` on the first render, which would silently drop
 `?advanced`. `'advanced' in router.query` checks for the key, because `?advanced` has no value
-and parses to `""`, which is falsy. And `canCreateExperiment(auth?.user)` decides whether to
-show a form at all: an ANALYST or VIEWER gets a notice (`data-testid="create-not-allowed"`)
-saying their role can view experiments but not create them, because the API would refuse the
-create (Hour 16).
+and parses to `""`, which is falsy. And `canCreateExperiment(auth?.user, effective)` decides
+whether to show a form at all: a user whose role does not create experiments, and who holds no
+grant that does, gets a notice (`data-testid="create-not-allowed"`) saying their role can view
+experiments but not create them, because the API would refuse the create (Hour 16). The loading
+branch waits for that answer too: while the effective map (Hour 9) might still add `experiment:
+create`, the page shows neither the notice nor the form.
 
 The client-side mirror of the server's validators, split at its seams so a step can check
 only its own part:
@@ -369,6 +426,8 @@ export function checkVariants(variants: VariantFormData[]): string | null {
   if (!variants.some((v) => v.is_control)) return 'One variant must be marked as control.';
   const total = allocationTotalOf(variants);
   if (total !== 100) return `Variant allocations must add up to 100% (currently ${total}%).`;
+  const empty = variants.findIndex(hasNoShare);
+  if (empty >= 0) return `“${variants[empty].name.trim()}”: ${ZERO_SHARE}`;
   const problems = configurationProblems(variants);
   const first = problems.findIndex((p) => p !== null);
   if (first >= 0) {
@@ -400,7 +459,11 @@ export function validateForm(
 ```
 
 `??` chains the checks: the first non-null message wins, in the order name, variants, metrics.
-Compare with the server:
+One check here is the client's own: a variant at 0% passes the sum and is refused anyway
+(`ZERO_SHARE`, "This version gets 0% of traffic. Give it a share, or remove it."). Its doc comment
+gives the reason: "the API accepts it, but no user is ever assigned to it". A mirror may be
+*stricter* than the server when the thing it refuses can only be a mistake; it must never be
+looser. Compare with the server:
 
 ```python
 # 📁 backend/app/schemas/experiment.py
@@ -465,6 +528,7 @@ The payload builder is a pure function of the state:
 // 📁 frontend/src/components/experiments/new/formState.ts
 export function buildCreatePayload(state: ExperimentFormState): CreateExperimentRequest {
   const { name, key, description, hypothesis, type, rules, variants, metrics } = state;
+  const plannedEffect = plannedEffectFraction(state.plannedEffectPct);
   const payload: CreateExperimentRequest = {
     name: name.trim(),
     key: (key || generateKey(name)).trim() || undefined,
@@ -494,18 +558,21 @@ export function buildCreatePayload(state: ExperimentFormState): CreateExperiment
         is_primary: m.is_primary,
       };
       if (m.is_primary && plannedEffect !== undefined) metric.expected_effect = plannedEffect;
+      // Sent only when true; without it the API stores false.
+      if (m.lower_is_better === true) metric.lower_is_better = true;
       return metric;
     }),
     confidence_level: state.confidenceLevel,
     correction_method: state.correctionMethod,
   };
   if (state.bayesianEnabled) payload.bayesian_enabled = true;
+  if (state.sequentialEnabled) payload.sequential_testing_enabled = true;
   return payload;
 }
 ```
 
-`const plannedEffect = plannedEffectFraction(state.plannedEffectPct);` (a line the excerpt leaves
-out) turns what the user typed on the Estimate step into a fraction, or `undefined`.
+`plannedEffectFraction(state.plannedEffectPct)` turns what the user typed on the Estimate step
+into a fraction, or `undefined`.
 `const payload: CreateExperimentRequest = {...}` — annotating the payload makes the compiler
 check it against the mirror of `ExperimentCreate`, so a missing required field is a build
 error. `rules as unknown as Record<string, unknown>` is a double assertion: the rule builder's
@@ -520,8 +587,10 @@ variant's `configuration` is typed as JSON text (`configuration_text`), parsed b
 UTF-16 units: "é" would count as one byte instead of two); a blank box leaves the key out, and an
 array, a string or `null` is refused on the client because the API refuses it too. And the planned
 effect goes on the primary metric only, as `expected_effect`; with none, no metric carries the key
-at all. The state also holds the results settings the user chose on the same step: `confidenceLevel`
-and `correctionMethod` are always sent, `bayesian_enabled` only when switched on. The pattern
+at all. A metric's `lower_is_better` (for a metric where less is the win, such as a load time) is
+the same idea: sent only when true, because "without it the API stores false". The state also holds
+the results settings the user chose on the same step: `confidenceLevel` and `correctionMethod` are
+always sent, `bayesian_enabled` and `sequential_testing_enabled` only when switched on. The pattern
 is the one this Hour started with: a client-side check in the API's own terms, and a payload that
 says nothing the user was not asked.
 
@@ -536,6 +605,9 @@ The submit — one function for both views:
     const problem = validateForm(state.name, state.variants, state.metrics);
     if (problem) {
       setError({ message: problem });
+      if (configurationProblems(state.variants).some((p) => p !== null)) {
+        setRevealProblems((n) => n + 1);
+      }
       return;
     }
 
@@ -572,7 +644,11 @@ The submit — one function for both views:
   };
 ```
 
-Read it as a pipeline. Validate the form, then the targeting rules (`checkTargeting` finds a
+Read it as a pipeline. Validate the form — and if a variant's configuration is the problem, bump
+`revealProblems`, the counter `VariantsEditor` watches (Hour 6) to open that row and focus its
+field, so the problem never sits inside a closed section. A counter rather than a boolean, because
+the child must react to *every* refusal, including a second one in a row; `true` → `true` is no
+change. Then validate the targeting rules (`checkTargeting` finds a
 blank attribute, operator or value, or a group with no conditions, and the problems are shown
 at the rule builder, not at the foot of the form). Guard against a double submit with a
 **ref** as well as state: `submittingRef.current` changes synchronously, so a second click
@@ -611,7 +687,8 @@ export function describeCreateError(err: unknown, sentKey: string | undefined, v
   ("Group 1, Condition 2: unknown operator") and shown at the rules; any other item in the
   same 422 is kept and shown at the foot.
 - **any other `ApiError`**: the message `apiFetch` built — for a server error, it carries the
-  request ID (Hour 3).
+  request ID; for a create that timed out, it says the request "may or may not have been
+  carried out" and asks the user to reload and check (Hour 3).
 - **an exception that is not an API answer**: `CREATE_FAILED`, “Something went wrong while
   creating the experiment. Check the experiments list before trying again.” The exception's own
   text is never shown, and the sentence says what the page genuinely does not know: whether the
@@ -621,6 +698,120 @@ That refines the Creed's rule 5. "Show the server's message when they disagree" 
 default, but where the **status alone** says what happened and what to do, the page says it
 in its own words and offers the fix. It never reads the words of an error to decide what it
 is: the wording can change, the status code is the contract.
+
+#### The same rules in four newer forms
+
+The dashboard has gained four forms since the create form was written, and each one is the rules
+above applied to a new shape. Read them as worked examples.
+
+**Edit variants and metrics, on a draft.** `ExperimentDesignForm` is the create form's reducer and
+editors again (Hour 6), started from the stored experiment. What it adds is a rule about *not*
+sending:
+
+```tsx
+// 📁 frontend/src/components/experiments/ExperimentDesignForm.tsx
+  const [state, dispatch] = useReducer(experimentFormReducer, experiment, formStateFromExperiment);
+  // What an unchanged form would send; a save equal to it sends nothing.
+  const [seeded] = useState(() => JSON.stringify(buildDesignPayload(formStateFromExperiment(experiment))));
+  ...
+    const body = buildDesignPayload(state);
+    if (JSON.stringify(body) === seeded) {
+      onCancel();
+      return;
+    }
+```
+
+`seeded` is a snapshot taken once, by a lazy initialiser, and never updated — a value, not state,
+so its setter is not even named. Saving a form nobody changed closes it without a request. Before
+that, `checkDesign` runs guided setup's own checks and stricter ones of its own (at least two
+variants, exactly one control, exactly one primary), and a refusal moves focus to the field it is
+about. The save
+itself is the one `PUT` of exactly `{variants, metrics}` from Hour 14.
+
+**A flag's rollout schedule.** `RolloutScheduleManager` on the flag page creates and runs a
+schedule (stages that raise the flag's percentage over time). Its validator is the clearest case
+of a client mirror that is deliberately *stricter* than the server, with the reason written down:
+
+```tsx
+// 📁 frontend/src/components/feature-flags/RolloutScheduleManager.tsx
+/**
+ * The whole stage list, as it would be after a change, checked the way the
+ * API checks a new schedule and more: every stage named, every target a whole
+ * number from 0 to 100, and no target below the one before it, in
+ * `stage_order`. The API checks the order only on create, and by list
+ * position, so the form runs this before every create, add and update. A
+ * target above `max` (the schedule's `max_percentage`) is refused too.
+ */
+export function checkStages(stages: Array<{ name: string; target: string }>, max: number): StageProblem[] {
+...
+/**
+ * A `datetime-local` value as naive UTC, `YYYY-MM-DDTHH:MM:SS`, with no `Z` and
+ * no offset. Stage dates are sent as naive UTC; the API takes a value with no
+ * zone as UTC (`UTCDateTime`).
+ */
+export function localInputToNaiveUtc(value: string): string | null {
+  const d = localInputToDate(value);
+  return d ? d.toISOString().slice(0, 19) : null;
+}
+...
+/**
+ * The fixed sentence for a failed request, chosen by the answer's status only;
+ * a time-out shows the dashboard's own time-out sentence (#1040).
+ */
+export function rolloutErrorCopy(err: unknown): string {
+  if (!isApiError(err)) return ROLLOUT_ERROR_COPY.fallback;
+  if (err.timedOut) return err.message;
+  if (err.status === 0) return UNREACHABLE;
+  return ROLLOUT_ERROR_COPY[err.status] ?? ROLLOUT_ERROR_COPY.fallback;
+}
+```
+
+Three habits in three functions. `checkStages` validates the list *as it would be after the
+change*, so editing stage 2 cannot quietly put it below stage 1. `localInputToNaiveUtc` is Hour 4's
+time-zone trap from the other side: a `<input type="datetime-local">` holds a time with no zone, in
+the browser's zone, and the function turns it into the zone-less UTC the API expects (another
+helper, `readBack`, then shows the user both: "Saved as Mon, Nov 2, 2026, 9:00 AM PST (17:00
+UTC)."). And `rolloutErrorCopy` is the create form's status mapping with Hour 3's ordering rule: a
+time-out is checked before `status === 0`, because both are `0`. The update, like every edit form
+here, sends only what changed (`stageChanges`: "The update body: exactly the fields that
+changed.").
+
+**Exclusion groups and the global holdout.** The two pages under `/experiments/` follow the same
+pattern (fixed copy by status, only the changed fields sent), and one detail in
+`frontend/src/utils/exclusionGroups.ts` is worth stealing. A group's share
+of traffic is stored as a fraction (`0.5`) and edited as a whole percent (`50`), and
+`groupChanges` compares "the share ... as the whole percent the form showed, so saving an
+unchanged form never rounds a stored 0.333 to 0.33". Compare the value the user *saw*, not the
+value you converted it into, or a save with no change becomes a change.
+
+**Your API keys.** `/account/api-keys` lets any user make keys of their own, including one with the
+`mcp:read` scope (for tools such as the Controlvar MCP server). Ticking that box changes which
+expiry choices are offered — "No expiry" is not one for an `mcp:read` key — and the form keeps its
+state consistent without an effect. The checkbox's own `onChange` clears a "No expiry" pick as it
+ticks the box ("the default takes its place"), and the value the select shows is derived:
+
+```typescript
+// 📁 frontend/src/components/account/ownKeyExpiry.ts
+/**
+ * The choice in effect: what the user picked, if it is offered for this key,
+ * otherwise the default. `null` means the user has not picked one.
+ */
+export function effectiveExpiry(picked: ExpiryChoice | null, mcpRead: boolean): ExpiryChoice {
+  if (picked !== null && expiryOptions(mcpRead).some((option) => option.value === picked)) return picked;
+  return defaultExpiry(mcpRead);
+}
+```
+
+The component keeps `pickedExpiry` in state and computes
+`const expiry = effectiveExpiry(pickedExpiry, mcpRead);` on every render — Hour 6's "derive, don't
+duplicate". Compare the alternative: an effect that watched `mcpRead` and corrected the expiry
+would run after the render that needed it, so for one painted frame the select would hold a choice
+the key cannot have. A change made in the event handler, plus a value derived during render, has
+no such frame. The scope's value, label and help text live in one
+file, `frontend/src/components/admin/api-keys/mcpReadScope.ts`, which the admin dialog and this
+page both import, so the two screens cannot describe the scope differently. One honest caveat: the
+API-key components call `apiFetch` themselves with a path constant (`OWN_KEYS_API_PATH`) instead of
+going through a service, which is the exception to Hour 14's rule rather than the rule.
 
 > **Watch Out!** A `<form>` without `e.preventDefault()` in its submit handler reloads the
 > page — and Next's dev server makes that look like "my state disappeared." The single-page
@@ -675,7 +866,12 @@ cd frontend && npx jest src/tests/components/experiment-form-state.test.ts src/t
   `validateStep` and `maxReachableStep` gate the wizard.
 - `submit(view)`: validate, check targeting, ref-guarded send with `redirectOn401: false`,
   `describeCreateError` by status, navigate with a hard-navigation fallback.
-- Role first: `canCreateExperiment` shows a notice instead of a form the API would refuse.
+- Permission first: `canCreateExperiment(user, effective)` shows a notice instead of a form the
+  API would refuse, and neither while the answer is still coming.
+- The newer forms repeat the rules: reuse the reducer (`ExperimentDesignForm`), send nothing for
+  an unchanged form, validate the list as it will be (`checkStages`), compare what the user saw
+  (`groupChanges`), derive rather than repair state (`effectiveExpiry`), and check `timedOut`
+  before `status === 0`.
 
 ---
 
@@ -703,7 +899,7 @@ The list fetch — one hook, the filter in the deps:
 ```tsx
 // 📁 frontend/src/pages/experiments/index.tsx
   const [statusFilter, setStatusFilter] = useState<ExperimentStatus | 'all'>('all');
-
+  ...
   const { data, loading: isLoading, error } = useApi<ExperimentListResponse>(
     () => ExperimentsService.list(statusFilter !== 'all' ? { status: statusFilter } : undefined),
     [statusFilter],
@@ -789,58 +985,104 @@ const ACTION_META: Record<
 };
 ```
 
-#### Who may act: by role, not by ownership
+#### Who may act: by permission, not by ownership
 
 Which buttons a user sees depends on two things: the experiment's status
-(`ACTIONS_BY_STATUS`) and the user's **role**. Access to experiments, like access to feature
-flags, is by role: ADMIN and DEVELOPER (or a superuser) may create, start, pause, complete and
-archive any experiment; ANALYST and VIEWER may read all of them and change none, including
-ones they created. The dashboard mirrors that rule in one small module, so the list, the form
-and the detail page cannot disagree:
+(`ACTIONS_BY_STATUS`) and what the user **may do**. Access to experiments, like access to feature
+flags, is by permission, and a permission comes from one of three places. A superuser has all of
+them. A built-in role has a fixed set: ADMIN and DEVELOPER may create, start, pause, complete and
+archive any experiment; ANALYST and VIEWER may read all of them and change none, including ones
+they created. And in the full profile a custom role or a direct grant can **add** a permission to
+anyone — `experiment: update` for an ANALYST, say (only experiment and feature-flag create, read,
+update, delete and list, and audit-log read, can be granted). The dashboard mirrors that rule in one
+small module, so the list, the forms and the detail page cannot disagree:
 
 ```typescript
 // 📁 frontend/src/utils/experimentPermissions.ts
 const ROLES_THAT_CAN_CHANGE = ['ADMIN', 'DEVELOPER'] as const;
 
-export function canChangeExperiment(
-  user: { role?: string | null; is_superuser?: boolean } | null | undefined,
-): boolean {
+export function canChangeExperiment(user: PermissionUser, effective?: EffectivePermissions): boolean {
   // No session yet: keep the buttons rather than flickering them in; the
   // API still decides.
   if (!user) return true;
   if (user.is_superuser) return true;
-  return ROLES_THAT_CAN_CHANGE.includes(user.role as 'ADMIN' | 'DEVELOPER');
+  return (
+    ROLES_THAT_CAN_CHANGE.includes(user.role as 'ADMIN' | 'DEVELOPER') ||
+    holds(effective, 'experiment', 'update')
+  );
 }
 ```
 
-`canCreateExperiment` is its twin for creation. The list page hides "+ New Experiment"
-(`data-testid="new-experiment-btn"`) when it is false, and `/experiments/new` shows a notice
-instead of the form (Hour 15). The detail page keeps the status's actions but offers none, and
-explains why instead of leaving an unexplained gap:
+The last line is the whole effective-permissions change on the client: the role list **or** the
+user's own map, read by `holds` from `frontend/src/utils/effectivePermissions.ts`, whose header
+states the formula every helper follows —
+`allowed = is_superuser || ROLE_LIST.includes(role) || holds(effective, resource, action)` — and the
+fail-closed reading of a missing map ("only the role lists apply, so the dashboard is never more
+permissive than the API"). The role list is still pinned from the other side:
+`backend/tests/unit/core/test_dashboard_experiment_roles.py` reads this TypeScript file as text
+and holds `ROLES_THAT_CAN_CHANGE` equal to the roles `permissions.py` gives EXPERIMENT UPDATE (and
+DELETE), so a role added on one side only fails a Python test instead of offering a button the API
+refuses.
+
+`canCreateExperiment` is its twin for creation and `canDeleteExperiment` for deleting a draft, each
+asking about its own action, because a grant can give one without the other. The list page hides
+"+ New Experiment" (`data-testid="new-experiment-btn"`) when creation is not allowed, and
+`/experiments/new` shows a notice instead of the form (Hour 15). The detail page keeps the status's
+actions but offers none, and explains why instead of leaving an unexplained gap:
 
 ```tsx
 // 📁 frontend/src/pages/experiments/[id].tsx
   const statusActions = ACTIONS_BY_STATUS[status] ?? [];
-  const mayChange = canChangeExperiment(user);
-  // Offer only what the API would accept: a role without EXPERIMENT UPDATE is
-  // refused every lifecycle change, including on an experiment it owns.
+  const mayChange = canChangeExperiment(user, effective);
+  // Not refused yet: the effective map may still add EXPERIMENT UPDATE (#891).
+  // Until it answers the page shows neither the buttons nor the note.
+  const mayChangePending = !mayChange && permissionsLoading;
+  // Offer only what the API would accept: a user without EXPERIMENT UPDATE
+  // (by role, custom role or direct grant) is refused every lifecycle change,
+  // including on an experiment they own.
   const actions = mayChange ? statusActions : [];
   // A null owner (the creator's account was removed) is nobody, so it is
   // never you.
   const isOwner =
     user !== null && experiment.owner_id !== null && user.id === experiment.owner_id;
   const resultsAvailable = status !== 'draft';
-  const showRoleNote = !mayChange && statusActions.length > 0;
+  const showRoleNote = !mayChange && !mayChangePending && statusActions.length > 0;
 ```
 
 `showRoleNote` renders `data-testid="experiment-role-note"`: "Starting, pausing, completing
-and archiving an experiment requires the ADMIN or DEVELOPER role; you are ANALYST. You can read
-its results." `isOwner` only changes the wording ("You own this experiment, but ..."). Two
-principles are at work. **The UI is never more permissive than the API**: a button that always
-answers 403 is a bug, even though the API is what enforces. And **a hidden control needs a
-reason on screen**, or the user thinks the page is broken. (A user with a custom role or a
-direct grant is offered only what their built-in role allows — under-offering is the safe
-direction.)
+and archiving an experiment needs permission to change experiments, which the ADMIN and
+DEVELOPER roles have; you are ANALYST. You can read its results." `isOwner` only changes the
+wording ("You own this experiment, but ..."). Three principles are at work. **The UI is never more
+permissive than the API**: a button that always answers 403 is a bug, even though the API is what
+enforces. **A hidden control needs a reason on screen**, or the user thinks the page is broken. And
+**a refusal is shown only once it is certain**: `mayChangePending` keeps both the buttons and the
+note off the screen while the map that might admit the user is on its way (Hour 9), so an ANALYST
+with a grant never reads "you may not" a moment before the buttons appear. The note's words follow
+the same rule as the code: they name the permission ("permission to change experiments") and
+mention the roles as the usual holders of it, because a role is no longer the only way to get one.
+
+Not every control can be granted. The global holdout and archiving an exclusion group check the
+ADMIN role itself on the server (`_require_admin`), so their helper takes no map at all:
+
+```typescript
+// 📁 frontend/src/utils/experimentPermissions.ts
+const ROLES_THAT_ADMINISTER_ELIGIBILITY = ['ADMIN'] as const;
+
+export function canAdministerEligibility(
+  user: { role?: string | null; is_superuser?: boolean } | null | undefined,
+): boolean {
+  if (!user) return false;
+  if (user.is_superuser) return true;
+  return ROLES_THAT_ADMINISTER_ELIGIBILITY.includes(user.role as 'ADMIN');
+}
+```
+
+Read its first line against `canChangeExperiment`'s. For a lifecycle button, no session yet means
+`true` ("keep the buttons rather than flickering them in; the API still decides"), and inside the
+dashboard that branch is hardly reached, since `RequireAuth` renders a protected page only once the
+user is known. For an administrative control the default is `false`: "these controls appear only
+once the user is known to be an ADMIN or a superuser". Which way a helper answers when it does not
+know yet is a decision, and the file writes it down beside each one.
 
 A "copy" affordance with a transient state — `copied` flips on for 1.5 seconds, and the
 clipboard being unavailable is swallowed rather than surfaced:
@@ -958,8 +1200,10 @@ watch the buttons change to "Archive" only after the response arrives.
 - **Local status updates instead of the server's response.**
 - **`window.confirm`** — untestable, unstyled; use inline state.
 - **Refetching the whole list for one row change** when updating that one row in state will do.
-- **Gating on ownership** (`isOwner`) instead of role, or **hiding a control without saying
-  why**.
+- **Gating on ownership** (`isOwner`) instead of permission, or **hiding a control without
+  saying why**.
+- **Reading only `user.role`** where the API also admits a custom role or a direct grant —
+  pass the effective map, and keep a pending state while it loads.
 
 ### Key takeaways
 
@@ -967,8 +1211,11 @@ watch the buttons change to "Archive" only after the response arrives.
 - Actions: pending label + disabled buttons + inline confirm + the server's response as new
   state + `finally` to clear.
 - Index services by action name when the action union equals the method names.
-- Offer actions by role (`canChangeExperiment`, `canCreateExperiment`), mirroring the API, and
-  explain a hidden control (`experiment-role-note`).
+- Offer actions by permission (`canChangeExperiment(user, effective)`, `canCreateExperiment`,
+  `canDeleteExperiment`): the role list or the effective map, mirroring the API; show neither
+  control nor note while the map is pending; explain a hidden control (`experiment-role-note`).
+- A control the API keeps for the ADMIN role itself (`canAdministerEligibility`) takes no map and
+  answers `false` until the user is known.
 - Tests pin transitions with a stateful routed mock.
 
 ---
@@ -1239,6 +1486,17 @@ own words and offers the fix. It never parses an error's words to decide what it
 **Q8. Why does the new-experiment page render only a loading marker until `router.isReady`?**
 On a static export the first render has an empty `query`, so `'advanced' in router.query` would
 be false and a `?step=` would be lost; waiting for the router keeps the view the URL asked for.
+
+**Q9. `updateDetails` and `updateDesign` send the same `PUT` to the same URL. Why two methods?**
+Because the route replaces every variant and metric when a body carries them. Each method's body
+type can say only what its caller means: `ExperimentDetailsUpdate` has no room for variants, and
+`updateDesign` takes exactly `{variants, metrics}`, both complete. A details edit cannot replace
+the variants by accident; it would not compile.
+
+**Q10. An exclusion group stores a share of `0.333`. The user opens the edit form, which shows
+33, changes only the name and saves. Is `traffic_allocation` sent?**
+No. `groupChanges` compares the share as the whole percent the form showed (33 = 33), so only the
+name is sent and the stored 0.333 is not rounded to 0.33.
 
 **Quiz.** In `ResultsService.getResults`, why `params?.breakdown || undefined` rather than
 `??`?
