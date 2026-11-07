@@ -435,13 +435,29 @@ Hour 2: an experiment with no public `key` (`None` or `""`) falls back to its UU
 
 ```python
 # 📁 backend/app/schemas/rollout_schedule.py
-        stage_percentages = [stage.target_percentage for stage in self.stages]
+        # Check that the targets do not decrease in stage_order, whatever
+        # order the list is in: the scheduler starts stages by stage_order
+        # (#1460). A stable sort, so stages that share an order (refused
+        # below) are compared in list order.
+        stage_percentages = [
+            stage.target_percentage
+            for stage in sorted(self.stages, key=lambda stage: stage.stage_order)
+        ]
         if not all(a <= b for a, b in zip(stage_percentages, stage_percentages[1:])):
-            raise ValueError("Stage percentages must be non-decreasing")
+            raise ValueError("Stage percentages must be non-decreasing in stage_order")
 ```
 
 `zip(xs, xs[1:])` pairs each element with its successor; `all(...)` is `True` if every pair
 satisfies the condition. (The inner expression is a generator — Hour 16.)
+
+The interesting part is the question the loop can't answer for you: neighbours _in which
+order_? A rollout request carries its stages as a list, and each stage also carries its own
+`stage_order`. Until v0.40.0 the check compared the stages in list order, which is not the
+order the scheduler runs them in. So `[{stage_order: 2, target_percentage: 10},
+{stage_order: 1, target_percentage: 50}]` passed (10, then 50, looks non-decreasing) and
+then ran backwards: 50%, then 10% (#1460). The fix is one `sorted(..., key=...)` (Hour 5)
+before the walk. A comparison of neighbours is only as right as the order you put them in,
+and the order that matters is the one the _consumer_ uses, not the one the data arrived in.
 
 A `while` with `break`, and the zero trap avoided on purpose:
 
@@ -797,7 +813,9 @@ build the cumulative `distribution` list, then write `pick(bucket)` that returns
 variant name for a bucket, falling through to the last variant.
 
 **E1.4 — Non-decreasing.** Write `non_decreasing(xs) -> bool` using `zip` and `all`, and
-show it on `[5, 25, 50, 100]` and `[5, 50, 25]`.
+show it on `[5, 25, 50, 100]` and `[5, 50, 25]`. Then take
+`stages = [{"stage_order": 2, "target": 10}, {"stage_order": 1, "target": 50}]` and show that
+the targets pass in list order and fail in `stage_order`.
 
 **E1.5 — Keyword-only.** Write `track(user_id, event_name, *, value=None, properties=None)`
 that returns a dict with only the keys that were provided, using the `None` default
@@ -860,7 +878,13 @@ def non_decreasing(xs) -> bool:
 
 non_decreasing([5, 25, 50, 100])   # True
 non_decreasing([5, 50, 25])        # False
+
+stages = [{"stage_order": 2, "target": 10}, {"stage_order": 1, "target": 50}]
+non_decreasing([s["target"] for s in stages])                                          # True: list order
+non_decreasing([s["target"] for s in sorted(stages, key=lambda s: s["stage_order"])])  # False: run order
 ```
+
+The second pair is the rollout bug from Hour 3: the same data, two orders, two answers.
 
 **S1.5**
 
