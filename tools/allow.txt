@@ -14,3 +14,9 @@ V2 | learn-react-nextjs-in-24-hours/part-3-nextjs.md | @modules import alias, no
 # frontend/scripts/nginx-routes.mjs and frontend/scripts/prune-marketing-site.mjs, both present at REF.
 V2 | learn-react-nextjs-in-24-hours/part-3-nextjs.md | path relative to frontend/ (WORKDIR /app/frontend); frontend/scripts/nginx-routes.mjs exists at REF | && node scripts/nginx-routes.mjs --out /app/nginx/routes.conf \
 V2 | learn-react-nextjs-in-24-hours/part-6-production.md | path relative to frontend/ (WORKDIR /app/frontend); frontend/scripts/nginx-routes.mjs exists at REF | && node scripts/nginx-routes.mjs --out /app/nginx/routes.conf \
+
+# V2: verbatim lines of CLAUDE.md. The first names a test file that never existed, which is what the quote is
+# about (`git log --all -- <path>` at REF prints nothing); frontend/node_modules is what `npm ci` creates, never committed.
+V2 | using-ai-tools-effectively/chapter-2-instructions-that-work.md | CLAUDE.md quoted verbatim saying this file never existed; that absence is the lesson | and `backend/tests/unit/metrics/test_metrics_imports.py` were cited here for
+V2 | using-ai-tools-effectively/chapter-5-checking-claims.md | CLAUDE.md quoted verbatim; frontend/node_modules is created by npm ci, never committed | no `frontend/node_modules`.
+V2 | using-ai-tools-effectively/chapter-6-tamper-testing.md | CLAUDE.md quoted verbatim; frontend/node_modules is created by npm ci, never committed | Cheap moves that would have caught all three: `mv frontend/node_modules` aside
