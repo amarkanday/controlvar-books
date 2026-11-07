@@ -14,8 +14,8 @@ asking what actually removes it (Hour 9).
 Two ground rules. First, this is engineering practice, not certification or legal advice: nothing here
 interprets a regulation. Second, each lesson separates **implemented** controls (you can point at the line
 or the test) from **recommended practice** (a procedure you must provide). The distinction is the point.
-Keep the app clone at v0.36.4 open; the Try It Yourself blocks use the same environment variables as
-Part I and run without a database.
+Keep the app clone at this book's pin, `09d815ea`, open; the Try It Yourself blocks use the same
+environment variables as Part I and run without a database.
 
 ---
 
@@ -37,9 +37,12 @@ It does not say that *this actor* may do *this action* to *this object*, and it 
 happens to the object when the answer is no.
 
 Credentials also differ in kind. A user's access token is for people at a keyboard and expires. An API key
-is for programs, lasts until deleted, and (at v0.36.4) authenticates only on the endpoints an SDK calls:
-the app's key documentation says a key on a management route is refused with `401` and the same body as a
-request with no login at all. Do not accept either credential everywhere "because both resolve to a user".
+is for programs and lasts until it is deleted or expires. It authenticates on the endpoints an SDK calls
+and, with the `mcp:read` scope, on four read operations (the flag list, the experiment list, one
+experiment, its results). Everywhere else it is refused: the app's key documentation says that creating or
+changing flags and experiments, and managing users, "take a user login; an API key there is refused with
+401" and the same body as a request with no login at all. Do not accept either credential everywhere
+"because both resolve to a user".
 
 #### A story: the scope that checks the key you hold
 
@@ -47,20 +50,44 @@ API keys carry a comma-separated `scopes` string. Several writers fill it, and t
 literals like `"read,write"`. A tempting design would check whether the key's *owner* holds some key with
 the scope. Controlvar's `sdk:ruleset` check deliberately does not: it re-hashes the `X-API-Key` header and
 reads **that one row**, so "another key of the same user carrying the scope grants nothing". And the scope
-works only while the key's owner can change feature flags, checked on every request, so demoting the owner
-takes effect on the next call. The story is the shape of a good boundary: decide on the credential
-*presented*, and re-derive the owner's authority every time.
+works only while the key's owner can change feature flags, checked on every request, so demoting the owner,
+or revoking the custom grant that gave them the right, takes effect on the next call. The story is the
+shape of a good boundary: decide on the credential *presented*, and re-derive the owner's authority every
+time.
 
-> **Did You Know?** Of all the scope strings a key can carry, exactly one is enforced. The source says so
-> in a comment: `sdk:ruleset` is "the one scope name the platform enforces". `read` and `write` are stored,
-> parsed and ignored by routes. A label is not least privilege unless a route checks it.
+> **Did You Know?** Of all the scope strings a key can carry, exactly two are enforced. The source says so
+> in a comment: "The two scope names the platform enforces. Any other name is a label." They are
+> `sdk:ruleset` and `mcp:read`. `read` and `write` are stored, parsed and ignored by routes. A label is not
+> least privilege unless a route checks it.
+
+The second scope teaches the other half of that sentence. `mcp:read` was a label too, until the release
+that made four read operations check it, and the key documentation states the consequence: "Keys already
+labelled `mcp:read` gain that access when the instance is upgraded to a version that enforces the scope."
+Nothing re-reads a stored label when a route starts checking it. Turning a label into a control is a
+change to every row that already carries it, so list those rows before you ship it (an ADMIN can, with
+`GET /api/v1/api-keys?all=true`). The custom-role code says the same about its own allow-list: "Widening
+this set activates, at once, every pair already stored in an active custom role or direct grant that
+holds it: nothing re-checks a stored row."
 
 ### How Controlvar does it
 
-#### One scope, enforced on the presented key
+#### Two scopes, each enforced on the presented key
 
 ```python
 # 📁 backend/app/api/sdk_scope.py
+def may_use_server_key(user: User) -> bool:
+    """Whether *user* may own a server-side key (the ``sdk:ruleset`` scope).
+
+    The one rule for creating such a key, for ``GET /sdk/ruleset``, ``POST
+    /tracking/evaluations``, batch assignment and whether an error report
+    counts toward rollback: the user can change feature flags. In the full
+    profile a custom role or direct grant of ``feature_flag (update)`` gives
+    that too; for the four built-in roles it is ADMIN and DEVELOPER (and a
+    superuser), as before custom roles took effect.
+    """
+    return check_permission(user, ResourceType.FEATURE_FLAG, Action.UPDATE)
+
+
 def scope_refusal(db: Session, api_key: APIKey) -> Optional[str]:
     """Why ``api_key`` may not act as a server-side key, or ``None`` if it may.
 
@@ -71,28 +98,43 @@ def scope_refusal(db: Session, api_key: APIKey) -> Optional[str]:
     if not has_scope(api_key.scopes, SDK_RULESET_SCOPE):
         return MISSING_SCOPE_DETAIL
     owner = db.query(User).filter(User.id == api_key.user_id).first()
-    if (
-        owner is None
-        or not owner.is_active
-        or not check_permission(owner, ResourceType.FEATURE_FLAG, Action.UPDATE)
-    ):
+    if owner is None or not owner.is_active or not may_use_server_key(owner):
         return OWNER_ROLE_DETAIL
     return None
 ```
 
 Read the order: the scope first, then the owner (loaded from the database by the key's own `user_id`),
-who must exist, be active and be able to update feature flags. The module docstring lists the refusals:
+who must exist, be active and be able to update feature flags. Notice that "able to update feature flags"
+is a function with a name, `may_use_server_key`, and its docstring lists every place that asks the
+question: creating such a key, the three routes, and whether an error report counts toward rollback. It
+arrived with custom roles (v0.40.0), so that all of those places ask the question the same way, and a
+custom role or direct grant of `feature_flag (update)` counts for every one of them at once. The module
+docstring lists the refusals:
 
 ```python
 # 📁 backend/app/api/sdk_scope.py
 Refusals: no or unknown key -> 401 (from ``get_api_key``); a valid key without
-the scope -> 403; a scoped key whose owner cannot change feature flags -> 403.
-The two 403 texts are the same on every route.
+the scope -> 403 (:data:`MISSING_SCOPE_DETAIL`); a scoped key whose owner
+cannot change feature flags -> 403 (:data:`OWNER_ROLE_DETAIL`); these two
+texts are the same on every route.  Batch assignment
+(:func:`require_batch_assign_key`) also checks that the owner can change
+experiments (``check_permission(owner, EXPERIMENT, UPDATE)``) and refuses with
+its own 403 (:data:`OWNER_EXPERIMENT_DETAIL`) before any assignment is
+written: three 403 texts in all.
 ```
 
-401 means "we do not know who you are"; 403 means "we know, and the answer is no". The two 403 texts are
-identical on every route, so a caller cannot use the wording to learn which routes exist or which check
-failed beyond the documented reason. Now how the scope string is read:
+401 means "we do not know who you are"; 403 means "we know, and the answer is no". Each 403 text is the
+same on every route, so a caller cannot use the wording to learn which routes exist or which check failed
+beyond the documented reason. Batch assignment adds one more question because it writes: a key that may
+download the flag ruleset is not, by that alone, allowed to put a thousand users into an experiment, so
+the owner must also be able to change experiments, and the refusal comes "before any assignment is
+written".
+
+`mcp:read` (in `backend/app/api/read_scope.py`) follows the same presented-key rule: "The header is
+re-hashed and that one `APIKey` row is read", and then the owner is returned so that "the route's own role
+checks then run unchanged; the scope itself carries no role rule". Its own smoke test,
+`test_mcp_read_routes.py`, pins the exact set of route registrations that accept it. Now how the scope
+string is read:
 
 ```python
 # 📁 backend/app/core/api_key_scopes.py
@@ -166,9 +208,12 @@ def can_act_on_feature_flag(
     """Whether *user* may take *action* on a feature flag owned by *owner_id*.
 
     The one decision for every per-flag route.  A superuser may always act.
-    Otherwise the role must hold *action* on feature flags in ROLE_PERMISSIONS --
-    that check comes first, so owning a flag never lets a read-only role change
-    it -- and then the scope table decides whose flags the permission covers.
+    When the built-in role holds *action* on feature flags in ROLE_PERMISSIONS,
+    the scope table decides whose flags the permission covers.  Otherwise a
+    custom role or direct grant of ``feature_flag (<action>)`` (full profile)
+    admits any flag, without reading the scope table (access is by
+    permission, not ownership); without one the answer is no, so owning a flag
+    never lets a read-only role change it.
 
     *owner_id* comes from the stored flag, never from a response dict (which
     renders a missing owner as the string ``"None"``).  *scope_table* exists for
@@ -176,9 +221,12 @@ def can_act_on_feature_flag(
     """
     if getattr(user, "is_superuser", False):
         return True
-    if not check_permission(user, ResourceType.FEATURE_FLAG, action):
-        return False
-    role = getattr(user, "role", UserRole.VIEWER)
+    try:
+        role = getattr(user, "role", UserRole.VIEWER)
+    except (AttributeError, TypeError):
+        role = UserRole.VIEWER
+    if not has_permission(role, ResourceType.FEATURE_FLAG, action):
+        return _pair(ResourceType.FEATURE_FLAG, action) in granted_permissions(user)
     table = FEATURE_FLAG_SCOPE if scope_table is None else scope_table
     scope = table.get(role, {}).get(action, Scope.OWN)
     if scope is Scope.ANY:
@@ -186,12 +234,21 @@ def can_act_on_feature_flag(
     return owner_id is not None and str(owner_id) == str(getattr(user, "id", None))
 ```
 
-Read the docstring in the full source: the role matrix is checked *first*, "so owning a flag never lets a
-read-only role change it", and only then does the scope table decide whose flags the permission covers.
-Today every entry is `ANY`: ADMIN and DEVELOPER can change any flag, ANALYST and VIEWER can read any flag
-and change none, even their own. The creator is recorded as `owner_id` and shown, but ownership is not an
-access rule. A per-flag lock or approval would be a new entry in that table, and a smoke test pins the exact
-set of mutating routes that must call this function.
+Read the docstring in the full source as a decision list. A superuser may act. If the built-in role holds
+the action, the scope table decides whose flags it covers; today every entry is `ANY`, so ADMIN and
+DEVELOPER can change any flag and ANALYST and VIEWER can read any flag. If the role does not hold it, the
+only other way in is a custom role or direct grant of exactly that action, which exists only in the full
+profile; without one the answer is no, "so owning a flag never lets a read-only role change it". The
+creator is recorded as `owner_id` and shown, but ownership is not an access rule.
+
+The comment above `FEATURE_FLAG_SCOPE` records a consequence that is easy to miss: "this table binds the
+built-in roles only. A holder of a custom role or direct grant of a feature_flag action is admitted to ANY
+flag before this table is read ... so a per-flag lock added here would not bind them. Such a lock must
+also be checked on the grant path." A second door into a decision means every future rule must be added
+at both doors. The grants themselves are narrow on purpose: `GRANTABLE` holds create, read, update, delete
+and list on experiments and on feature flags, plus reading the audit log, and the RBAC module refuses any
+other pair with a 422 of type `not_grantable`. A smoke test pins the exact set of mutating routes that
+must call this function.
 
 > **Watch Out!** In tests, "admin" fixtures are often superusers, which bypass every check. A permission
 > test written with a superuser proves nothing. Test with a non-superuser of each role, and create the
@@ -260,7 +317,8 @@ instant erasure.
 | API key on a user-management route | Credential type does not bypass management authentication |
 | Valid key without `sdk:ruleset` on a scoped route | 403; no ruleset, no batch side effect |
 | Another key of the same owner has the scope | The presented, unscoped key still fails |
-| Scoped key whose owner was demoted | Next scoped request is refused |
+| Scoped key whose owner was demoted, or lost a custom grant | Next scoped request is refused |
+| Key with `mcp:read` on a route that changes something | 401, the same body as no login |
 | Actor changes a resource identifier | Authorisation is evaluated for the requested object |
 | Core profile receives a module-only URL | Absence is handled without importing module code |
 
@@ -304,6 +362,13 @@ developer who does not own it may update: True
 ======================== 55 passed, 3 warnings ========================
 ```
 
+The two users are plain `SimpleNamespace` objects, so they hold no custom grants: `granted_permissions`
+gives nothing to anything that is not a user row bound to a database session ("a `SimpleNamespace`, a
+mock, a transient, pending or detached instance all get nothing"). That strictness is deliberate, and the
+reason is in the same docstring: "`inspect` of a `MagicMock` answers a mock whose 'session' is a mock
+too". A permission check that a test double could satisfy by accident would pass tests for the wrong
+reason.
+
 Now tamper with the gate. In your **scratch** clone, open `backend/app/api/v1/endpoints/tracking.py` and
 add `Depends(require_sdk_ruleset_key)` (importing it from `backend.app.api.sdk_scope`) to the
 `track_event` route's parameters, then run `test_sdk_scoped_routes.py` again. It fails, and the assertion
@@ -313,17 +378,23 @@ not a gate.
 Reasoning exercise. A developer adds `scopes=["read"]` to a browser key and calls it read-only. The same
 user's second key has `sdk:ruleset`. What should the reviewer challenge?
 
-**Answer.** `read` is not enforced by any route; it is stored text. Inspect every endpoint the key can
-reach rather than inferring restrictions from a label. The browser key must fail the scoped routes on its
-own regardless of the second key (the scope check reads the presented row). Prove refusal with integration
-tests, check owner demotion, and never ship a scoped ruleset key to a browser. If the product needs a truly
-restricted public key, that is a new enforced contract with tests, not documentation.
+**Answer.** `read` is not enforced by any route; it is stored text (`mcp:read` is a different name, and it
+*widens* what a key can do: it lets the key read every flag, experiment and result its owner can). Inspect
+every endpoint the key can reach rather than inferring restrictions from a label. The browser key must
+fail the scoped routes on its own regardless of the second key (the scope check reads the presented row).
+Prove refusal with integration tests, check owner demotion, and never ship a scoped ruleset key, or an
+`mcp:read` key, to a browser. If the product needs a truly restricted public key, that is a new enforced
+contract with tests, not documentation, and every existing key that already carries its name gains it on
+the day it ships.
 
 ### Key takeaways
 
 - Authentication names the caller; the route must still check the action and the object.
 - Decide on the credential *presented*, and recompute the owner's authority on every request.
-- Exactly one scope is enforced. A stored scope string that no route reads is a label.
+- Two scopes are enforced, `sdk:ruleset` and `mcp:read`. A stored scope string that no route reads is a
+  label, until a release enforces it and every key already carrying it gains the access.
+- A second way into a permission decision (custom grants) means every new rule must be checked at both
+  doors.
 - Pin the set of protected routes, and test that your inventory walk cannot be empty.
 - A workspace groups people; it is not a tenant boundary. Run separate installations for separate teams.
 
@@ -398,8 +469,22 @@ model_response = Column(Text, default="")
 ```
 
 Segments made from a list of user ids store those ids in a members table (`segment_members`), a
-second copy of identifiers, and the flag ruleset (Hour 7) is a third. Add the derived results, exports,
-caches and logs and the picture is: **a user id typed once appears in several places**.
+second copy of identifiers, and the flag ruleset (Hour 7) is a third. The event keys from Hour 4 are a
+fourth, and the most surprising one, because they were built for reliability, not for data:
+
+```python
+# 📁 backend/app/models/event_dedup_key.py
+There is deliberately no foreign key to ``events``: creating one takes a lock
+on ``events`` that waits for every open transaction writing to it. A key is
+kept when its event is deleted. It then names an experiment or flag id that
+nothing resolves to again, so it never matches a new event, and nothing purges
+keys. An operator erasing one person's events by hand deletes their rows here
+too (``user_id``).
+```
+
+A table whose purpose is "recognise a retry" holds your users' ids indefinitely. Every reliability
+mechanism that remembers something is also a data store, and belongs in the inventory. Add the derived
+results, exports, caches and logs and the picture is: **a user id typed once appears in several places**.
 
 Recommended inventory columns, for every field: purpose, owner, source, destination, readers, retention,
 deletion mechanism and verification evidence. Include derived results and exports, not only base tables.
@@ -449,30 +534,40 @@ _SENSITIVE_FIELDS = {
 }
 
 
-def _redact_sensitive(data: Optional[Dict]) -> Optional[Dict]:
+def _redact_sensitive(data: Optional[Any]) -> Optional[Any]:
     """Replace sensitive field values with [REDACTED].
 
     Performs case-insensitive substring matching so that fields like
     'hashed_password', 'ACCESS_TOKEN', etc. are also caught.
-    Recurses into nested dicts.
+    Recurses into nested dicts and lists.
     """
     if data is None:
         return None
-    result = {}
-    for k, v in data.items():
-        if any(s in k.lower() for s in _SENSITIVE_FIELDS):
-            result[k] = "[REDACTED]"
-        elif isinstance(v, dict):
-            result[k] = _redact_sensitive(v)
-        else:
-            result[k] = v
-    return result
+    if isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            if any(s in k.lower() for s in _SENSITIVE_FIELDS):
+                result[k] = "[REDACTED]"
+            else:
+                result[k] = _redact_sensitive(v)
+        return result
+    if isinstance(data, list):
+        return [_redact_sensitive(item) for item in data]
+    return data
 ```
 
-It matches substrings case-insensitively and recurses into nested dictionaries, so `hashed_password`,
-`ACCESS_TOKEN` and `Access_Token` are caught. It cannot know that `email` is sensitive in *your* data, and
-it should not pretend to. If you add fields to an audited object, add the field to your inventory and decide
-whether it belongs in an audit snapshot at all.
+It matches substrings case-insensitively and recurses into nested dictionaries and lists, so
+`hashed_password`, `ACCESS_TOKEN` and `Access_Token` are caught, and so is a `token` inside a list of
+objects. That last part is a fix shipped in v0.40.0 (#1488, "redact sensitive fields inside nested
+arrays"): the earlier version recursed into dictionaries only, so a list of objects passed through
+unchanged, secrets and all. Notice the shape of the fix: the function now decides by the *value's* type at
+every level (a dict, a list, or anything else, which it returns as it is) instead of by one container type
+it happened to expect. A walker over untrusted structure should handle every shape the structure can
+take, and say what it does with the rest.
+
+It still cannot know that `email` is sensitive in *your* data, and it should not pretend to. If you add
+fields to an audited object, add the field to your inventory and decide whether it belongs in an audit
+snapshot at all.
 
 #### Choose identifiers deliberately
 
@@ -497,6 +592,7 @@ python - <<'EOF'
 from backend.app.services.audit_log_service import _redact_sensitive
 print(_redact_sensitive({"name": "x", "api_key": "k",
                          "nested": {"Access_Token": "t", "plan": "pro"},
+                         "items": [{"token": "t2", "sku": "a-1"}],
                          "email": "a@b.c", "card_number": "4242"}))
 from backend.app.services.analysis_snapshot_service import purge_expired_history
 print(purge_expired_history(retention_days=0))
@@ -506,12 +602,12 @@ EOF
 Expected result:
 
 ```text
-{'name': 'x', 'api_key': '[REDACTED]', 'nested': {'Access_Token': '[REDACTED]', 'plan': 'pro'}, 'email': 'a@b.c', 'card_number': '4242'}
+{'name': 'x', 'api_key': '[REDACTED]', 'nested': {'Access_Token': '[REDACTED]', 'plan': 'pro'}, 'items': [{'token': '[REDACTED]', 'sku': 'a-1'}], 'email': 'a@b.c', 'card_number': '4242'}
 {'analysis_snapshots': 0, 'bandit_state_history': 0}
 ```
 
-`email` and `card_number` are not redacted; `api_key` and `Access_Token` are. (The second line previews
-Hour 9: a retention of zero disables that purge and deletes nothing.)
+`email` and `card_number` are not redacted; `api_key`, `Access_Token` and the `token` inside the list
+are. (The second line previews Hour 9: a retention of zero disables that purge and deletes nothing.)
 
 Design exercise. The integration sends a customer email, a full account JSON and the checkout URL for a
 rule that only tests whether the shopper has a paid plan. Design a smaller payload without changing the
@@ -524,7 +620,8 @@ up). Keep the id-to-person mapping in its authorised source system.
 
 ### Key takeaways
 
-- A user id typed once is copied into the assignment, events, segments, rulesets, exports and logs.
+- A user id typed once is copied into the assignment, events, event keys, segments, rulesets, exports and
+  logs. A mechanism built for reliability that remembers ids is a data store too.
 - Prefer allowlists. Controlvar's integration responses show only named keys; its audit redactor hides by
   key-name substring and misses everything not named.
 - Failures answer a fixed sentence with a request id; exception text goes to the log only, and a test
@@ -559,11 +656,12 @@ the models rather than assume.
 
 Controlvar's compliance audit events carry a `retention_expires_at`, stamped at write time from a setting
 (365 days for the SOC 2 profile, 730 for ISO 27001) and documented as the time the event "may be
-archived/deleted". It is a good column. But a search of the source at v0.36.4 for anything that *reads*
+archived/deleted". It is a good column. But a search of the source at the pin for anything that *reads*
 it to delete or archive finds only the model, the schema, the writer and tests. The app's limitations page
-says it plainly: "A retention policy, or a tool that erases one person's data: neither exists. Nothing
-deletes events, assignments or audit records by age." The only retention that actually runs is a purge of
-the platform's own analysis history. That candour is a model for your own documentation: say what runs.
+says it plainly, in its row for "A retention policy, or a tool that erases one person's data": "Neither
+exists. Nothing deletes events, assignments or audit records by age, and no route deletes the events of
+one of your app's users." The only retention that actually runs is a purge of the platform's own analysis
+history. That candour is a model for your own documentation: say what runs.
 
 > **Did You Know?** The one retention job is piggybacked on another scheduler's tick: the metrics
 > scheduler calls `purge_expired_history()` each time it runs, so its cadence is the metrics scheduler's,
@@ -674,13 +772,23 @@ The flag and its related data are permanently removed *except its events*, which
 segments and rollout schedules they created, ownerless, and an experiment whose creator is gone shows "No
 owner" (Hour 11). None of those is an erasure of an external subject's events, and none was meant to be.
 
+And the event keys of Hour 4 outlive the events themselves: a key "is kept when its event is deleted",
+and "nothing purges keys". No route deletes one person's events, so this matters exactly when an operator
+erases someone's events by hand. The app's guide to how events count warns that operator, in a sentence
+the app's own test suite checks: "`event_dedup_keys` holds your app's user ids and keeps them when events
+are deleted." A unit test reads that sentence from the page and fails if the table it names is not one of
+the core models, because a sentence naming the wrong table would send an operator erasing someone's data
+to the wrong place. A procedure in documentation that people will follow under pressure deserves a test
+as much as code does.
+
 Because the app does not provide a subject-erasure tool, any manual workflow is yours. The recommended
 shape: establish the identifier mapping and authorised scope through your organisation's process; inventory
-assignment rows, events, context, segment memberships, LLM records, derived datasets, exports, caches, logs
-and backups that may hold it; decide which are in scope and which have independent retention duties;
-rehearse in a disposable dataset with before-and-after counts and integrity checks; keep a protected
-evidence record that does not reproduce the sensitive payload. Do not publish ad hoc production `DELETE`
-statements as a universal recipe: relationships, retention duties and analysis requirements differ.
+assignment rows, events, event keys, context, segment memberships, LLM records, derived datasets, exports,
+caches, logs and backups that may hold it; decide which are in scope and which have independent retention
+duties; rehearse in a disposable dataset with before-and-after counts and integrity checks; keep a
+protected evidence record that does not reproduce the sensitive payload. Do not publish ad hoc production
+`DELETE` statements as a universal recipe: relationships, retention duties and analysis requirements
+differ.
 
 #### Exports are copies with their own lifecycle
 
@@ -734,7 +842,7 @@ the column with the clock or deletes by it.
 ```text
 backend/app/models/compliance_audit_event.py:94:    retention_expires_at = Column(DateTime(timezone=True), nullable=True)
 backend/app/schemas/compliance_audit.py:102:    retention_expires_at: Optional[datetime] = Field(None)
-backend/app/services/audit_log_service.py:158:            retention_expires_at=_get_retention_expiry(retention_standard),
+backend/app/services/audit_log_service.py:162:            retention_expires_at=_get_retention_expiry(retention_standard),
 ```
 
 A grep is weak evidence of absence (a consumer could build the name at runtime), so say what you did and
@@ -747,9 +855,13 @@ grep -n "purge_expired_history" backend/app/core/metrics_scheduler.py
 Expected result: two lines, the import and the call, which together are the whole list of consumers of that job.
 
 ```text
-104:                purge_expired_history,
-107:            purge_expired_history()
+124:                purge_expired_history,
+127:            purge_expired_history()
 ```
+
+(Line numbers move between releases; the shape of the answer, one import and one call, is what to check.)
+At the pin the purge runs inside the metrics scheduler's worker thread (Hour 5), so a slow purge no
+longer holds up the API's event loop; it still reports a failure only as a log line.
 
 If a later release adds a deletion job, a fourth line or a `delete` will appear in the first search, and
 this lesson should be rewritten.
@@ -766,9 +878,10 @@ instead of claiming a platform-wide erasure operation that does not exist.
 ### Key takeaways
 
 - Retention is a running job with a window, a clock and a failure signal. A date column is not one.
-- At v0.36.4 the only retention that runs is the analysis-history purge; nothing deletes events,
-  assignments or audit records by age, and no tool erases one subject's data.
-- Read the foreign keys: assignments cascade, events detach, a deleted flag keeps its events.
+- At the pin the only retention that runs is the analysis-history purge; nothing deletes events,
+  assignments, event keys or audit records by age, and no tool erases one subject's data.
+- Read the foreign keys: assignments cascade, events detach, a deleted flag keeps its events, and event
+  keys have no foreign key at all, so they outlive their events.
 - An export, a downloaded ruleset and a restored backup outlive the live database change.
 
 **Review artifact:** a field-level data map, a minimised payload example, retention-enforcement evidence
@@ -800,7 +913,9 @@ failed; the id lets the operator find the real error in the server log.
 4. An allowlist and a denylist both protect a secret. Which fails closed?
 5. Name two things that survive a backup restore that you deleted yesterday.
 
-**Answers.** (1) No; only `sdk:ruleset` is enforced. (2) No; it can remain linkable and guessable. (3) No;
+**Answers.** (1) No; only `sdk:ruleset` and `mcp:read` are enforced, and neither makes a key read-only:
+`mcp:read` opens four reads that a key without it cannot reach. (2) No; it can remain linkable and
+guessable. (3) No;
 platform users and external subjects are separate identities. (4) The allowlist. (5) The deleted rows
 themselves in the restored database, and any export or downloaded ruleset taken earlier.
 
@@ -810,19 +925,22 @@ themselves in the restored database, and any export or downloaded ruleset taken 
    expected status and what must be asserted afterwards.
 2. **Inventory.** Build the inventory table (purpose, owner, destination, readers, retention, deletion,
    evidence) for one integration you know, including exports and logs.
-3. **Retention audit.** For each of assignments, events, audit events, analysis snapshots, flags and API
-   keys, state the mechanism that removes it at v0.36.4, or "none".
+3. **Retention audit.** For each of assignments, events, event keys, audit events, analysis snapshots,
+   flags and API keys, state the mechanism that removes it at the pin, or "none".
 4. **Redaction.** Propose a change to the audit redactor that fails closed, and list what it would break.
 
 ### Solutions
 
 1. No key: 401. Valid key without the scope: 403, no ruleset in the body. Scoped key whose owner is a
-   VIEWER or inactive: 403. Scoped key and a capable owner: 200. After each refusal, assert nothing was
-   recorded as a ruleset download.
-2. A good answer lists `user_id` at least in assignments, events, segment members, rulesets, exports and
-   logs, and marks the retention and deletion columns "none" where the platform provides no mechanism.
+   VIEWER with no custom grant, or inactive: 403. Scoped key and a capable owner (ADMIN, DEVELOPER, a
+   superuser, or a holder of a `feature_flag (update)` grant in the full profile): 200. After each
+   refusal, assert nothing was recorded as a ruleset download.
+2. A good answer lists `user_id` at least in assignments, events, event keys, segment members, rulesets,
+   exports and logs, and marks the retention and deletion columns "none" where the platform provides no
+   mechanism.
 3. Assignments: cascade with their experiment (a DRAFT experiment may be deleted); events: none by age,
-   detached when their experiment or flag is deleted; audit events: none (the date column is not read);
+   detached when their experiment or flag is deleted; event keys: none, and kept when their event is
+   deleted; audit events: none (the date column is not read);
    analysis snapshots and bandit history: the purge after `ANALYSIS_HISTORY_RETENTION_DAYS`; flags: deleted
    by explicit request (events kept); API keys: deleted with their user or explicitly.
 4. Replace the denylist by an allowlist of fields an audit snapshot may contain per entity type, failing
