@@ -55,15 +55,15 @@ Sams-style sidebars — **By the Way**, **Watch Out!**, **Did You Know?** — ru
 Each **Week** ends with a **Capstone** that traces one real feature end-to-end, then a
 **Workshop**: a quiz (with answers) and exercises (with worked solutions) to lock it in.
 
-> **Convention.** `# 📁 path` = real Controlvar source at v0.36.4. Snippets are sometimes trimmed
-> for teaching (a `...` marks what was left out, and a long signature may be joined onto one
-> line); the file path lets you read the full version. You'll need a clone of the
-> [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar) repository open alongside
-> this book, at tag `v0.36.4` if you want every line to match — the _Build It_ exercises send you
-> into it. Paths are relative to the repository root. Controlvar was called Controlvar before
-> 0.35.0; you will still meet the old name in some identifiers (`experimently.token`,
-> `EXPERIMENTLY_PROFILE`, the `experimentation` database schema), and the text says so where it
-> matters.
+> **Convention.** `# 📁 path` = real Controlvar source at commit `09d815ea` (`main` after
+> v0.43.2). Snippets are sometimes trimmed for teaching (a `...` marks what was left out, and a
+> long signature may be joined onto one line); the file path lets you read the full version.
+> You'll need a clone of the [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar)
+> repository open alongside this book, checked out at `09d815ea` if you want every line to
+> match — the _Build It_ exercises send you into it. Paths are relative to the repository root.
+> Controlvar was called Experimently before 0.35.0; you will still meet the old name in some
+> identifiers (`experimently.token`, `EXPERIMENTLY_PROFILE`, the `experimentation` database
+> schema), and the text says so where it matters.
 
 ---
 
@@ -118,9 +118,11 @@ variant is user X in?") is decided on the server by `bucket_of(user_id, experime
 first four bytes of `MD5("{user_id}:{experiment.key}")` read as a little-endian unsigned
 integer and divided by 2³², the same function every SDK implements, and stored as a sticky
 `assignments` row. **Track** ("user X did `purchase`") writes an `events` row tagged with the
-user's variant. The results engine then counts **converting users**: each assigned user who
-sent at least one matching event counts once. Everything else — flags,
-rollouts, safety, statistics, dashboards — is built around those two rows.
+user's variant while the experiment is running. The results engine then counts **converting
+users** — each assigned user who sent at least one matching event counts once — and, for a
+revenue, count, duration or custom metric, takes the **mean per assigned user**, a user with no
+matching event counting as 0. Everything else — flags, rollouts, safety, statistics,
+dashboards — is built around those two rows.
 
 ---
 
@@ -190,12 +192,13 @@ _Set aside four weeks. Open the repo. Turn to [Week 1](./week-1-core-loop.md). �
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`). Every `# 📁` excerpt was copied from the file
-at that tag, and `tools/` in this repository checks that each cited path exists and that every
-identifier in an excerpt occurs in its file. The numbers quoted (the 20 required checks, the 16
-SDKs and the 13 that run live, the 2,191 local-evaluation cases, the nine middleware layers, the
-test counts) were counted in that tree. The commands in the _Build It_ sections were read against
-the code, not run for this edition. Re-check the book yourself by following `tools/README.md`.
+Verified against Controlvar `main` at `09d815ea` (after v0.43.2). Every `# 📁` excerpt was
+copied from the file at that commit, and `tools/` in this repository checks that each cited path
+exists and that every identifier in an excerpt occurs in its file. The numbers quoted (the 20
+required checks, the 16 SDKs and the 13 that run live, the 2,242 local-evaluation cases, the nine
+middleware layers, the test counts) were counted in that tree. The commands in the _Build It_
+sections were read against the code, not run for this edition. Re-check the book yourself by
+following `tools/README.md`.
 
 ## Related reading — Production Engineering
 

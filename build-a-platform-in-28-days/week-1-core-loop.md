@@ -15,7 +15,7 @@ in real files you can open in the
 [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar) repository.
 Read them alongside the prose; the file paths marked `# 📁` are real source, quoted exactly
 (trimmed where marked `...`), and the whole point is that you can go verify them. This week was
-checked against Controlvar v0.36.4 (`79f8ed18`).
+checked against Controlvar `main` at `09d815ea` (after v0.43.2).
 
 > **The one sentence to carry through Week 1.** _An experiment is two tables — `assignments`
 > (who saw what) and `events` (what they did) — joined by `(experiment_id, user_id)`; assignment
@@ -74,8 +74,8 @@ Data flows like this: an SDK calls `POST /api/v1/tracking/assign` → the API ha
 into a variant and writes an **`assignments`** row → the SDK later calls
 `POST /api/v1/tracking/track` → the API writes an **`events`** row → the dashboard calls
 `GET /api/v1/results/{experiment_id}` → the **results engine** counts assigned users and
-converting users per variant, runs Fisher's exact test against control, and returns a
-verdict. You saw the one-page diagram in the
+converting users per variant (and, for a revenue-style metric, each user's total), tests each
+treatment against control, and returns a verdict. You saw the one-page diagram in the
 [README](./README.md) — that's the whole book in one picture.
 
 #### Why the server decides, and why PostgreSQL holds the answer
@@ -197,7 +197,7 @@ controlvar/
 ├── modules/                   # the optional modules (full profile): the same
 │                              # layout one level down                        ← Week 2
 ├── modules-manifest.txt       # the authority on what is a module
-├── sdk/                       # 16 SDKs                                      ← Week 3
+├── sdk/                       # 16 SDKs, and the MCP server (sdk/mcp)        ← Week 3
 ├── demo/                      # ShopLab (:3200), StreamPulse (:3300)         ← Week 3
 ├── infrastructure/cdk/        # AWS CDK stacks (Python)                      ← Week 4
 ├── deploy/compose/            # the production compose file                  ← Week 4
@@ -864,14 +864,16 @@ redeclares `updated_at` without the mixin's `onupdate`: it means "received at", 
 because CUPED (Day 19) reads a user's history only if it was stored before the user was assigned,
 and an ORM update that re-tagged an event would otherwise silently drop it out of every covariate.
 
-> **Did You Know?** The `metrics` table has a `lower_is_better` flag and an
-> `event_value_path` (a JSON path into the event's metadata for revenue-style metrics), and
-> the `events` table has `value` — but `/results` analyses **every** metric as a proportion:
-> the share of assigned users who sent at least one matching event, compared with Fisher's
-> exact test. Revenue included. Mean metrics, analysed with Welch's t-test from sufficient
-> statistics (`sufficient_stats_analysis.mean_metric_result`), are used only by the warehouse
-> module (full profile, beta). When you read `calculate_metric_results` on Day 6 and see only
-> conversion rates, that's not an omission in the book.
+> **Did You Know?** A metric's `metric_type` decides how `/results` analyses it, and the
+> schema's own description says so in one sentence: `conversion` is the share of assigned users
+> who sent `event_name`; `count` is the number of `event_name` events per assigned user;
+> `revenue`, `duration` and `custom` are the total `value` of a user's `event_name` events, per
+> assigned user, and in each mean a user with none counts as 0 (Day 6). The `metrics` table
+> also has a `lower_is_better` flag, and it is read: when it is true the winner is the
+> significant treatment that went *down*, and a bandit (Day 19) moves traffic toward the arm
+> with fewer converting users. Two columns are not read at all: `aggregation_method` and
+> `event_value_path` are stored and returned, and their API descriptions begin "Not read". A
+> mean metric adds up each event's top-level `value`, never a value inside its metadata.
 
 ### Build It
 
@@ -1327,6 +1329,34 @@ is not an error — it's the normal case for most users of a targeted test, and 
 render the default experience without logging a failure. The SDKs treat `variant_name` as
 the answer and fall back to `"control"` only on transport errors.
 
+The same reasoning covers an experiment that is **not running**. The endpoint finds the
+experiment by key whatever its status (the key is unique) and, for anything but `ACTIVE`,
+never calls `assign_user` at all:
+
+```python
+# 📁 backend/app/api/v1/endpoints/tracking.py
+def _not_running_answer(
+    request: AssignmentRequest, experiment: Experiment
+) -> VariantAssignmentResponse:
+    """``/assign``'s answer for an experiment that is not ACTIVE.
+
+    The experiment's control variant, ``assigned: false`` and ``reason`` set
+    to the status (``draft``, ``paused``, ``completed`` or ``archived``), for
+    every user, enrolled or not. Nothing is recorded: no assignment, no view
+    event, no holdout population row, no bandit call. Stored assignments are
+    left as they are, so a resumed experiment answers each enrolled user with
+    their variant again.
+    ...
+    """
+```
+
+So a paused experiment is a 200 with the control and `reason: "paused"`, not a 404: from the
+app's side, "the test is paused" and "this user is not in the test" call for the same page. Only
+two things are still a 404: a key no experiment has, and the one state the API itself never
+creates, an experiment with no variant marked as the control (serving its first variant could
+show a treatment to everyone). Assigned users keep their rows, so resuming the experiment gives
+each of them their variant back.
+
 > **Watch Out!** Multi-armed bandits change one line of this flow. For
 > `optimization_type != "fixed"` the endpoint gets an `override_variant_id` from
 > `bandit_chooser(db, experiment)` (`backend/app/services/bandit_routing.py`), which reads the
@@ -1336,6 +1366,19 @@ the answer and fall back to `"control"` only on transport errors.
 > so a bandit doesn't break any of the four properties — it just replaces the fixed
 > distribution with a learned one. Day 19 covers how the weights are learned.
 
+> **By the Way.** A split URL experiment (the `split_url` module, full profile, beta) gives each
+> variant its own page, and the decision of where to send a visitor is this same function. Your
+> server or edge reads `GET /api/v1/tracking/split-url/routes` (the control page of every
+> active split URL experiment, as a host and a path), and for a request that matches an entry
+> asks `POST /api/v1/tracking/split-url/assign`, which answers `redirect` with the variant's
+> URL or `serve`. Its module docstring is explicit that it "answers through
+> `POST /api/v1/tracking/assign`'s own function", so the visitor gets the same assignment row,
+> exposure, holdout, mutual exclusion, targeting and bandit choice as any SDK call; it adds only
+> two reasons of its own, `not_entry` and `bot`. On AWS, an opt-in CloudFront router does the
+> asking: a CDK app of its own in `modules/infrastructure/split_url_edge/`, which no
+> `cdk deploy --all` or workflow deploys. One decision, reused, rather than a second assigner at
+> the edge.
+
 ### Build It
 
 Prove determinism and stickiness against a running API. You need an API key. The ShopLab
@@ -1343,7 +1386,8 @@ seed (`python backend/scripts/seed_shoplab.py`, which `./demo/setup-local.sh` ru
 creates one named `shoplab-storefront` and writes it to a gitignored `.api_key` file in
 `demo/shoplab/`; the `KEY=` line below reads it. If you started the stack with compose instead, the demo key is
 the `SHOPLAB_API_KEY` value in `docker-compose.yml` (a public demo key, for local use only), or
-create your own on the dashboard's Admin → API keys page.
+create your own on the dashboard's **Your API keys** page (under your account; administrators
+also have Admin → API Keys).
 
 ```bash
 API=http://localhost:8000/api/v1
@@ -1383,6 +1427,8 @@ Then read the unit tests that pin the gate order — they are the specification:
 - Gates run holdout → mutual exclusion → targeting, each with its own salt so they're
   independent.
 - Ineligible users get 200 + control + `assigned: false` + a `reason`; no row, no exposure.
+  An experiment that is not ACTIVE answers every user the same way, with its status as the
+  `reason`; only an unknown key (or an experiment with no control) is a 404.
 - Bandits swap the fixed distribution for learned weights via a deterministic override.
 - Assigning a list of users has its own route, `POST /api/v1/tracking/assign/batch` (beta,
   `sdk:ruleset` key): up to 1,000 distinct users, each answered as a single call would be, with
@@ -1428,10 +1474,12 @@ identifiers the analysis will need, and never lose one. Three design decisions f
    another event or by excluding it at analysis time, never by mutation — because the
    analysis has to be reproducible from the log.
 2. **Events are resolved at write time.** The SDK sends an `experiment_key` (a human string);
-   the API resolves it to an `experiment_id`, looks up the user's current assignment, and
-   denormalises the `variant_id` onto the row. The results engine can then find a variant's
-   events by `variant_id` alone, with no SQL join back to `assignments`. This is the
-   write-once, read-many trade.
+   the API resolves it to an `experiment_id`, looks up the user's current assignment while the
+   experiment is running, and denormalises the `variant_id` onto the row. The results engine
+   can then find a variant's events by `variant_id` alone, with no SQL join back to
+   `assignments`. This is the write-once, read-many trade, and it has a consequence worth
+   stating early: an event counts for the variant the user held **when the server received
+   it**, and the API never re-tags it afterwards.
 3. **Events are matched by name, not type.** This is the Day 1 bug, and today you'll see
    both sides of it in code.
 
@@ -1442,10 +1490,12 @@ takes keys; `/tracking/events` takes ids for server-side integrations that alrea
 id that is not a UUID answers 422, and a UUID that names no stored experiment, flag or variant
 answers 404 naming the field, with nothing stored); `/tracking/batch` takes up to 100 events at
 once and reports per-event failures without failing the batch. And the SDKs add one rule of their own: an event tracked _without_ a key
-**fans out** to every experiment the SDK has a cached assignment for and every flag it has
-evaluated for that user — so `track('purchase')` from your checkout page counts for the hero
-test, the sort bandit and the buy-button test simultaneously. That rule is what makes a
-single metric definition (`event_name: "purchase"`) reusable across experiments.
+**fans out** to the experiments and flags the SDK has answered for that user — every one
+answered in the last 24 hours in the JavaScript, Python and React SDKs, whether or not the
+answer is still cached, and the cached ones in the others — so `track('purchase')` from your
+checkout page counts for the hero test, the sort bandit and the buy-button test
+simultaneously. That rule is what makes a single metric definition (`event_name: "purchase"`)
+reusable across experiments.
 
 ### How Controlvar does it
 
@@ -1460,7 +1510,11 @@ class EventRequest(StorableTextModel):
     user_id: str = Field(..., min_length=1, max_length=255)
     experiment_key: Optional[str] = Field(None, max_length=100)
     feature_flag_key: Optional[str] = Field(None, max_length=100)
-    ...
+    value: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
+    timestamp: Optional[datetime] = None
+    event_id: EventId = None
+
     # Both keys are optional (#217). With neither, the endpoint stores the
     # event as history; a key that is given but not found answers 404.
 ```
@@ -1475,8 +1529,8 @@ untagged history. (Internally a key-less event is built as `UntaggedEventCreate`
 `EventCreate` still refuses an event with neither id, and the service takes an `allow_untagged`
 flag that only `/track` and `/batch` pass.)
 
-The endpoint resolves keys to ids, finds the assignment, and hands a column-shaped
-`EventCreate` to the service:
+The endpoint resolves keys to ids, finds the variant, and hands a column-shaped `EventCreate`
+to the service:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/tracking.py
@@ -1484,37 +1538,72 @@ The endpoint resolves keys to ids, finds the assignment, and hands a column-shap
     experiment_id = None
     variant_id = None
     if request.experiment_key:
-        experiment = db.query(Experiment).filter(Experiment.key == request.experiment_key).first()
+        experiment = (
+            db.query(Experiment)
+            .filter(Experiment.key == request.experiment_key)
+            .first()
+        )
+
         if experiment:
             experiment_id = experiment.id
-
-            # Find variant if user has an assignment
-            assignment = (
-                db.query(Assignment)
-                .filter(
-                    Assignment.experiment_id == experiment_id,
-                    Assignment.user_id == request.user_id,
-                )
-                .order_by(Assignment.created_at.desc())
-                .first()
-            )
-            if assignment:
-                variant_id = assignment.variant_id
+            variant_id = _variant_at_receipt(db, experiment, request.user_id)
     ...
-    event_data = _event_model(experiment_id, feature_flag_id)(
-        user_id=request.user_id,
-        event_type=request.event_type,
-        event_name=request.event_name or request.event_type,
-        experiment_id=str(experiment_id) if experiment_id else None,
-        feature_flag_id=str(feature_flag_id) if feature_flag_id else None,
-        variant_id=str(variant_id) if variant_id else None,
-        value=request.value,
-        properties=request.metadata,
-        timestamp=request.timestamp or datetime.now(timezone.utc),
-    )
-    event = EventService(db).track_event(event_data, allow_untagged=True)
-    record_event_tracked(str(event_data.event_type))
+        event_data = _event_model(experiment_id, feature_flag_id)(
+            user_id=request.user_id,
+            event_type=request.event_type,
+            event_name=request.event_name or request.event_type,
+            experiment_id=str(experiment_id) if experiment_id else None,
+            feature_flag_id=str(feature_flag_id) if feature_flag_id else None,
+            variant_id=str(variant_id) if variant_id else None,
+            value=request.value,
+            properties=request.metadata,
+            timestamp=request.timestamp or datetime.now(timezone.utc),
+            event_id=request.event_id,
+        )
+
+        # Track the event, once per event_id (#1543)
+        event, stored_id = _store_once(
+            db, event_data, request.event_id, route="track", allow_untagged=True
+        )
+        return _event_response(event, event_id=request.event_id, stored_id=stored_id)
 ```
+
+The variant comes from a helper with a rule in it:
+
+```python
+# 📁 backend/app/api/v1/endpoints/tracking.py
+def _variant_at_receipt(db: Session, experiment: Experiment, user_id: str) -> Any:
+    """The variant ``/track`` and ``/batch`` tag an event with.
+
+    The user's stored assignment, while the experiment is ACTIVE; otherwise
+    ``None``. The status is the one read when the event is received. For a
+    draft, paused, completed or archived experiment the event is stored with
+    its ``experiment_id`` and no variant, so it counts in no variant's
+    results: an event received while the experiment is not running is not
+    taken as evidence about the variant the user was assigned. The assignment
+    rows are kept, and ``backend/scripts/retag_events_from_assignments.py``
+    can tag such events from them afterwards.
+    """
+    if experiment.status != ExperimentStatus.ACTIVE:
+        return None
+    assignment = (
+        db.query(Assignment)
+        .filter(
+            Assignment.experiment_id == experiment.id,
+            Assignment.user_id == user_id,
+        )
+        .order_by(Assignment.created_at.desc())
+        .first()
+    )
+    return assignment.variant_id if assignment else None
+```
+
+A paused or completed experiment is the case that forced it. The user still holds their row,
+so an earlier version tagged the event with their variant, although the app was no longer
+serving them that variant (a stopped experiment answers everyone with the control, Day 4): the
+results of a test kept moving after it stopped. Now the event is kept, with its
+`experiment_id`, and counts in no arm; a resumed experiment counts the user's later events as
+before, and re-tagging the old ones is a deliberate act by an operator, not a side effect.
 
 Look at `event_name=request.event_name or request.event_type`. The SDKs send
 `event_type: "purchase"` (the tracking schema's `event_type` is free text — it is _not_ the
@@ -1590,6 +1679,61 @@ dict, schema field names or column names — and strict about _identity_:
 from Day 3, `UTCTimestampString`, then normalises it to canonical UTC, so every stored value
 looks like `2026-09-11T14:03:22.118342+00:00` and sorts correctly as text.
 
+#### Sending an event twice: `event_id`
+
+"Append-only" has an awkward corner: a request that timed out may already have been stored,
+and the client cannot know. Without help, a retry stores the event again, and while a
+conversion metric counts the user once whatever happens, a count metric counts the event twice
+and a revenue metric adds its value twice (Day 6). So an event may carry an **`event_id`**,
+the sender's own name for one occurrence: text of up to 255 characters, compared exactly, with
+`""` and `null` meaning none. The server stores the first event for a given user, experiment,
+flag, event name and `event_id`; a later one with the same five answers `200` with
+`"duplicate": true` and the stored event's `id`, and writes nothing. `/tracking/batch` counts it
+in `success_count` and in a new `duplicate_count`.
+
+The key is not a column on `events`. It lives in its own table, `event_dedup_keys`, whose
+primary key is the user and a 64-character key computed in exactly one place:
+
+```python
+# 📁 backend/app/services/event_dedup.py
+def dedup_key(
+    experiment_id: Optional[Union[UUID, str]],
+    feature_flag_id: Optional[Union[UUID, str]],
+    event_name: str,
+    event_id: str,
+) -> str:
+    """The 64-character key of one event within its user.
+
+    The lowercase SHA-256 hex digest of four parts, each encoded as
+    ``str(len(b)).encode("ascii") + b":" + b`` where ``b`` is its UTF-8 bytes,
+    concatenated in this order:
+    ...
+    """
+    digest = hashlib.sha256()
+    for part in (
+        _id_text(experiment_id),
+        _id_text(feature_flag_id),
+        event_name,
+        event_id,
+    ):
+        digest.update(_encoded(part))
+    return digest.hexdigest()
+```
+
+Two pieces of engineering hide in that function. The parts are **length-prefixed**, not simply
+joined: concatenated, `("ab", "c")` and `("a", "bc")` are both `abc`, and a separator only moves
+the problem to any part that contains the separator, which an `event_id` of the sender's
+choosing may. With its length in front of each part, no two different tuples encode to the same
+bytes. And the key holds the experiment, not the variant, and is **never recomputed** — not when
+an event is re-tagged, not when the experiment changes status — so an event first received while
+its experiment was paused is still a duplicate when it is sent again after the experiment
+starts, and it stays out of every arm. `EventService.track_event_once` claims the key with `INSERT ... ON CONFLICT DO NOTHING
+RETURNING` in the same transaction as the event, so two retries racing each other produce one
+row and no error. The app's guide `docs/guides/how-events-count.md` tabulates every case (a
+repeat, an event before assignment, one while the experiment is stopped, a value that is not a
+finite number); it is the page to hand someone who asks "why does my count differ from my
+logs?".
+
 #### Exposures
 
 `assign_user` also writes an event — `track_exposure`, `event_type="exposure"` — every time a
@@ -1629,7 +1773,19 @@ docker compose exec postgres psql -U postgres -d experimentation -c \
 ```
 
 You should see an `exposure` row from the assignment and a `purchase`/`purchase` row from the
-track call. Finally, confirm there's nowhere left that matches conversions by type:
+track call. Now send one event twice with the same `event_id`, the way a client's retry would:
+
+```bash
+for i in 1 2; do
+  curl -s -X POST $API/tracking/track -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+    -d '{"experiment_key":"shoplab_hero_banner","user_id":"user-42","event_type":"purchase","value":49.0,"event_id":"order-1001"}' \
+    | python -c 'import sys,json; d=json.load(sys.stdin); print(d["id"], d["duplicate"])'
+done
+```
+
+The two lines print the same `id`; the second ends in `True`, and the events query above shows
+one more `purchase` row, not two. Finally, confirm there's nowhere left that matches conversions
+by type:
 
 ```bash
 git grep -n 'event_type == "conversion"\|event_type=="conversion"' backend/app modules
@@ -1643,7 +1799,10 @@ still compares `event_type` with `"conversion"` is that fallback, inside the two
 
 - Events are append-only facts; correction is by addition or exclusion, never mutation.
 - `/track` resolves `experiment_key` → `experiment_id` and denormalises the user's
-  `variant_id` onto the row at write time.
+  `variant_id` onto the row at write time, and only while the experiment is ACTIVE: an event
+  received while it is a draft, paused, completed or archived is kept and counts in no arm.
+- An `event_id` makes a retry safe: the first event per user, experiment, flag, event name and
+  `event_id` is stored, a repeat answers `"duplicate": true` and writes nothing.
 - SDK events are `(event_type=name, event_name=name)`; the internal helper writes
   `("conversion", name)`; match on **`event_name`**, exclude exposures by `event_type`.
 - Timestamps are stored as ISO-8601 strings with an explicit UTC offset.
@@ -1660,7 +1819,10 @@ some callers already sent. `EventService.build_event` accepts either (and the OR
 The event is stored with `variant_id = NULL`. It still counts toward flag metrics if a flag
 key was given, and the results engine — which groups by `variant_id` — won't attribute it to
 any arm. That's correct: a conversion by a user who was never assigned isn't evidence about
-either variant.
+either variant. Note that the tag is decided at receipt: if the user is assigned a second
+later, that earlier event still counts nowhere. Track a user's events for an experiment once
+their assignment has answered. (`/tracking/events`, the by-ids route, is the exception: it
+stores the `variant_id` it is sent, and the event counts once the user holds that variant.)
 
 **Q. Can I backfill events with a historical timestamp?**
 Yes — `timestamp` is optional and defaults to server time; the seeds use it to build 30 days
@@ -1668,9 +1830,10 @@ of history. It's stored as sent (normalised to UTC), so daily breakdowns honour 
 
 **Q. Why is `/tracking/batch` limited to 100 events?**
 Failure isolation, and a bound on the work one request can ask for (the app caps every body at
-5 MiB, and the batch schema caps the list at 100 events); the first reason matters more:: each event is
+5 MiB, and the batch schema caps the list at 100 events); the first reason matters more: each event is
 validated and stored independently and the response reports `success_count`,
-`failure_count` and per-event `errors`. The SDKs chunk larger batches client-side.
+`failure_count`, `duplicate_count` and per-event `errors`. The SDKs chunk larger batches
+client-side.
 
 ---
 
@@ -1678,34 +1841,49 @@ validated and stored independently and the response reports `success_count`,
 
 ### What & why
 
-You have two tables. A result is, at its heart, four numbers per variant — assigned users,
-converting users, a rate, and how sure you are that the rate differs from control — plus a
-recommendation. Today is about how the platform gets from two counts to "ship treatment",
+You have two tables. A result is, at its heart, a few numbers per variant — assigned users,
+converting users, a rate or a mean, and how sure you are that it differs from control — plus a
+recommendation. Today is about how the platform gets from those numbers to "ship treatment",
 and about the **honesty checks** it runs on the way, because a results page that only shows
 the flattering number is worse than no results page.
 
-The primary path is deliberately simple statistics — a contingency table per variant vs
-control, a test of whether the proportions differ, a confidence interval on each rate —
+The primary path is deliberately simple statistics — one comparison per treatment against
+control, a test of whether they differ, an interval on each arm and on the difference —
 because simple statistics are the ones a product manager can reason about and an auditor can
 reproduce. The advanced methods (sequential testing, CUPED, Bayesian, bandits) sit _beside_
 the primary result as additional blocks, not instead of it. Day 19 and the
 [statistics book](../experimentation-statistics/README.md) cover those; today is the spine.
 
-#### Why Fisher's exact test, for every metric
+#### Two kinds of metric, two tests
 
-For a conversion metric the natural question is whether two proportions differ, and `/results`
-answers it one way: **Fisher's exact test** on a 2×2 table per treatment against control. It is
-exact at any sample size, `scipy.stats.fisher_exact` is fast even on large counts, and one test
-everywhere means one number a product manager can reason about and an auditor can reproduce.
-Every metric on `/results` is analysed this way, as a proportion — the share of assigned users
-with at least one matching event — whatever its `metric_type` (revenue included), and every
-treatment's result reports `statistical_test_used: "fisher_exact"`.
+A metric's `metric_type` decides which question `/results` asks, and the response says which
+it asked in each metric's `analysis` field:
+
+- **`conversion` → a proportion.** The share of assigned users with at least one matching
+  event, compared with **Fisher's exact test** on a 2×2 table per treatment against control
+  (`statistical_test_used: "fisher_exact"`). It is exact at any sample size, and
+  `scipy.stats.fisher_exact` is fast even on large counts.
+- **`revenue`, `count`, `duration`, `custom` → a mean per assigned user.** Every assigned user
+  is one unit; their value is the total `value` of their matching events (for `count`, the
+  number of those events), and a user with none counts as **0**. The arms are compared with
+  **Welch's t-test**, which does not assume equal variances. "Revenue per assigned user", not
+  "revenue per buyer", is the number that answers "did this change make us money?": a treatment
+  that converts fewer users at a higher basket can win the second and lose the first.
+
+The split is one tuple, `MEAN_METRIC_TYPES = ("revenue", "count", "duration", "custom")`, and a
+new `MetricType` member fails a test until someone classifies it. Either way, each treatment
+also carries its **difference** from the control with an interval (`absolute_difference`,
+`absolute_difference_ci`), an interval on the relative lift (`relative_improvement_pct_ci`), and
+the **incremental impact** — the difference times the treatment's own assigned users, with its
+interval (`incremental_impact`, `incremental_impact_ci`): a sentence like "about 340 more
+purchases, somewhere between 90 and 590" is one a product manager can act on. None of these
+intervals is adjusted for multiple comparisons, and the code's docstrings say so.
 
 > **Watch Out!** `AnalysisService` still defines `select_statistical_test`, `z_test_proportions`
 > and `welch_t_test`, and you will find tests for them. Nothing on the results path calls them.
-> Do not read the selection rule in `select_statistical_test` as what the dashboard does. Mean
-> metrics (Welch's t-test from sufficient statistics) exist only in the warehouse module, in the
-> full profile, as a beta.
+> Do not read the selection rule in `select_statistical_test` as what the dashboard does: the
+> metric's type decides, through `MEAN_METRIC_TYPES`, and the Welch test the mean path runs is
+> computed from per-arm sums in `sufficient_stats_analysis.mean_metric_result`.
 
 ### How Controlvar does it
 
@@ -1796,9 +1974,47 @@ is the request's `confidence_level` if the request names one, otherwise the expe
 `confidence_level` (0.95 unless its creator chose otherwise). The interval is the normal approximation
 `p ± z·√(p(1−p)/n)` with `z = norm.ppf(1 − (1 − confidence_level)/2)` (1.6449 at 0.90, 1.96 at
 0.95), clamped to `[0, 100]`, and a treatment is significant when `p_value < 1 −
-confidence_level`. Effect sizes (Cohen's h, `2·asin√p₁ − 2·asin√p₀`) are labelled
-negligible/small/medium/large so the dashboard can say "significant but negligible" — the most
-useful sentence in experimentation.
+confidence_level`. The difference's interval is a different construction: Newcombe's, from
+each arm's Wilson limits (`_proportion_difference`), at the same level. Effect sizes (Cohen's
+h, `2·asin√p₁ − 2·asin√p₀`) are labelled negligible/small/medium/large so the dashboard can say
+"significant but negligible" — the most useful sentence in experimentation.
+
+`calculate_metric_results` is the proportion path, and its counts feed the mean path too: the
+service that assembles the response picks the analysis per metric.
+
+```python
+# 📁 backend/app/services/analysis_service.py
+        # A revenue, count, duration or custom metric (MEAN_METRIC_TYPES) is
+        # its mean per assigned user; a conversion metric is the share of
+        # users who converted.
+        alpha = 1.0 - confidence_level
+        metrics = [
+            (
+                self._per_user_mean_result(
+                    experiment, metric, raw, alpha, correction_method
+                )
+                if metric_type_name(metric) in MEAN_METRIC_TYPES
+                else binomial_metric_result(
+                    ...
+                    alpha,
+                    correction_method,
+                    metric=metric,
+                )
+            )
+            for metric, raw in zip(metric_definitions, metrics_results)
+        ]
+```
+
+For a mean metric `_per_user_mean_result` reads each user's value — `event_counts` for a
+count metric, `value_totals` otherwise — with exactly the rule `count_converting_users` uses
+(matching events, tagged with the variant, from a user assigned to it), and hands the lists to
+`sufficient_stats_analysis.per_user_mean_metric_result`. Its docstring is the specification,
+and two of its sentences are worth reading as design: every assigned user "is one unit, and
+their value is what the caller read for them ... 0 for a user with none", and when "neither arm
+varies (every user's value is 0 before the first purchase) the p-value and the difference's
+interval are None". A value that is not a finite number, or one beyond ±10¹², adds nothing to
+its user's total (`VALUE_BOUND`), and the API refuses such a value on the way in with a 422.
+A result whose numbers cannot be computed says so with nulls rather than a made-up zero.
 
 #### The honesty checks
 
@@ -1973,13 +2189,37 @@ Feed the four counts into `scipy.stats.fisher_exact` and compare the p-value wit
 Then change `count(distinct e.user_id)` to `count(*)` and see by how much counting events
 would have overstated the primary metric.
 
+Now a mean. ShopLab's checkout experiment (`shoplab_checkout_flow`; put its id in `<EXP>`) has
+a revenue metric, "Order value", over the same `purchase` event as its primary metric. Its
+per-user values, with a 0 for every assigned user who bought nothing:
+
+```sql
+select v.name, a.user_id, coalesce(sum(e.value), 0) as total
+from experimentation.assignments a
+join experimentation.variants v on v.id = a.variant_id
+left join experimentation.events e
+  on e.experiment_id = a.experiment_id and e.user_id = a.user_id and e.variant_id = a.variant_id
+ and e.event_name = 'purchase' and e.event_type not in ('exposure','experiment_exposure')
+ and abs(e.value) <= 1e12
+where a.experiment_id = '<EXP>'
+group by v.name, a.user_id;
+```
+
+Split the totals by variant and run `scipy.stats.ttest_ind(treatment, control, equal_var=False)`:
+its p-value is the metric's `p_value` (unadjusted), and the two means are the variants' `mean`.
+Drop the zeros and rerun it to see the "revenue per buyer" answer the platform deliberately does
+not give.
+
 ### Key takeaways
 
 - A result is assigned users and **converting users** per variant (`count_converting_users`:
-  each assigned user once, at most), Fisher's exact test vs control, and a confidence interval
-  — the Day 3 join, computed.
-- One test on `/results`: Fisher's exact, for every metric, analysed as a proportion.
-  `confidence_level` sets both the interval and the significance threshold.
+  each assigned user once, at most), a test vs control, and confidence intervals — the Day 3
+  join, computed.
+- Two tests on `/results`, chosen by `metric_type`: a conversion metric is a proportion
+  (Fisher's exact); a revenue, count, duration or custom metric is a mean per assigned user,
+  zeros included (Welch's t). Each treatment carries its difference, its lift and its
+  incremental impact, each with an interval. `confidence_level` sets the intervals and the
+  significance threshold; `lower_is_better` sets which direction wins.
 - Honesty checks wrap every result: SRM (chi-square, p < 0.001, fixed experiments only,
   and a failed check turns the recommendation into `INCONCLUSIVE`), multiple-testing correction
   (stored per experiment, Benjamini-Hochberg by default), and minimum-sample-size gating of the
@@ -1993,6 +2233,15 @@ would have overstated the primary metric.
 `scipy.stats.fisher_exact` on a 2×2 table is fast even for large counts, and at scale its
 p-value is close to a z-test's anyway. The expensive part of a results request is the counting
 queries, which is why the endpoint caches.
+
+**Q. Why does a revenue metric count users who bought nothing?**
+Because they were assigned, and the question is what the change did to *everyone* it was shown
+to. Revenue per buyer conditions on buying, which the treatment itself may change: an arm that
+converts fewer, richer buyers looks better per buyer and may earn less in total. The per-user
+mean with zeros is the unconditioned answer, and the conversion metric beside it tells you how
+many bought. The app's documentation is candid about the cost: on zero-inflated, right-skewed
+revenue with a lopsided split, measured A/A experiments recommended shipping a variant that was
+no better more often than α says (`docs/getting-started/limitations.md` gives the numbers).
 
 **Q. The dashboard says "significant" but the recommendation is still "keep running". Why?**
 Minimum sample size. A metric declares `minimum_sample_size` (default 100), and the
@@ -2055,19 +2304,28 @@ pending the hook returns the control defaults, so the page never flashes an unde
 **3. The API authenticates the key.** `deps.get_api_key` hashes the header with SHA-256,
 looks up `APIKey.key` by hash, checks `is_valid`, loads the owning user. (Week 2, Day 10.)
 
-**4. The endpoint finds the experiment by key and status.**
+**4. The endpoint finds the experiment by key, then looks at its status.**
 
 ```python
 # 📁 backend/app/api/v1/endpoints/tracking.py
+    # Get experiment by key, whatever its status (the key is unique).
     experiment = (
-        db.query(Experiment)
-        .filter(Experiment.key == request.experiment_key, Experiment.status == ExperimentStatus.ACTIVE)
-        .first()
+        db.query(Experiment).filter(Experiment.key == request.experiment_key).first()
     )
+
+    if not experiment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No experiment has the key '{request.experiment_key}'.",
+        )
+
+    if experiment.status != ExperimentStatus.ACTIVE:
+        return _not_running_answer(request, experiment)
 ```
 
-A draft or paused experiment is a 404 here — the SDK's `get_variant` swallows that and
-returns `"control"`.
+An unknown key is a 404. A draft or paused experiment is a 200 with the control,
+`assigned: false` and `reason: "draft"` or `"paused"` (Day 4), so the page renders the image
+hero and nothing is recorded.
 
 **5. `AssignmentService.assign_user` decides.** Sticky row? No (first visit). Holdout? The
 demo has none. Mutual exclusion? `shoplab_hero_banner` isn't in a group. Targeting rules?
@@ -2087,17 +2345,20 @@ go on to buy, the checkout's `track('purchase', ...)` takes the same path and fe
 secondary metric.)
 
 **8. The API stores the event.** `/track` resolves `shoplab_hero_banner` → `experiment_id`,
-finds the visitor's assignment → `variant_id`, builds an `EventCreate` with
-`event_name = "hero_cta_click"` (copied from `event_type`), and `EventService.track_event`
-inserts the row with a canonical UTC timestamp.
+finds the visitor's assignment → `variant_id` (the experiment is ACTIVE; Day 5), builds an
+`EventCreate` with `event_name = "hero_cta_click"` (copied from `event_type`), and
+`EventService` inserts the row with a canonical UTC timestamp — once per `event_id`, if the
+SDK sent one.
 
 **9. The dashboard asks for results.** The results page calls `GET /api/v1/results/<id>`
 with the admin's bearer token. Cache miss (or `use_cache=false`) →
 `AnalysisService.get_experiment_results` → for each metric, primary first,
 `calculate_metric_results`: assignments per variant, `count_converting_users(...,
 "hero_cta_click")` per variant (each assigned visitor once, however many times they clicked),
-Fisher's exact test vs control, a normal-approximation interval at the experiment's confidence
-level (0.95 here, stored on the experiment, unless the request names another).
+Fisher's exact test vs control (both of the hero's metrics are `conversion` metrics, so both
+are proportions), a normal-approximation interval at the experiment's confidence level (0.95
+here, stored on the experiment, unless the request names another), and the difference, lift
+and incremental impact with their intervals.
 
 **10. The honesty checks run.** `sample_ratio_check` chi-squares the assignment counts against
 50/50 and reports the result in `srm`; `sample_size_adequate` checks every variant against
@@ -2139,13 +2400,14 @@ experiment.
 
 ### Key takeaways
 
-- The hop list: SDK hook → `/tracking/assign` → `get_api_key` → experiment by key →
-  `assign_user` (sticky → gates → hash) → row + exposure → SDK cache → app renders.
-- Then: `track` (fan-out) → `/tracking/track` → key → id, assignment → `variant_id` →
-  `EventService` → row.
-- Then: `/results/{id}` → `calculate_metric_results` (assigned users, converting users,
-  Fisher, CI) → SRM check (a warning overrides the recommendation), sample-size gate on the
-  recommendation → cache + snapshot → dashboard.
+- The hop list: SDK hook → `/tracking/assign` → `get_api_key` → experiment by key (not
+  ACTIVE → control with its status as the reason) → `assign_user` (sticky → gates → hash) →
+  row + exposure → SDK cache → app renders.
+- Then: `track` (fan-out) → `/tracking/track` → key → id, assignment → `variant_id` (while
+  ACTIVE) → `EventService` (once per `event_id`) → row.
+- Then: `/results/{id}` → `calculate_metric_results` (assigned users, converting users) →
+  Fisher for a proportion or Welch for a mean, with intervals → SRM check (a warning overrides
+  the recommendation), sample-size gate on the recommendation → cache + snapshot → dashboard.
 - Every layer is a file you can open; every number is a query you can rerun.
 
 ---
@@ -2283,7 +2545,7 @@ print(round(p_fisher, 4), round(p_z, 4))   # 0.2402 and 0.2002 — same conclusi
 dashboard shows the z-test's. Neither is significant at the default 0.95 (threshold 0.05), and
 neither is at 0.80 either (threshold 0.20, and 0.2402 > 0.20). The z-test's 0.2002 sits just
 above that threshold, a reminder that the choice of test can matter at the margin, and one
-reason the platform uses one test everywhere.
+reason the platform uses one test for every proportion.
 
 **S1.6**
 
