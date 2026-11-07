@@ -698,7 +698,7 @@ a usable entry. Third, it can only read: its whole allow-list of AWS operations 
 passes the old fixed list to uvicorn and needs nothing from the task definition, so such a
 release is skipped with a notice, but only when its entrypoint is positively identified by that
 old line; anything it cannot identify is checked. `rollback.yml` runs neither of these two
-checks, because a rollback target from before the change needs nothing.
+checks.
 
 **The canary.** The AppSpec is the whole contract with CodeDeploy — which task definition,
 which container and port:
