@@ -11,8 +11,9 @@ comparison is another lottery ticket for a false positive. Hour 10 is the correc
 machinery; Hour 11 is the honest way to slice results (and the drift-and-contamination
 checks that ride alongside — one now computed by the platform, two not); Hour 12 is the
 engineering discipline that makes any number the platform ever showed recomputable: seeds,
-engine versions, fingerprint tests, snapshots, the cache, and the table that says which
-analyses are `ga` and which are `beta`.
+engine versions, fingerprint tests, snapshots, the cache, the table that says which
+analyses are `ga` and which are `beta`, and the replay that checks a number against an
+answer computed without the product.
 
 ---
 
@@ -198,7 +199,10 @@ corrected over before you quote it.
 > `?correction_method=none` (or whose experiment was stored with `none`) is reading
 > _uncorrected_ significance for a multi-variant experiment, and the verdict looks the same
 > either way. The first edition of this book warned that the default was `none`; it is no
-> longer, which is exactly why the field is worth checking rather than assuming.
+> longer, which is exactly why the field is worth checking rather than assuming. And the
+> correction reaches the p-values only: the intervals on each treatment's difference, lift and
+> impact (Part I Hour 2) are never adjusted, so with two or more treatments under a correction
+> an interval can exclude 0 on a treatment whose adjusted p-value is not significant.
 
 > **By the Way** — Bonferroni also belongs in the **power calculation**. If you'll test three
 > treatments at α/3, the sample size per variant has to be computed at α/3, not α:
@@ -284,8 +288,11 @@ computes per-segment results with the corrected α, and marks every segment expl
 base α is `1 − confidence_level` of the analysis (the experiment's stored level unless the
 request names one). A segment's denominator is the distinct
 assigned users with an event carrying that segment value; its numerator is converting users
-(Part I Hour 2). Every variant appears in every segment, and the control is the variant
-flagged `is_control` — never guessed from ids or order:
+(Part I Hour 2). That holds whatever the metric's type: a breakdown of a revenue, count,
+duration or custom metric reports the share of users who sent its event in each segment (the
+column the Breakdowns view heads "Mean"), not the metric's mean per user, while the metric's
+headline row on `/results` is its mean. Every variant appears in every segment, and the control
+is the variant flagged `is_control` — never guessed from ids or order:
 
 ```python
 # 📁 backend/app/services/dimensional_analysis_service.py
@@ -465,7 +472,7 @@ The structural fix for interactions is upstream of statistics: put the two exper
 **mutual exclusion group** (Build book Day 4) so no user is in both. The route knows this — it
 refuses to test a pair that shares a group.
 
-**Novelty and SUTVA** — described, not computed. The platform has no routine at v0.36.4 that
+**Novelty and SUTVA** — described, not computed. The platform has no routine at `09d815ea` that
 tests for a novelty effect or a SUTVA violation: the `novelty_result` and `sutva_result` fields
 are kept in the scan's response shape and are `null`, and a `null` means "not computed", never
 "no novelty". Treat them as checks to do by hand:
@@ -608,10 +615,21 @@ and a number becomes an artefact rather than a moment.
 The seed, from `core` so schemas can import it without cycles:
 
 ```python
-# 📁 backend/app/core/stats_engine.py
+# 📁 backend/app/core/stats_engine.py  (abridged)
 #: Bumped whenever a change alters numbers a client could have persisted
-#: (sampling strategy, estimator, default priors, thresholds).
-ENGINE_VERSION: str = "1.4.0"
+#: (sampling strategy, estimator, default priors, thresholds).  1.5.0: the
+...
+#: The rule: an engine-changing PR bumps ``ENGINE_VERSION`` to the next minor
+#: and appends it to ``RELEASED_ENGINE_VERSIONS`` ("frozen on main", in
+#: ``backend/tests/unit/services/test_sufficient_stats_fingerprint.py``) in the
+#: same change.  A frozen version's entries are never edited, and no key is
+#: ever added under one.  A PR is engine-changing when, for the same database
+#: rows and request, it adds, removes or changes any number, decision (winner,
+#: recommendation, Bayesian decision, ``can_stop``) or allocation weight that a
+#: path stamping ``engine_version`` returns, caches or persists: results and
+#: its snapshots, Bayesian, CUPED, sequential, and the bandit's state, history
+#: and status.  A revert of an engine-changing PR bumps again.
+ENGINE_VERSION: str = "1.8.0"
 
 #: Mask that keeps the derived seed inside the signed 64-bit range.
 _SEED_MASK = (1 << 63) - 1
@@ -666,8 +684,15 @@ Wired into the Bayesian analysis (Part III Hour 8):
         # → byte-identical Monte Carlo draws.
         seed = derive_seed(experiment.id, as_of_bucket(as_of), n_samples)
 
-        # Run full Bayesian analysis
-        analysis = service.analyze(variant_observations, n_samples=n_samples, seed=seed)
+        # Run full Bayesian analysis, in the primary metric's direction
+        analysis = service.analyze(
+            variant_observations,
+            n_samples=n_samples,
+            seed=seed,
+            lower_is_better=metric_lower_is_better(
+                self._bayesian_primary_metric(experiment)
+            ),
+        )
         ...
         return BayesianResultsResponse(
             is_enabled=True,
@@ -700,36 +725,94 @@ for Thompson weights and stamps `BanditState.engine_version` (Part III Hour 9).
 | 1.2.0   | `/results` intervals and significance at the requested confidence level (#454); the sequential confidence sequence became the inverted mSPRT (#231); a Bayesian `STOP_WINNER` needs P(best) ≥ 0.975 (#242). |
 | 1.3.0   | CUPED adjusts for each user's own pre-assignment events (`cuped_metric_result`) instead of a placeholder covariate (#217). |
 | 1.4.0   | The mSPRT and the confidence sequence use the Agresti–Caffo variance, and Λ is computed in log space and capped (#854). |
+| 1.5.0   | The winner, the recommendation and the Bayesian decision read the metric's `lower_is_better` (#1377), and `/results` analyses a revenue metric as its mean per assigned user (#1400). |
+| 1.6.0   | A bandit whose primary metric is lower-is-better rewards a user who did _not_ convert, so its weights, regret estimate and history favour the arm with fewer conversions (#1385). |
+| 1.7.0   | `/results` analyses a count, duration or custom metric as its mean per assigned user too, where it was the share of users who sent the event (#439). |
+| 1.8.0   | Every treatment carries an interval on its difference from the control, an interval on its relative change and the incremental impact; a proportion's `absolute_difference`, null before, is filled (#1496). |
 
-**The fingerprint test and the bump rule.** A version string only means something if it
+1.5.0 first shipped in v0.38.0; 1.6.0, 1.7.0 and 1.8.0 all first shipped in v0.40.0. Three
+versions in one release is what the bump rule below produces: a version is frozen when its pull
+request merges, not when a release ships.
+
+**The fingerprint tests and the bump rule.** A version string only means something if it
 moves whenever the numbers do, and nobody remembers to bump it by hand. So
 `backend/tests/unit/services/test_engine_fingerprint.py` runs a fixed dataset through every
 analysis path — frequentist, Bayesian (including an A/A case), CUPED, sequential, breakdowns —
 hashes the canonical output, and compares it with the hash pinned for the current
-`ENGINE_VERSION`:
+`ENGINE_VERSION`. When it fails, its docstring says what to do:
 
 ```python
 # 📁 backend/tests/unit/services/test_engine_fingerprint.py  (docstring, abridged)
 """
-When this test fails, the engine's output changed.  Then:
-
-* if the current ``ENGINE_VERSION`` has **not** shipped in a release, replace
-  its hash below with the new one (the change is part of that version);
-* if it **has** shipped, bump ``ENGINE_VERSION`` in
-  ``backend/app/core/stats_engine.py`` (and ``test_stats_determinism.py`` and
-  both OpenAPI snapshots, whose ``engine_version`` defaults follow it), and add
-  the new version's hash here, keeping the old entries.
-
-Never edit the hash of a released version.
+...
+When this test fails, the engine's output changed.  The rule: an
+engine-changing PR bumps ``ENGINE_VERSION`` to the next minor and appends it to
+``RELEASED_ENGINE_VERSIONS`` ("frozen on main") in the same change.  A frozen
+version's entries are never edited, and no key is ever added under one.  A PR
+...
+So bump ``ENGINE_VERSION`` in ``backend/app/core/stats_engine.py`` (both
+OpenAPI snapshots follow it), append it to ``RELEASED_ENGINE_VERSIONS`` in
+``test_sufficient_stats_fingerprint.py``, add the new version's hash here and
+in every other pin table, and add its digest to ``FROZEN_DIGESTS`` in
+``test_engine_versions_frozen.py``.  Never edit an existing entry.
 """
 ```
 
 Its control id deliberately sorts _after_ the treatment's, so an engine that guessed the
-control from the smaller id would produce a different hash. Two siblings pin the rest:
-`test_sufficient_stats_fingerprint.py` pins the proportion engine (`binomial_metric_result`)
-per version, and `test_stats_determinism.py` checks that every Monte Carlo path is
-deterministic for a given seed and that the responses carry their provenance fields. A pull request that changes a number therefore cannot merge silently: it either
-updates the unreleased version's hash or bumps the version.
+control from the smaller id would produce a different hash.
+
+**Why "frozen on main" and not "frozen when released".** The rule used to be: while the current
+version has not shipped, replace its hash; once it has, bump. That depends on someone recording
+which versions have shipped, and the record, `RELEASED_ENGINE_VERSIONS`, still ended at 1.4.0
+after 1.5.0 went out in v0.38.0 and v0.39.0. For that stretch 1.5.0's hashes could be replaced
+with no test failing (#1502; `test_engine_versions_that_shipped_are_recorded` keeps the story in
+its docstring). The rule now has nothing to remember: every engine-changing pull request bumps
+to the next minor and freezes it in the same change, and a revert bumps again.
+
+**One dataset cannot see every change.** `ENGINE_FINGERPRINTS` pins the same hash for 1.4.0
+through 1.8.0: its dataset has no lower-is-better metric, runs no bandit, has no mean metric on
+`/results` and does not hash the difference fields, and each version's comment in the table says
+so. Six more tables pin what it cannot see, per version — `SUFFICIENT_STATS_FINGERPRINTS`,
+`REVENUE_RESULTS_FINGERPRINTS`, `LOWER_IS_BETTER_FINGERPRINTS`, `VALUE_RESULTS_FINGERPRINTS`,
+`ONE_TREATMENT_PINS` and `CHARACTERISATIONS` — and `test_engine_versions_frozen.py` freezes all
+seven with one digest per frozen version:
+
+```python
+# 📁 backend/tests/unit/services/test_engine_versions_frozen.py
+def version_digest(version: str, tables=None) -> str:
+    """sha256 of the canonical JSON of ``version``'s entry in each table."""
+    tables = PIN_TABLES if tables is None else tables
+    entries = {
+        f"{path}::{name}": table[version]
+        for (path, name), table in tables.items()
+        if version in table
+    }
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+```
+
+```python
+# 📁 backend/tests/unit/services/test_engine_versions_frozen.py
+def test_the_running_engine_is_the_last_frozen_version():
+    """A bump without the append, or an append without the bump, fails here."""
+    assert ENGINE_VERSION == RELEASED_ENGINE_VERSIONS[-1], (
+        f"ENGINE_VERSION is {ENGINE_VERSION} but the last version frozen on "
+        f"main is {RELEASED_ENGINE_VERSIONS[-1]}: an engine-changing PR bumps "
+        "ENGINE_VERSION and appends it to RELEASED_ENGINE_VERSIONS together"
+    )
+```
+
+Replace any table's 1.8.0 hash and 1.8.0's digest no longer matches `FROZEN_DIGESTS`, so the
+test fails and names the version; a new table whose first entry is a new version changes no old
+digest. `FROZEN_VERSIONS`, an append-only literal, stops a frozen version being dropped from the
+tuple and the digests together, and a source scan of `backend/tests/unit` fails on any
+version-keyed table missing from `PIN_TABLES`, so a new table cannot sit outside the freeze. (The
+scan is a heuristic, and its docstring lists what it misses: a non-literal key, a nested dict, a
+table outside `backend/tests/unit`.) `test_stats_determinism.py` checks the rest: every Monte
+Carlo path is deterministic for a given seed, and the responses carry their provenance fields;
+the version itself is held by the invariant above, not by a literal there. A pull request that
+changes a number therefore cannot merge silently: there is no unreleased version for the change
+to hide in, so it bumps the version.
 
 **Snapshots.** One row per (experiment, kind, UTC day) for the results endpoints — upserted,
 so a polling dashboard refreshes the day's row rather than growing the table — and one row
@@ -795,7 +878,7 @@ def record_snapshot(db, experiment_id, kind, payload, *, engine_version=ENGINE_V
         with _audit_session(db) as session:
             return _upsert(session, snapshot)
     except Exception as exc:
-        logger.warning("analysis_snapshots write failed for experiment %s (%s): %s", experiment_id, kind.value if isinstance(kind, AnalysisKind) else kind, exc)
+        logger.warning("analysis_snapshots write failed for experiment %s (%s): %s", experiment_id, kind.value if isinstance(kind, AnalysisKind) else kind, type(exc).__name__)
         return None
 ```
 
@@ -887,6 +970,58 @@ their numbers are `ga`, and the CUPED route is `x-stability: beta` while its num
 their fields say. Post-stratification has no entry because it computes nothing — it answers
 501, and `/interactions/scan` reports overlap only and says so rather than carrying a label.
 
+**Is the number right at all? The ground-truth replay.** Seeds, versions and snapshots make a
+number reproducible, and the fingerprint tests compare the engine with its own past; none of
+them says the number is _correct_. `tests/ground_truth` (#1544) compares the results page with an
+independent answer. A seeded generator plans a population and its traffic; a driver sends the
+plan through the public API of a running Controlvar (assignments, tracked events, the
+experiment's lifecycle) and writes every request and answer to a ledger; a written event
+contract turns the ledger into the exact counts and per-user values the results must show; and a
+reference module computes the statistics from those values:
+
+```python
+# 📁 tests/ground_truth/ground_truth/reference.py  (docstring, abridged)
+"""The statistics the results must show, computed from the per-user values.
+
+Written from the docs, not from the product:
+
+* a conversion metric is analysed as a proportion, a two-sided Fisher's exact
+  test on the users who converted and those who did not, each treatment
+  against the control (``docs/architecture/technical-guide.md``, "Statistical
+  Methods"); its ``absolute_difference`` is the difference of the shares;
+* a revenue, count, duration or custom metric is analysed as its mean per
+  assigned user, Welch's t-test (``docs/getting-started/concepts.md``); its
+  ``absolute_difference`` is the difference of the means and
+  ``absolute_difference_ci`` Welch's interval at the confidence level
+  (``docs/api/endpoints.md``, "The difference from the control, its intervals
+  and the impact");
+...
+"""
+```
+
+The library imports nothing but the standard library, scipy and statsmodels — never `backend`,
+`modules` or an HTTP library — so a defect in the product cannot be copied into the answer it is
+checked against. `backend/tests/unit/ground_truth/test_independence.py` holds that twice, with a
+static scan of every import and with a fresh interpreter that refuses those packages. The
+replay reads `GET /api/v1/results/{id}?use_cache=false` and checks, per scenario: every
+assignment answer against the assignment hash, re-implemented from the docs (G0);
+`sample_size`, `conversions` and a revenue or count metric's `mean` exactly (G1); `p_value`,
+`adjusted_p_value`, `absolute_difference`, a mean's `absolute_difference_ci` and the SRM
+p-value within a stated tolerance, and `is_significant` exactly (G2); and no 5xx (Z). The four
+scenarios are an A/A test, a two-arm lift, a 30/70 split with repeat purchases carrying a
+revenue and a count metric, and a three-arm Benjamini–Hochberg test. The planted truth only
+sets each scenario's direction: the product is compared with the reference on the same sample,
+never with the truth it was generated from, because a correct engine still misses a planted
+effect some of the time. The `Ground-truth Replay` workflow (`.github/workflows/ground-truth.yml`)
+runs it on a pull request that touches what the replay exercises or is labelled `e2e`, and when
+dispatched by hand; it is not a required check.
+
+Offline, `backend/tests/unit/stats_validation/` holds the engine's operating characteristics
+with seeded simulations: the A/A significance and family-wise rates, interval coverage, a
+planted lift, the SRM, the Bayesian false-winner rate (Part III Hour 8) and the lopsided-revenue
+battery of Part I Hour 2. Those need no server, and they are what to run first when you change
+an estimator.
+
 > **Watch Out!** "Seeded" means reproducible **given the same inputs**. If late events arrive
 > tonight, tomorrow's recomputation for _today's_ bucket will differ — the seed is the same,
 > the counts aren't. That's why the snapshot stores the **payload**, not just the seed: the
@@ -906,7 +1041,7 @@ their fields say. Post-stratification has no entry because it computes nothing �
 >>> from backend.app.core.stats_engine import derive_seed, as_of_bucket, make_rng, ENGINE_VERSION
 >>> from datetime import datetime, timezone, timedelta
 >>> ENGINE_VERSION
-'1.4.0'
+'1.8.0'
 >>> as_of_bucket(datetime(2026, 9, 11, 23, 59, tzinfo=timezone.utc)), as_of_bucket(datetime(2026, 9, 12, 0, 1, tzinfo=timezone.utc))
 ('2026-09-11', '2026-09-12')
 >>> as_of_bucket(datetime(2026, 9, 11, 20, 0, tzinfo=timezone(timedelta(hours=-5))))   # 20:00 EST = 01:00 UTC next day
@@ -920,7 +1055,7 @@ True
 
 Then, against a running stack with a Bayesian-enabled experiment: call
 `GET /api/v1/results/{id}/bayesian` twice and diff the bodies (identical, including `seed`
-and `engine_version: "1.4.0"`; the route is not cached, and each call records the decision on
+and `engine_version: "1.8.0"`; the route is not cached, and each call records the decision on
 the experiment);
 query `SELECT kind, engine_version, seed, n_samples, as_of FROM experimentation.analysis_snapshots
 WHERE experiment_id = '…' ORDER BY created_at DESC LIMIT 5;` and confirm one `bayesian` row for
@@ -929,16 +1064,25 @@ today whose `seed` matches the response; then `POST /results/{id}/invalidate-cac
 And watch the fingerprint gate fire: change `PROB_BEST_THRESHOLD` in
 `bayesian_service.py` to 0.95 in a scratch checkout and run
 `python -m pytest backend/tests/unit/services/test_engine_fingerprint.py -q` — it fails,
-naming the hash it got. That failure is the reminder to bump the version.
+naming the hash it got. Now try the shortcut the old rule allowed: paste that hash over 1.8.0's
+in `ENGINE_FINGERPRINTS` and run `backend/tests/unit/services/test_engine_versions_frozen.py`.
+It fails as well, naming 1.8.0, because 1.8.0's digest moved. The only way out is the one the
+rule names: 1.9.0, appended everywhere.
 
 ### Key takeaways
 
 - Seed = `blake2b("{experiment_id}|{UTC day}|{n_samples}")` masked to 63 bits; `default_rng`
   only; stable across processes, machines and the dashboard/scheduler boundary.
-- `ENGINE_VERSION` (1.4.0) is bumped when numbers a client could have persisted would change;
-  `test_engine_fingerprint.py` forces it (update the unreleased hash, or bump a released
-  version; never edit a released hash). It's on the Bayesian, CUPED and bandit responses,
-  every snapshot, and the `/results` cache key.
+- `ENGINE_VERSION` (1.8.0) names the code that computed a number. An engine-changing pull
+  request — one that changes any number, decision or allocation weight a stamping path returns,
+  caches or persists — bumps it to the next minor and appends it to `RELEASED_ENGINE_VERSIONS`
+  in the same change. A version is frozen on merge, not on release; its pins are never edited;
+  a revert bumps again. `test_engine_fingerprint.py`, six other pin tables and the per-version
+  digests in `test_engine_versions_frozen.py` enforce it. The version is on the Bayesian, CUPED
+  and bandit responses, every snapshot, and the `/results` cache key.
+- Reproducible is not correct: the ground-truth replay (`tests/ground_truth`) checks the
+  results page against an independent reference that imports nothing from the product, and
+  `stats_validation` holds the engine's error rates offline.
 - `analysis_status.py` labels each analysis `ga` or `beta`; a `beta` response carries an
   `analysis_notice` saying what is not computed.
 - `analysis_snapshots`: one row per (experiment, kind, day) upserted, exact ticks for the
@@ -974,13 +1118,14 @@ samples and the persisted snapshot agrees with what was served; finer buckets wo
 coarser ones would freeze a daily-updated posterior.
 
 **Q6. You bump a default prior from Beta(1,1) to Beta(2,2). What else must change?**
-`test_engine_fingerprint.py` will fail, and that decides it. If the current `ENGINE_VERSION`
-has shipped in a release, bump it, update `test_stats_determinism.py` and both OpenAPI
-snapshots (their `engine_version` defaults follow it), and add the new version's hash beside
-the old ones; never edit a released version's hash. (If it has not shipped, replace its own
-hash: the change is part of that version.) A client could have persisted numbers computed under
-the old prior, and the snapshot's `engine_version` is how a reader tells the two apart. The
-`/results` cache key changes with it, so no old answer is served after the upgrade.
+`test_engine_fingerprint.py` will fail, and the rule decides the rest, whether or not a release
+has shipped since 1.8.0: bump `ENGINE_VERSION` to 1.9.0 in `stats_engine.py` and regenerate both
+OpenAPI snapshots (`make openapi`; their `engine_version` defaults follow it), append 1.9.0 to
+`RELEASED_ENGINE_VERSIONS` and `FROZEN_VERSIONS`, add its entry to every pin table, and append
+its digest to `FROZEN_DIGESTS` (run `test_engine_versions_frozen.py`; the failure prints it).
+Never edit 1.8.0's entries: it was frozen when it merged. A client could have persisted numbers
+computed under the old prior, and the snapshot's `engine_version` is how a reader tells the two
+apart. The `/results` cache key changes with it, so no old answer is served after the upgrade.
 
 **Quiz.** A results response has `correction_method: "none"`, three treatments, one with
 `p_value: 0.03, is_significant: true`. Should the PM ship?
