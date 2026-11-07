@@ -7,8 +7,8 @@
 > type hints, dataclasses, generators, context managers, `async`, threads, hashing, testing.
 > This book is different. Every concept is taught **twice**: once in the abstract, and once
 > with a real snippet pulled from the **Controlvar** backend (an open-source A/B-testing and
-> feature-flag platform: about 78,000 lines of type-hinted Python 3.11 in `backend/app`, some
-> 24,900 tests). By Hour 24 you
+> feature-flag platform: about 86,000 lines of type-hinted Python 3.11 in `backend/app`, some
+> 34,000 tests). By Hour 24 you
 > won't just _know_ Python — you'll know how a disciplined team uses it to run a service
 > where a single naive `datetime` once stopped every rollout (you'll meet that bug in
 > Hour 17), and where a method that didn't exist silently ran for months (Hour 1).
@@ -42,7 +42,8 @@ same rhythm so you can pace yourself:
 Each Part ends with a **Workshop** (Q&A + quiz + exercises with solutions) to lock it in.
 
 > **Convention in this book.** Code blocks tagged `# 📁 path/to/file.py` are real, current
-> Controlvar source at v0.36.4. Blocks with no path are illustrative. `# ✅` marks the idiom we want;
+> Controlvar source at commit `09d815ea` (`main` after v0.43.2). Blocks with no path are
+> illustrative. `# ✅` marks the idiom we want;
 > `# ❌` marks the anti-pattern it replaces. Have a Python 3.11 shell open — with the
 > repository's virtualenv active (`source venv/bin/activate`) you can import any module you
 > read about and poke at it.
@@ -121,25 +122,28 @@ each over the next 24 hours; keep them in view as your North Star:
 
 ## A note on accuracy
 
-Verified against Controlvar v0.36.4 (`79f8ed18`). Controlvar was called Experimently before
-0.35.0; you will still meet the old name in some identifiers (`experimently.bearer`,
-`EXPERIMENTLY_VERSION`, the `experimently-local` token issuer), and they are quoted as the code
-spells them. Every snippet tagged `# 📁` was compared with the file at that tag, line by line
-(a script normalises whitespace and trailing commas and lists any line that is not in the
-file); where a snippet leaves lines out it says so with `...`. Counts were measured at the tag:
-lines with `wc -l` over `backend/app` (78,458; `modules/backend/app` adds 21,483), tests with
-`pytest --collect-only -q` (24,868: 21,487 under `backend/tests`, 3,381 under
-`modules/backend/tests`, with `modules/requirements.txt` and `modules/requirements-test.txt`
-installed), `mypy backend/app/` (1,010 errors in 147 files), and the pinned tool versions in
+Verified against Controlvar `main` at `09d815ea` (after v0.43.2). Controlvar was called
+Experimently before 0.35.0; you will still meet the old name in some identifiers
+(`experimently.bearer`, `EXPERIMENTLY_VERSION`, the `experimently-local` token issuer), and
+they are quoted as the code spells them. Every snippet tagged `# 📁` was compared with the
+file at that commit, line by line (a script normalises whitespace and lists any line that is
+not in the file); where a snippet leaves lines out it says so with `...`, and a long call or
+signature is sometimes joined onto one line. Counts were measured at that commit: lines with
+`wc -l` over the `.py` files in `backend/app` (85,617; `modules/backend/app` adds 22,974),
+tests with `pytest --collect-only -q` (34,246: 30,394 under `backend/tests` and 3,852 under
+`modules/backend/tests`, not counting eight warehouse test files that need `duckdb` and
+`sqlglot` from the modules' requirements, which the venv used did not have), `mypy
+backend/app/` (1,053 errors in 156 files), and the pinned tool versions in
 `backend/requirements.txt` (Python 3.11, ruff 0.16.10, mypy 1.20.2, NumPy 1.26.4,
-SciPy 1.17.1). The hashing and NumPy/SciPy Try-It outputs, the `lint-imports` contracts and the
+SciPy 1.17.1). The hashing, regex, scheduler-thread and NumPy/SciPy Try-It outputs and the
 Part VI solutions were run; the Try-Its that need a database, the dashboard or a running
-scheduler were not. Files move; if a path 404s, `git grep` the symbol (e.g.
+scheduler were not. The `lint-imports` contracts were run for the v0.36.4 edition, and
+`pyproject.toml` has not changed since. Files move; if a path 404s, `git grep` the symbol (e.g.
 `git grep -n "def _hash_user_to_variant"`). The _patterns_ outlast the line numbers.
 
 To re-check a quote yourself, clone [`Controlvar/controlvar`](https://github.com/Controlvar/controlvar)
-at `v0.36.4`, then point this repository's `tools/check.sh` at it (see `tools/README.md`) to
-re-run the path, snippet and link checks over this book.
+and check out `09d815ea`, then point this repository's `tools/check.sh` at it (see
+`tools/README.md`) to re-run the path, snippet and link checks over this book.
 
 _Now turn to [Part I](./part-1-getting-started.md) and start the clock. ⏱️_
 

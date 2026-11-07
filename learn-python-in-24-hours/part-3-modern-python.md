@@ -5,7 +5,7 @@
 [← Part II](./part-2-data-structures.md) · [Contents](./README.md) · [Part IV →](./part-4-idioms.md)
 
 Parts I and II were the language a script is written in. This Part is the language a
-_codebase_ is written in: how some 78,000 lines of `backend/app` are split into modules and why the import spelling
+_codebase_ is written in: how some 86,000 lines of `backend/app` are split into modules and why the import spelling
 matters (Hour 9), classes and the three kinds of method (Hour 10), the two lightweight ways
 to give data a shape — dataclasses and enums (Hour 11), the type-hint vocabulary that
 Pydantic enforces and `mypy` can check (Hour 12), and how errors are raised, caught, chained and — most
@@ -880,8 +880,9 @@ matters:
 > for optional-with-default. Pydantic v2 is strict about this too: `Optional[str]` without
 > `= None` is a _required_ field that may be null.
 
-> **Did You Know?** `mypy` is _not_ a gate here, and the reason is a number: at v0.36.4
-> `mypy backend/app/` reports 1,010 errors in 147 files (mypy 1.20.2, the pinned requirements). The `[tool.mypy]`
+> **Did You Know?** `mypy` is _not_ a gate here, and the reason is a number: at `09d815ea`
+> `mypy backend/app/` reports 1,053 errors in 156 files (mypy 1.20.2, the pinned
+> requirements). The `[tool.mypy]`
 > settings are strict on paper (`disallow_untyped_defs = true`), the code is not there yet,
 > and a gate that fails on every pull request would be switched off. What the codebase does
 > keep is the habit: where the ORM's dynamic attributes defeat the checker, an ignore names
@@ -915,8 +916,8 @@ and run `mypy scratch_types.py` from the repository root (so it picks up the `[t
 settings) — among its two errors is `"Counters" has no attribute "get_counters"
 [attr-defined]`. That's the whole argument for hints in one command. Then try a real file:
 `mypy backend/app/core/scheduler_tick.py`. It reports nothing in `scheduler_tick.py` itself,
-but mypy follows imports, so it prints a few hundred errors from the modules it pulled in —
-the 931 above, seen from one corner.
+but mypy follows imports, so it prints a few hundred errors (413 at `09d815ea`) from the
+modules it pulled in — the 1,053 above, seen from one corner.
 
 ### Common mistakes
 
@@ -1076,7 +1077,9 @@ branch ends there. A failed rollback is logged, not raised, so it can't replace 
 error.
 
 The scheduler isolates each row in its own **savepoint** (a nested transaction), so one row
-the database refuses is rolled back alone and the rest of the tick carries on:
+the database refuses is rolled back alone and the rest of the tick carries on. (This is
+`ExperimentScheduler._process_due`, the tick's database work, a plain `def` that runs in a
+worker thread — Hour 19 says why.)
 
 ```python
 # 📁 backend/app/core/scheduler.py

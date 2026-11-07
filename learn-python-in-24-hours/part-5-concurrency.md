@@ -20,7 +20,8 @@ keeps per-request state straight (Hour 20).
 
 An **event loop** is a scheduler for **coroutines** — functions declared `async def` that
 can pause at `await` and let something else run. A coroutine pauses only where it says
-`await`; between awaits it runs to completion without interruption. That's cooperative
+`await` (and only when the thing awaited actually has to wait); between those points it runs
+without interruption. That's cooperative
 multitasking: no locks needed for data that's only touched between awaits, and no
 parallelism — one coroutine runs at a time.
 
@@ -70,7 +71,7 @@ def get_experiment_results(
 ) -> ExperimentResultsResponse:
 ```
 
-An `async def` with real awaits — the safety tick awaits the service's async methods:
+An `async def` full of awaits — the safety check awaits the service's async methods:
 
 ```python
 # 📁 backend/app/core/safety_scheduler.py
@@ -87,8 +88,33 @@ An `async def` with real awaits — the safety tick awaits the service's async m
                     rollback_result = await safety_service.async_rollback_feature_flag(...)
 ```
 
-Each `await` is a point where another coroutine — a request handler, another scheduler —
-may run. Between them the loop body runs uninterrupted.
+Each `await` is a point where the coroutine _may_ pause and let another one — a request
+handler, another scheduler — run. It pauses only if what it awaits actually suspends: an
+`asyncio.sleep`, a network read through an async driver, a lock it must wait for. Awaiting a
+coroutine that never suspends is just a function call. And these never do: they are
+`async def`s wrapped around synchronous SQLAlchemy. The scheduler's own docstring says so,
+with the cost:
+
+```python
+# 📁 backend/app/core/safety_scheduler.py
+    async def _check_off_loop(self) -> Dict[str, int]:
+        """
+        Run :meth:`check_feature_flags_safety` in a worker thread (#1690).
+
+        The check is synchronous SQLAlchemy, a few queries per ACTIVE flag,
+        behind ``async def``s that never suspend. On the event loop it stopped
+        the API answering anything for its whole run, every 5 minutes
+        (measured locally: 0.3-0.6 s at 100 ACTIVE flags, about 3 s at
+        1,000). Here it runs unchanged in one worker thread, on a private
+        event loop and with its own session, and the API's loop awaits the
+        result. The rollback alerts it sends go with it.
+        ...
+        """
+```
+
+So a page of `await`s proves nothing about concurrency. What decides is whether anything
+underneath yields to the loop. Since v0.42.0 the safety tick runs this method, unchanged, off
+the loop entirely; Hour 19 shows how.
 
 `await asyncio.sleep`, never `time.sleep`, in the loop:
 
@@ -186,6 +212,17 @@ print(asyncio.run(ExperimentScheduler().process_scheduled_experiments()))
 >>> async def forgot():
 ...     fetch("oops", 0)                  # RuntimeWarning: coroutine 'fetch' was never awaited
 >>> asyncio.run(forgot())
+>>> async def never_suspends(): return 1
+>>> async def main():
+...     order = []
+...     async def other(): order.append("other")
+...     t = asyncio.create_task(other())
+...     for _ in range(3):
+...         await never_suspends(); order.append("main")
+...     await t
+...     return order
+>>> asyncio.run(main())                   # no await in the loop let `other` in
+['main', 'main', 'main', 'other']
 ```
 
 Then count the two handler styles in the repo — `git grep -c "^async def " backend/app/api/v1/endpoints/results.py`
@@ -197,14 +234,16 @@ module is consistently `def`.
 - **Forgetting `await`** — a coroutine that never runs; for a permission check, a silent
   pass.
 - **`time.sleep` / blocking I/O in a coroutine** — freezes the loop.
+- **Reading `await` as "yields here"** — an `async def` wrapped around synchronous code
+  suspends nowhere; a chain of them blocks the loop for the whole run.
 - **`await` in a `def`** — `SyntaxError`; make it `async def` or use `asyncio.run` at the
   top level only.
 - **Mixing styles within a module** — pick one per file.
 
 ### Key takeaways
 
-- `async def` returns a coroutine; `await` runs it and yields to the loop; only awaits are
-  switch points.
+- `async def` returns a coroutine; `await` runs it; only an `await` on something that
+  actually suspends is a switch point — an `async def` over synchronous code yields nothing.
 - Blocking calls block everyone; `await asyncio.sleep`, `to_thread`/`run_in_threadpool`.
 - FastAPI: `async def` on the loop, `def` in a threadpool; consistent per module.
 - Async dependencies must be awaited or `Depends`-ed; `asyncio.gather` for concurrency;
@@ -236,7 +275,10 @@ Three facts about tasks that the scheduler code depends on:
 an awaitable — the escape hatch for CPU-bound or blocking work inside a coroutine. It's
 what the bandit runner uses for Monte Carlo and its database work, and what
 `async_scheduler_lock` (Hour 15) uses to take and release the advisory lock, so a database
-that hangs blocks a worker thread rather than the event loop.
+that hangs blocks a worker thread rather than the event loop. The other four schedulers
+(experiment, safety, metrics and rollout) go through a stricter wrapper, `run_in_worker` in `backend/app/core/scheduler_tick.py`; by v0.43.2 every
+tick's database work, and the run record each tick writes, runs in a worker thread. The second
+half of this Hour is why the wrapper exists.
 
 ### In the wild
 
@@ -252,7 +294,9 @@ The task lifecycle, start to stop:
 
         self.is_running = True
         self.task = asyncio.create_task(self._run_scheduler())
-        logger.info(f"Experiment scheduler started with {self.interval_minutes} minute interval")
+        logger.info(
+            f"Experiment scheduler started with {self.interval_minutes} minute interval"
+        )
 
     async def stop(self):
         """Stop the scheduler."""
@@ -274,7 +318,8 @@ The task lifecycle, start to stop:
         while self.is_running:
             try:
                 # One tick under the advisory lock; records the run and
-                # skips when another replica holds the lock.
+                # skips when another replica holds the lock. Its database
+                # work runs in a worker thread.
                 await run_locked_tick(
                     SCHEDULER_NAME, self.process_scheduled_experiments
                 )
@@ -343,6 +388,108 @@ The session is opened _inside_ the thread and never crosses back — sessions ar
 thread-safe, so the boundary is the function call. `run_count` is updated on the loop after
 the thread returns, so no lock is needed.
 
+#### Every tick off the loop: `run_in_worker`
+
+The experiment scheduler's tick has the same shape as the bandit's, split in two. A plain
+`def`, `_process_due`, does all the database work with its own session (it is the savepoint
+loop from Hour 13) and returns a small dataclass of what happened. The coroutine sends it to a
+thread and waits:
+
+```python
+# 📁 backend/app/core/scheduler.py
+        # self._process_due is read here, at call time: the tests replace it
+        # on the instance.
+        work = await run_in_worker(self._process_due, label=f"{SCHEDULER_NAME} tick")
+
+        if work.activated_ids:
+            await experiment_cache.drop_cached_experiment_details(work.activated_ids)
+            await _send_each(
+                self._notification_service.notify_experiment_started, work.started
+            )
+```
+
+What touches the process-wide Redis pool (the cache drop) stays on the API's loop, after the
+thread has returned. The method's docstring says why: that pool belongs to the API's loop.
+
+The run record every tick writes went the same way, and the comment beside it is the most
+useful paragraph in this Part:
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+    if record:
+        # In a worker thread, like the tick bodies (#1690): the write checks a
+        # connection out of the pool, and when every connection is held by a
+        # request waiting for this event loop, a checkout made on the loop's
+        # own thread waits the whole pool timeout and stops the API answering
+        # for that long -- and then the run record is lost as well.
+        await run_in_worker(
+            functools.partial(
+                _persist_run, name, started_at, completed_at, status, result, error
+            ),
+            label=f"{name} run record",
+        )
+```
+
+Read it slowly. Every pooled connection is held by a request that is waiting for this event
+loop, and a synchronous checkout made on the loop's own thread then waits the whole pool
+timeout (`pool_timeout=30` in `backend/app/db/session.py`). For that long the API answers
+nothing. That is public issue #1756, "Under sustained overload, the API stops answering for
+about 30 seconds at a time", fixed in v0.43.2: Hour 18's rule, "blocking calls block the
+loop", with a timeout attached. (`functools.partial` freezes the six arguments into a
+zero-argument callable — Hour 4's functions-as-objects — because `run_in_worker` takes one.)
+
+Why not plain `asyncio.to_thread`? The wrapper is short. The part of its docstring shown here
+covers the first trap; the part behind the `...` covers cancellation, and the list below
+quotes it:
+
+```python
+# 📁 backend/app/core/scheduler_tick.py
+async def run_in_worker(work: Callable[[], Any], *, label: str) -> Any:
+    """
+    Run *work* in a worker thread; the event loop awaits it (#1690).
+
+    For a tick whose body is synchronous (SQLAlchemy queries, HTTP sends): run
+    on the event loop, it stops the API answering anything else until it
+    finishes. *work* must be a plain callable. A coroutine function cannot be
+    handed over as it is -- ``asyncio.to_thread`` on one only creates the
+    coroutine and never runs it, and the tick is recorded as a success that
+    did nothing -- so wrap it to create and run the coroutine inside the
+    thread, on a private event loop: ``lambda: asyncio.run(body())``.
+    ...
+    """
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, functools.partial(contextvars.copy_context().run, work)
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await _wait_for_worker(worker, label)
+        raise
+```
+
+Four ideas in eight lines:
+
+1. **A coroutine function is not work.** Calling `body()` only _creates_ a coroutine object;
+   `to_thread(body)` does that in the thread and hands the unrun object back. The safety tick
+   (Hour 18) therefore passes `lambda: asyncio.run(self.check_feature_flags_safety())`: the
+   thread starts its own event loop and runs the coroutine to completion there.
+2. **`contextvars.copy_context().run`** carries the caller's `ContextVar`s (Hour 20 — the log
+   context) into the thread, as `to_thread` does.
+3. **`asyncio.shield(worker)`** keeps a cancellation of _this_ coroutine from reaching the
+   worker. A thread cannot be cancelled anyway — Python has no way to stop one from outside —
+   so on `CancelledError` the wrapper waits for the thread to finish, then re-raises. The
+   docstring gives the reason: `run_locked_tick` releases the advisory lock when the tick
+   returns, and returning early "would let another replica's tick run beside a thread that is
+   still running." Plain `to_thread` returns at once on cancel and leaves the thread running.
+4. **`run_in_executor`** returns a plain `Future`, not a `Task`, so when `asyncio.run` tears
+   the loop down and cancels every task, the worker is not among them.
+
+The lesson for anyone changing the backend: a scheduler tick's synchronous work goes through
+`run_in_worker`, and a cancelled tick must not return while its thread still runs. The
+regression tests that pin both are
+`backend/tests/integration/services/test_ticks_off_the_loop.py` and
+`test_safety_tick_off_loop.py` beside it.
+
 The lifespan as the owner of every task, and the shutdown order (stop in the same order as
 start — the code doesn't depend on order, but symmetry is easy to verify):
 
@@ -382,11 +529,12 @@ _awaits_, not threads, that create the race.
 
 > **Did You Know?** There are two thread pools in the process. `run_in_threadpool` and
 > FastAPI's plain `def` endpoints use `anyio`'s worker threads (capped at 40 by default);
-> `asyncio.to_thread` uses the event loop's default executor (`min(32, cpu_count + 4)`
-> threads). Each is per process, so a burst of threadpool endpoints competes for one pool
-> and the scheduler offloads for the other — and adding uvicorn workers multiplies both. The
-> image starts one worker by default (`--workers ${WEB_CONCURRENCY:-1}` in
-> `backend/Dockerfile`) and scales by running more containers.
+> `asyncio.to_thread` and `run_in_worker` (`run_in_executor(None, ...)`) use the event loop's
+> default executor (`min(32, cpu_count + 4)` threads). Each is per process, so a burst of
+> threadpool endpoints competes for one pool and the scheduler offloads for the other — and
+> adding uvicorn workers multiplies both. The
+> image starts one worker by default (`backend/Dockerfile` sets `WEB_CONCURRENCY=1`, which
+> uvicorn reads as its worker count) and scales by running more containers.
 
 ### Try It Yourself
 
@@ -415,7 +563,30 @@ _awaits_, not threads, that create the race.
 ...     r, _ = await asyncio.gather(asyncio.to_thread(cpu), asyncio.sleep(0.1))
 ...     return round(time.perf_counter() - t0, 2)
 >>> asyncio.run(offload())
+
+>>> async def body(): return "did the work"
+>>> async def handed_over(): return await asyncio.to_thread(body)
+>>> asyncio.run(handed_over())                       # <coroutine object body at ...>: never ran
+>>> from backend.app.core.scheduler_tick import run_in_worker      # venv, repo root
+>>> async def wrapped(): return await run_in_worker(lambda: asyncio.run(body()), label="demo")
+>>> asyncio.run(wrapped())
+'did the work'
+>>> def slow(events): time.sleep(0.3); events.append("thread finished")
+>>> async def cancel_during(offload, events):
+...     t = asyncio.create_task(offload(lambda: slow(events)))
+...     await asyncio.sleep(0.05); t.cancel()
+...     try: await t
+...     except asyncio.CancelledError: events.append("task cancelled")
+...     await asyncio.sleep(0.4); return events
+>>> asyncio.run(cancel_during(asyncio.to_thread, []))
+['task cancelled', 'thread finished']
+>>> asyncio.run(cancel_during(lambda work: run_in_worker(work, label="demo"), []))
+['thread finished', 'task cancelled']
 ```
+
+The last two lines are the whole reason for the wrapper: with `to_thread` the cancelled task
+is gone while its thread still runs; with `run_in_worker` the task ends only after the thread
+does.
 
 Then run a real scheduler's `start()`/`stop()` (Hour 19 of the FastAPI book) and confirm
 `task is None` afterwards; then read `BanditSchedulerRunner._run_scheduler` and find where
@@ -425,6 +596,10 @@ its sleep can be shortened by tests (`interval_seconds`).
 
 - **Swallowing `CancelledError`** (`except BaseException: pass`) — an unstoppable task.
 - **Sharing a `Session` between the loop and a thread.** Open it inside the thread.
+- **`to_thread(some_async_function)`** — the thread creates the coroutine and hands it back
+  unrun; the work "succeeds" having done nothing. Use `lambda: asyncio.run(body())`.
+- **Returning from a cancelled coroutine while its thread still runs**, when something (a
+  lock, a record) assumes the work has stopped. Wait for the thread, as `run_in_worker` does.
 - **Forgetting that awaits are switch points** — a read-modify-write across an `await`
   needs an `asyncio.Lock`.
 - **Fire-and-forget tasks with no exception handling** — "exception never retrieved."
@@ -436,6 +611,10 @@ its sleep can be shortened by tests (`interval_seconds`).
 - The lifespan owns tasks: start before `yield`, stop after.
 - `to_thread` for blocking/CPU work; open sessions inside the thread; the pool is per
   process.
+- Every scheduler tick's database work runs in a thread through `run_in_worker`: a plain
+  callable only, the context copied, and a cancelled tick waits for its thread before it
+  re-raises. A synchronous checkout on the loop's thread can stall the whole API for the pool
+  timeout (#1756).
 - `asyncio.Lock` guards data mutated across awaits; `gather` for concurrency.
 
 ---
@@ -445,7 +624,8 @@ its sleep can be shortened by tests (`interval_seconds`).
 ### What & why
 
 Threads still exist in an async backend, in three places: FastAPI's threadpool (plain `def`
-endpoints and `run_in_threadpool`), `asyncio.to_thread`, and the middleware, which may be
+endpoints and `run_in_threadpool`), the event loop's executor (`asyncio.to_thread`, and the
+schedulers' `run_in_worker`), and the middleware, which may be
 entered from threadpool workers. Any object touched from more than one thread needs a
 **`threading.Lock`** (or `RLock`, re-entrant, when a locked method calls another locked
 method). The Python interpreter's GIL serialises bytecode, but a compound operation — check
@@ -717,6 +897,14 @@ another locked method.
 other?**
 The value lives in a `ContextVar`, which is per task; each request's coroutine has its own
 context, and `.copy()` before `.update()` ensures the shared default is never mutated.
+
+**Q7. `check_feature_flags_safety` is an `async def` full of `await`s. Why did it still stop
+the API answering while it ran on the event loop, and why does `run_in_worker`, when its tick
+is cancelled, wait for the thread instead of re-raising at once?**
+The methods it awaits are `async def`s over synchronous SQLAlchemy that never suspend, so no
+`await` in it ever handed the loop back. As for the wait: a thread cannot be cancelled, and
+`run_locked_tick` releases the advisory lock as soon as the tick returns; returning early would
+let another replica's tick run beside a thread that is still working.
 
 **Quiz.** What does `asyncio.to_thread(self._run_sync)` return, and what must `_run_sync`
 never do?

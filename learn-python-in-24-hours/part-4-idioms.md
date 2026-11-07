@@ -730,7 +730,10 @@ def normalize_event_timestamp(value: Any) -> str:
     ...
     Accepts a ``datetime`` or an ISO-8601 string (``Z`` or a numeric offset).
     Raises ``ValueError`` for anything else, so an unreadable timestamp is
-    refused rather than stored and compared as text.
+    refused rather than stored and compared as text.  That includes a value
+    at the edge of the date range whose offset moves it past 0001-01-01 or
+    9999-12-31 once converted to UTC (``datetime.astimezone`` raises
+    ``OverflowError`` for it, #1684).
     """
     if isinstance(value, datetime):
         moment = value
@@ -740,12 +743,26 @@ def normalize_event_timestamp(value: Any) -> str:
         raise ValueError("event timestamp must be a datetime or an ISO-8601 string")
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc).isoformat()
+    try:
+        return moment.astimezone(timezone.utc).isoformat()
+    except OverflowError:
+        raise ValueError(
+            "event timestamp is outside the range that can be stored once it "
+            "is converted to UTC (0001-01-01 to 9999-12-31)"
+        ) from None
 ```
 
 Label the naive value, convert the aware one, then format: `2026-09-11T14:03:22.118342+00:00`.
 A client that sends `2026-09-11T16:03:22+02:00` or `...Z` is stored as the same instant in the
 same shape. (`fromisoformat` accepts a trailing `Z` since Python 3.11.)
+
+The `try` is an edge the first version missed: `9999-12-31T23:00:00-05:00` is a valid
+`datetime`, but in UTC it is the next day, in year 10000, which Python cannot represent, so
+`astimezone` raises `OverflowError`. The callers expect `ValueError` for a bad timestamp (and
+answer 422 for it), so the function translates. `raise ... from None` is the counterpart of
+Hour 13's `raise ... from exc`: it _suppresses_ the chained traceback ("During handling of the
+above exception, another exception occurred"), because the `OverflowError` is a detail of the
+conversion, not a cause the caller can act on.
 
 And so that no writer can forget to call it, the column type calls it — a SQLAlchemy
 `TypeDecorator` that runs on every value _bound_ to the column, whether it is being written
@@ -770,6 +787,60 @@ class UTCTimestampString(TypeDecorator):
 `Event.created_at >= boundary` binds `boundary` through this type, so a window edge given as
 an aware `datetime` is compared in the same format as the stored strings. The event service's
 own helper now just delegates (`_to_iso_timestamp` calls `normalize_event_timestamp`).
+
+#### The database's clock is not yours: the session time zone
+
+"Naive means UTC" has one more trap, and it is outside Python. Rollout stage dates live in
+`timestamp without time zone` columns, and a request sends them with an offset
+(`2026-11-05T17:00:00Z`), so SQLAlchemy binds an **aware** `datetime`. PostgreSQL accepts it —
+and converts it to the _database session's_ time zone before dropping the zone. On a session
+in UTC that conversion changes nothing, so nothing looks wrong. On a session in Los
+Angeles, a stage sent for 17:00 UTC was stored as 09:00 in November (10:00 in July), served
+back eight hours early, and the scheduler started the time-based stage early (#1462, fixed in
+v0.40.0). The fix applies the same trick as `UTCTimestampString`: a column type that converts
+in Python, before the database sees the value.
+
+```python
+# 📁 backend/app/models/column_types.py
+class UTCDateTime(TypeDecorator):
+    """A ``timestamp without time zone`` column whose bound values are UTC.
+
+    The columns that use it hold UTC with no zone, but the API binds them in
+    three shapes: an aware datetime (a request's dates, or the time a
+    scheduler or a route records), an ISO string and a naive one. PostgreSQL
+    converts an aware value to the session's time zone on the way into such a
+    column and ignores the offset in a string, so on a session whose time zone
+    is not UTC the stored value moved by the offset.
+    ...
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value)
+        if isinstance(value, datetime) and value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+```
+
+```python
+# 📁 backend/app/models/rollout_schedule.py
+    start_date = Column(UTCDateTime)  # For time-based triggers
+    completed_date = Column(UTCDateTime)  # When the stage was completed
+```
+
+Three shapes in, one shape out: a string is parsed, an aware value is _converted_ to UTC and
+then has its zone removed (`.astimezone(...)` first, `.replace(tzinfo=None)` second — the
+other order would throw the offset away), and a naive value passes through as UTC already.
+It is `_as_utc` run the other way: `_as_utc` makes naive values aware so they can be
+compared; `UTCDateTime` makes aware values naive so they can be stored. The database type did
+not change (no migration), only what Python hands it. The same type already guarded
+`experiments.start_date` and `end_date` (#704); the fix moved it to `models/column_types.py`
+so both models could share it.
 
 The client-error endpoint takes the third way out: it does not trust the client's clock at all.
 Rows in `error_logs` are timed by the server on receipt, with
@@ -907,6 +978,9 @@ of each, say whether the value meets a database column (naive) or a computed tim
   of converting; use `.astimezone`.
 - **Wall-clock (`time.time()`) for durations and windows** — use `perf_counter`/`monotonic`.
 - **Assuming a client's ISO string has an offset.** Validate, or normalise on receipt.
+- **Binding an aware value to a `timestamp without time zone` column** and trusting the
+  database to store UTC. It stores the session's local time. Convert to naive UTC in Python
+  first (`UTCDateTime`).
 
 ### Key takeaways
 
@@ -915,6 +989,9 @@ of each, say whether the value meets a database column (naive) or a computed tim
 - Convention here: naive means UTC; normalise at every comparison with `_as_utc`; write
   naive to naive columns; ISO strings always carry `+00:00`.
 - `replace(tzinfo=)` labels, `astimezone()` converts; `date()` after converting to UTC.
+- Normalise at the boundary, in one function every path goes through: `UTCTimestampString`
+  and `UTCDateTime` do it in the column type, so no writer can forget and no database
+  setting can move the value.
 - `perf_counter`/`monotonic` for elapsed time; the bug that stopped rollouts was one
   comparison.
 
@@ -946,6 +1023,13 @@ comparing.
 **Q6. When is `.replace(tzinfo=timezone.utc)` wrong?**
 On an aware value in another zone — it relabels 14:00 CET as 14:00 UTC instead of
 converting to 13:00 UTC. Use `.astimezone(timezone.utc)` for aware values.
+
+**Q7. A rollout stage sent with `start_date: "2026-11-05T17:00:00Z"` came back as `09:00`.
+Python did nothing wrong. What did, and why does `UTCDateTime` fix it in Python?**
+The column is `timestamp without time zone`; PostgreSQL converted the aware value to the
+session's time zone (Los Angeles) before storing it. `UTCDateTime.process_bind_param` converts
+to UTC and removes the zone before the value leaves Python, so the session's setting no longer
+matters — and it does so for every writer, because it lives in the column type.
 
 **Quiz.** Which of these are context managers in the codebase: `scheduler_lock(name)`,
 `TestClient(app)`, `pytest.raises(X)`, `engine.begin()`, `get_db()`?

@@ -25,7 +25,8 @@ them up is a real bug class.
   functions of bytes_. The platform uses MD5 for bucketing (fast, uniform, available in
   every language; `usedforsecurity=False` tells linters and FIPS builds it's not a security
   primitive), SHA-256 for API-key storage (fast, one-way; a random 128-bit key needs no slow
-  hash), and BLAKE2b for Monte Carlo seeds (a keyed-size digest that packs into 8 bytes).
+  hash) and for the fixed-length key that recognises an event sent twice, and BLAKE2b for
+  Monte Carlo seeds (a keyed-size digest that packs into 8 bytes).
 - **`struct`** — packs and unpacks bytes to fixed-width integers. `struct.unpack("<I",
   b)` reads 4 bytes as a **little-endian unsigned 32-bit int** — the cross-SDK convention.
 - **`secrets`** — cryptographically random values for tokens and keys
@@ -197,6 +198,61 @@ big-endian counterpart of `struct.unpack(">Q")`; `& ((1 << 63) - 1)` clears the 
 so the value fits a signed PostgreSQL `BIGINT`. Every Monte Carlo draw on the platform goes
 through `make_rng(derive_seed(...))` — same inputs, same samples, byte for byte.
 
+SHA-256 once more, as a fingerprint of _several_ strings. An SDK may send an event with an
+`event_id`, and an event sent again with the same `event_id` (a retry, say) is stored once
+(since v0.40.0, #1543). The server recognises "the same event" by a key built from four parts:
+
+```python
+# 📁 backend/app/services/event_dedup.py
+def _encoded(part: str) -> bytes:
+    """``<byte length>:<UTF-8 bytes>``: the length is ASCII decimal digits."""
+    data = part.encode("utf-8")
+    return str(len(data)).encode("ascii") + b":" + data
+
+
+def dedup_key(
+    experiment_id: Optional[Union[UUID, str]],
+    feature_flag_id: Optional[Union[UUID, str]],
+    event_name: str,
+    event_id: str,
+) -> str:
+    """The 64-character key of one event within its user.
+    ...
+    """
+    digest = hashlib.sha256()
+    for part in (
+        _id_text(experiment_id),
+        _id_text(feature_flag_id),
+        event_name,
+        event_id,
+    ):
+        digest.update(_encoded(part))
+    return digest.hexdigest()
+```
+
+Why not `hashlib.sha256(f"{experiment}:{flag}:{name}:{event_id}".encode())`? Because a
+separator separates only when no part can contain it, and `event_name` and `event_id` are
+strings a client chooses: `("a:b", "c")` and `("a", "b:c")` both join to `a:b:c`, and two
+different events would share one key. Writing each part's length in front of it removes the
+ambiguity — `2:ab` + `1:c` is not `1:a` + `2:bc` — because a reader of the bytes always knows
+where each part ends. The module docstring says it in one line: ``("ab", "c")`` and
+``("a", "bc")`` differ, "which a separator would not guarantee." Three more details:
+
+- the length counts **bytes**, not characters (`len("é")` is 1, `len("é".encode("utf-8"))`
+  is 2), because bytes are what gets hashed;
+- `digest.update(...)` feeds the hash piece by piece, which gives the same digest as hashing
+  the concatenation once;
+- the result is always 64 hex characters, whatever the input (the docstring names "a
+  255-character `event_id` of four-byte characters"), so it fits a fixed `String(64)` column:
+  `event_dedup_keys`, whose primary key is the user id plus this key.
+
+The bucketing hashes earlier in this Hour join with `:` and that is fine for them: a
+collision there only puts two (user, key) pairs in the same bucket, which every bucketing hash
+does by design. For an _identity_ — is this the same event? — a collision would silently drop a
+real one. And because the key is stored, its encoding can never change quietly:
+`backend/tests/unit/services/test_event_dedup.py` pins the exact bytes and digests, since a
+different encoding would stop recognising every event already stored.
+
 `secrets.token_hex(32)` is also the recommended way to generate the settings secrets the
 production validators demand:
 
@@ -230,18 +286,34 @@ production validators demand:
 >>> hmac.compare_digest("abc", "abc"), hmac.compare_digest("abc", "abd")
 >>> hashlib.blake2b(b"exp|2026-09-11|10000", digest_size=8).digest()
 >>> int.from_bytes(hashlib.blake2b(b"exp|2026-09-11|10000", digest_size=8).digest(), "big") & ((1 << 63) - 1)
+>>> def enc(part): data = part.encode("utf-8"); return str(len(data)).encode("ascii") + b":" + data
+>>> ":".join(["a:b", "c"]) == ":".join(["a", "b:c"])            # the separator collides
+True
+>>> enc("ab") + enc("c"), enc("a") + enc("bc"), enc("é")
+(b'2:ab1:c', b'1:a2:bc', b'2:\xc3\xa9')
+>>> from backend.app.services.event_dedup import dedup_key
+>>> dedup_key(None, None, "purchase", "order-1001")
+'9f9e77c14972cd70e3e493c3a8b0c9aa865a817b545dfbf037e29a13f2160257'
+>>> hashlib.sha256(b"0:0:8:purchase10:order-1001").hexdigest() == dedup_key(None, None, "purchase", "order-1001")
+True
 ```
 
 For `user-42`/`hero_banner` the three readings give 74 (whole digest `% 100`), 91 (first four
 bytes `% 100`, the holdout reading) and 0.1705… (÷ 2³²), so `bucket_of` gives 17. Same digest,
-three numbers.
+three numbers. The last lines rebuild the dedup key by hand: no experiment and no flag are
+`0:` each, then `8:purchase` and `10:order-1001`.
 
 Then run the golden vectors, from the repository root with the venv active:
 
 ```bash
-python -m pytest tests/sdk-contract -q -o addopts=""        # the harness's own tests
+python -m pytest tests/sdk-contract -q -o addopts=""        # the harness's own tests (network and node)
 python tests/sdk-contract/hash_contract.py python           # the Python SDK against the vectors
 ```
+
+The first command also checks the _published_ SDK releases against the server's ruleset
+(`test_published_ruleset.py`): it downloads them from npm and PyPI and runs the JavaScript one
+with `node`, and it fails, rather than skips, without either. The second needs nothing but the
+repository.
 
 The second prints `python: OK -- 9/9 hash vectors, 2/2 rollout vectors, 9/9 md5 digests`.
 (`make test-sdk` runs both, plus the JavaScript, edge, React Native and Go SDKs, which need
@@ -257,6 +329,8 @@ not run there.
   recipe to predict a flag rollout). Different functions; check which one the caller uses.
 - **`random` for tokens.** `secrets`.
 - **`==` on secrets.** `hmac.compare_digest`.
+- **Hashing `f"{a}:{b}"` as an identity** when a part can contain `:`. Length-prefix each
+  part (in bytes), as `dedup_key` does.
 
 ### Key takeaways
 
@@ -266,6 +340,9 @@ not run there.
   it (`bucket_of`, salted with `experiment.key`); `int(hex, 16)` is the whole-digest one that
   flag rollout uses; salts make buckets independent.
 - `secrets` for keys and settings secrets; `hmac.compare_digest` to check them.
+- Several strings into one stored key: `<byte length>:<bytes>` per part, then SHA-256 — a
+  fixed length, and no two different tuples encode to the same bytes — and pin the encoding
+  with a test, because once keys are stored it can never change.
 - Seeded `default_rng` everywhere randomness is shown to a user.
 
 ---
@@ -389,9 +466,9 @@ The same idea shaped for the bandit, with `bincount` instead of a loop of means:
 `n × k` matrix; `axis=1` argmaxes across each row; `bincount` counts occurrences of each
 index; `.tolist()` converts back to Python floats for JSON.
 
-SciPy tests — three different return shapes. The results endpoint analyses every metric as
-a proportion (converting users over assigned users) with Fisher's exact test, which returns a
-tuple:
+SciPy tests — three different return shapes. The results endpoint analyses a conversion
+metric as a proportion (converting users over assigned users) with Fisher's exact test, which
+returns a tuple:
 
 ```python
 # 📁 backend/app/services/sufficient_stats_analysis.py
@@ -405,8 +482,37 @@ tuple:
                 is_significant = p_value < alpha
 ```
 
-The analysis service also carries a z-test (a plain float from `norm.cdf`) and Welch's t-test
-(a result object with `.pvalue`):
+A revenue, count, duration or custom metric (`MEAN_METRIC_TYPES`) is analysed as its mean per
+assigned user, with Welch's t-test. The comparison is made from each variant's _sums_ — its
+user count, the sum of `y - k` and the sum of `(y - k)²` — so SciPy's `ttest_ind_from_stats`
+takes each arm's mean, standard deviation and size, and returns a result object with
+`.pvalue`:
+
+```python
+# 📁 backend/app/services/sufficient_stats_analysis.py
+    # The centred means go in, never k + c: at a large k the reconstructed
+    # means round away most of the difference.
+    p_value = float(
+        stats.ttest_ind_from_stats(
+            arm.c,
+            math.sqrt(arm.var),
+            arm.n,
+            control.c,
+            math.sqrt(control.var),
+            control.n,
+            equal_var=False,
+        ).pvalue
+    )
+```
+
+The comment is Hour 2's `0.1 + 0.2 != 0.3` grown up. The sums are kept centred on a constant
+`k` (the grand mean), so `arm.c` is the arm's mean _minus_ `k`. Adding `k` back before the test
+would give two large, nearly equal floats, and a 64-bit float keeps only about 16 significant
+digits: subtract two such numbers and most of the digits that carried the difference are gone.
+The test only needs the difference, so the centred values go in.
+
+The analysis service also carries a z-test (a plain float from `norm.cdf`) and a Welch's t-test
+over raw lists (a result object with `.pvalue`):
 
 ```python
 # 📁 backend/app/services/analysis_service.py
@@ -428,9 +534,10 @@ The analysis service also carries a z-test (a plain float from `norm.cdf`) and W
         return float(result.pvalue)
 ```
 
-(Welch's test on means is what the warehouse module, part of the full profile and in beta,
-runs — from summary statistics, with `stats.ttest_ind_from_stats` — not the core results
-endpoint.)
+(Same test, two inputs: `ttest_ind` takes the observations, `ttest_ind_from_stats` takes
+summaries of them. Working from summaries is that module's design — its docstring says it
+"reads no database", so a caller with the same sums from elsewhere, such as the warehouse
+module, gets the same numbers.)
 
 ```python
 # 📁 backend/app/services/srm_service.py
@@ -508,8 +615,10 @@ the Build book's Day 19 exercise — and confirm two runs give byte-identical ou
   reductions; `ddof=1` for sample statistics.
 - `default_rng(seed)` → `rng.beta(...)`; `argmax`/`bincount`/`mean(bool)` for Monte Carlo
   summaries.
-- SciPy: `fisher_exact` (tuple), `ttest_ind(...).pvalue`, `norm.cdf`, `chi2.sf`; clamp and
-  `float()` every p-value.
+- SciPy: `fisher_exact` (tuple), `ttest_ind(...).pvalue` and `ttest_ind_from_stats(...).pvalue`,
+  `norm.cdf`, `chi2.sf`; clamp and `float()` every p-value.
+- Subtracting two large, nearly equal floats loses the difference; keep values centred, as the
+  mean comparison does.
 - Pins are coupled: numpy 1.26 / scipy 1.17 / pandas 2.3 / statsmodels 0.15.
 
 ---
@@ -539,9 +648,10 @@ five features this codebase leans on:
 Plus the harness facts from the FastAPI book: the venv, `APP_ENV=test TESTING=true` (the
 current name for the first is `ENVIRONMENT=test`; `APP_ENV` still works and logs a
 deprecation warning), a database per process, no truncation, unique data, `-p no:cov -q` for
-speed. Running everything collects 24,868 tests at v0.36.4 (21,487 under
-`backend/tests`, 3,381 under `modules/backend/tests`; measured with
-`pytest --collect-only -q`, with the modules' requirements installed).
+speed. Running everything collects 34,246 tests at `09d815ea` (30,394 under
+`backend/tests`, 3,852 under `modules/backend/tests`; measured with
+`pytest --collect-only -q`, leaving out eight warehouse test files that need `duckdb` and
+`sqlglot`).
 
 ### In the wild
 
@@ -647,7 +757,7 @@ def active_holdout(db_session):
 # 📁 backend/tests/conftest.py
     monkeypatch.setattr(
         "backend.app.services.auth_service.CognitoAuthService.get_user_with_groups",
-        mock_get_user_with_groups
+        mock_get_user_with_groups,
     )
 ```
 
@@ -887,8 +997,8 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 ```
 
-No CI job, `make` target or pre-commit hook runs it, and `mypy backend/app/` reports 1,010
-errors in 147 files (mypy 1.20.2, the pinned requirements, measured for this edition). So `disallow_untyped_defs = true` states the
+No CI job, `make` target or pre-commit hook runs it, and `mypy backend/app/` reports 1,053
+errors in 156 files (mypy 1.20.2, the pinned requirements, measured for this edition). So `disallow_untyped_defs = true` states the
 goal — every function in `backend/app` annotated — not something a pull request is refused
 for. Treat it as a tool you run on the file you're changing: new code should be clean under
 it, even though the tree isn't. `no_implicit_optional` means `x: int = None` is an error —
@@ -925,6 +1035,8 @@ write `Optional[int]`.
   `x or default` only when they aren't.
 - Early returns over nesting; `enumerate`/`zip`/`any`/`all`; `A if c else B` for the
   ternary; explicit comparisons for numbers (`<= 0`, `>= 100`).
+- Before comparing neighbours, put the records in the order their consumer uses
+  (`sorted(self.stages, key=lambda stage: stage.stage_order)`), not the order they arrived in.
 - Clamp with `max(lo, min(hi, x))`; guard `isinstance(x, bool)` before `isinstance(x, int)`.
 - Units are not types: percentages are 0–100 in the API, 0.0–1.0 in the Lambdas — read
   the docstring.
@@ -940,6 +1052,9 @@ write `Optional[int]`.
   `for`/one `if`/one line per comprehension.
 - f-strings everywhere except `logger.*(“%s”, …)` and data-driven templates; `.encode()`
   before hashing; raw strings for regex; never build SQL with f-strings.
+- Regexes compiled once at module level; `fullmatch` or `\A…\Z` for a whole-string check;
+  on text from outside, a character class or a bounded quantifier, never nested repetition.
+  Where the program already knows the structure (the matched route), don't parse text for it.
 - `class X(str, Enum)` for values that cross JSON; plain `Enum` in the ORM; convert at the
   boundary, never compare across.
 
@@ -973,17 +1088,22 @@ write `Optional[int]`.
 
 - Naive means UTC; normalise at comparisons (`_as_utc`); write naive to naive columns; ISO
   strings always carry `+00:00` (`normalize_event_timestamp`, enforced by the
-  `UTCTimestampString` column type); a local wall-clock time is read in its `zoneinfo` zone
-  and converted to UTC before comparing; `perf_counter`/`monotonic` for durations.
+  `UTCTimestampString` column type); an aware value meets a `timestamp without time zone`
+  column only through `UTCDateTime`, never through the session's time zone; a local
+  wall-clock time is read in its `zoneinfo` zone and converted to UTC before comparing;
+  `perf_counter`/`monotonic` for durations.
 - `hashlib` for determinism (`usedforsecurity=False` on MD5), `secrets` for keys,
-  `hmac.compare_digest` to check them, seeded `default_rng` for Monte Carlo; `float()`/`.tolist()`
-  on every NumPy value that leaves a function.
+  `hmac.compare_digest` to check them, seeded `default_rng` for Monte Carlo; several strings
+  into one stored key are length-prefixed, not joined with a separator (`dedup_key`);
+  `float()`/`.tolist()` on every NumPy value that leaves a function.
 
 **Concurrency**
 
 - `async def` only awaits; blocking work goes to `to_thread`/`run_in_threadpool` (the
-  scheduler lock does, through `async_scheduler_lock`); `def` endpoints for heavy handlers;
-  consistent per module.
+  scheduler lock does, through `async_scheduler_lock`); a scheduler tick's synchronous work
+  goes through `run_in_worker`, a coroutine body as `lambda: asyncio.run(body())`; an
+  `async def` over synchronous code is not concurrent, however many `await`s it has; `def`
+  endpoints for heavy handlers; consistent per module.
 - Tasks are owned by the lifespan; `cancel()` then `await`; let `CancelledError`
   propagate; sessions never cross a thread boundary.
 - `threading.Lock`/`RLock` for cross-thread structures (short critical sections, `deque`
@@ -1065,6 +1185,13 @@ function, so the type never depends on which NumPy scalar the arithmetic produce
 **Q6. `x: int = None` — what does `mypy` say under this repo's config?**
 An error: `no_implicit_optional = true` forbids a `None` default on a non-Optional type.
 Write `x: Optional[int] = None`.
+
+**Q7. The bucketing hashes join `f"{user_id}:{key}"`, but `dedup_key` length-prefixes its
+parts. Why the difference?**
+`event_name` and `event_id` are client-chosen text that may contain `:`, so a joined string
+can make two different events one key, and the second would be dropped as a duplicate. A
+length prefix (in bytes) makes every tuple of parts encode differently. For bucketing, a
+collision only puts two pairs in the same bucket, which is harmless.
 
 **Quiz.** Which modules are exempt from `disallow_untyped_defs`, and does that exemption
 change what a pull request must pass?

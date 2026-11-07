@@ -105,13 +105,16 @@ A `Tuple[bool, int, int]` return type says "three things, in this order, with th
 meanings" — the caller unpacks all three by position. (When a tuple return grows past three
 fields, this codebase switches to a dataclass: `MSPRTResult`, `SRMResult`.)
 
-A list used as a stack of results, with `sum`, `max`, `min` and `sorted` over it:
+A list built in a chosen order, with `max` and `sorted` over it:
 
 ```python
 # 📁 backend/app/schemas/rollout_schedule.py
-        stage_percentages = [stage.target_percentage for stage in self.stages]
+        stage_percentages = [
+            stage.target_percentage
+            for stage in sorted(self.stages, key=lambda stage: stage.stage_order)
+        ]
         if not all(a <= b for a, b in zip(stage_percentages, stage_percentages[1:])):
-            raise ValueError("Stage percentages must be non-decreasing")
+            raise ValueError("Stage percentages must be non-decreasing in stage_order")
 
         # Check that max stage percentage doesn't exceed the schedule max
         if max(stage_percentages) > self.max_percentage:
@@ -128,6 +131,14 @@ A list used as a stack of results, with `sum`, `max`, `min` and `sorted` over it
         ):
             raise ValueError("Stage orders must be sequential without gaps")
 ```
+
+`sorted(self.stages, key=lambda stage: stage.stage_order)` sorts objects by a field: the `key`
+function is called once per element and the elements are ordered by what it returns. Python's
+sort is **stable** — elements with equal keys keep their original relative order — which is
+what the code's comment relies on when two stages share an order (a case refused a few lines
+later). Before v0.40.0 the first line read `[stage.target_percentage for stage in
+self.stages]`, the list in the order the request sent it, and a schedule that ran 50% then
+10% passed the check (Hour 3 tells that story).
 
 "No gaps, no duplicates" is checked without building anything: `n` orders are consecutive
 exactly when they are all different (`len(set(...))` equals `len(...)`) and the highest is
@@ -182,7 +193,9 @@ find which variant buckets 24, 25 and 99 land in.
 - Tuples: ordered, immutable records; unpack them; `_` for ignored fields; `(x,)` for one.
 - The bandit router's weights are a list of `(id, weight)` tuples walked in order with a
   running cumulative sum.
-- `sorted(...)` new vs `.sort()` in place; `len(set(xs))` and `max - min` check "consecutive" without building a list.
+- `sorted(...)` new vs `.sort()` in place, both stable; `sorted(xs, key=...)` puts records in
+  the order their consumer uses before you compare neighbours; `len(set(xs))` and `max - min`
+  check "consecutive" without building a list.
 
 ---
 
@@ -305,7 +318,9 @@ Building a dict from another with a comprehension (Hour 7) and merging with `**`
 
 ```python
 # 📁 backend/app/core/bandit_scheduler.py
-        # Build the raw dict expected by BanditService
+        reward_stats = _as_rewards(variant_stats, lower_is_better)
+
+        # Build the dict expected by BanditService
         variant_data: Dict[str, Dict] = {
             vid: {
                 "successes": vs.successes,
@@ -313,9 +328,15 @@ Building a dict from another with a comprehension (Hour 7) and merging with `**`
                 "pulls": vs.pulls,
                 "total_reward": vs.total_reward,
             }
-            for vid, vs in variant_stats.items()
+            for vid, vs in reward_stats.items()
         }
 ```
+
+`_as_rewards` is the "don't mutate what you were handed" rule from below, applied. For a
+metric where higher is better it returns `variant_stats` itself; for a lower-is-better one (an
+error or churn event, where the arm with _fewer_ converting users should win) it builds and
+returns a **new** dict whose successes are the users who did not convert, and leaves the
+caller's dict alone.
 
 ```python
 # 📁 backend/app/core/logger.py
@@ -614,7 +635,7 @@ takes bytes, so every hash input in this codebase is `.encode()`d first.
 **Regular expressions** (`re`) are for _matching and transforming_ text by pattern: `re.match`
 (at the start), `re.search` (anywhere), `re.sub` (replace), with raw strings (`r"..."`) so
 backslashes survive. The codebase uses them sparingly and deliberately — key validation,
-slug generation, path normalisation.
+slug generation, refusing text the database cannot store, checking a version string.
 
 ### In the wild
 
@@ -664,31 +685,124 @@ Key validation with `re.match` and a message better than the raw pattern:
 (`check_fields=False` lets the validator live on a shared base class whose subclasses may not
 all declare `key`.)
 
-`re.match` anchors at the start; the `$` anchors the end; `[a-z0-9_-]*` is "zero or more of
-these." A compiled pattern at module level for something used on every request:
+`re.match` anchors at the start and `$` at the end (with one Python wrinkle, below);
+`[a-z0-9_-]*` is "zero or more of these."
+
+A compiled pattern at module level, for something checked on every request whose text goes
+to the database. PostgreSQL refuses the NUL character (U+0000) in a text column, and a lone
+UTF-16 surrogate (U+D800–U+DFFF) cannot be encoded as UTF-8 at all — yet JSON can carry both
+(`"\u0000"`, `"\ud800"`), so a Python `str` parsed from a request can hold them:
 
 ```python
-# 📁 backend/app/middleware/prometheus_metrics_middleware.py
-# Matches UUID v4 segments in URL paths
-_UUID_PATTERN: re.Pattern = re.compile(
-    r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-    re.IGNORECASE,
-)
-# Matches purely-numeric path segments (e.g. /users/42)
-_NUMERIC_PATTERN: re.Pattern = re.compile(r"/\d+")
+# 📁 backend/app/schemas/storable_text.py
+#: One character class, so the search is linear and cannot backtrack.
+_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
 
 
-def normalize_path(path: str) -> str:
-    """Replace dynamic path segments with ``{id}`` for stable metric labels.
-    ...
+def contains_unstorable_text(value: Any) -> bool:
+    """True if *value*, or any string nested in it, holds NUL or a lone surrogate.
+
+    Walks dicts (keys and values), lists and tuples without recursion, so a
+    deeply nested body cannot exhaust the stack.
     """
-    path = _UUID_PATTERN.sub("/{id}", path)
-    path = _NUMERIC_PATTERN.sub("/{id}", path)
-    return path
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if _UNSTORABLE.search(item):
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
 ```
 
-`re.compile` once, `.sub` many times. `{8}` is "exactly eight"; `\d+` is "one or more
-digits."
+`re.compile` runs once, at import; `.search` then runs on every string in every request
+schema built on `StorableTextModel`, and a hit answers 422 with a message that names the
+field, never the value. `[...]` is a **character class** — any one character from the set —
+and `\ud800-\udfff` inside it is a range. Note the pattern is a plain string, not a raw one,
+and that is fine here: `\x00` and `\ud800` are escapes _Python_ understands, so the compiled
+pattern receives the characters themselves (`len(_UNSTORABLE.pattern)` is 6). `\d` is not a
+Python escape, which is why the version pattern below is written `r"..."`. The comment
+names the property that matters for text from outside: a single character class, no nested
+repetition, so the search time grows with the length of the input and nothing more. And the
+walk is Hours 5 and 6 at work: a list used as a stack (`extend` onto the end, `pop` off it)
+instead of a recursive call.
+
+The other half of the pair is `.sub`. The audit log _replaces_ what it cannot store instead of
+refusing it, because an entry recording what happened must not be lost:
+
+```python
+# 📁 backend/app/models/audit_log.py
+#: Code points replaced by U+FFFD in audit text.
+_REPLACED_TEXT = re.compile("[\x00\ud800-\udfff]")
+...
+def normalise_audit_text(value: Any) -> Any:
+    """Audit text is normalised before it is stored.
+
+    A ``str`` comes back with each code point in ``_REPLACED_TEXT`` replaced
+    by U+FFFD; anything else (``None`` included) is returned as is.
+    """
+    if isinstance(value, str):
+        return _REPLACED_TEXT.sub("\ufffd", value)
+    return value
+```
+
+`.sub(replacement, text)` returns a new string with every match replaced (strings are
+immutable); U+FFFD is the Unicode replacement character, `�`. One pattern, two modules, two
+opposite choices — and each is right for its caller.
+
+Anchors, and the one Python surprise in them — the version the API reports about itself:
+
+```python
+# 📁 backend/app/core/version.py
+#: What the file is allowed to contain: ``X.Y.Z`` with an optional SemVer
+#: pre-release, the same spelling ``scripts/check_version_sources.py`` enforces
+#: and the git tag and image tag quote.
+...
+_VERSION_PATTERN = re.compile(r"\A\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?\Z")
+```
+
+Read it left to right: `\A` the start of the string; `\d+` one or more digits; `\.` a literal
+dot (a bare `.` means "any character"); `(?:...)` a group that does not capture;
+`(?:alpha|beta|rc)` one of three words; the `?` after the outer group makes the whole
+pre-release optional; `\Z` the end. `0.43.2` and `0.43.2-rc.1` match; `v0.43.2` and
+`0.43.2-beta` do not. Why `\A` and `\Z` rather than `^` and `$`? In Python, `$` also matches
+just before a newline at the very end, so `re.match(r"^\d+$", "42\n")` is a match; `\Z` is the
+end of the string and nothing else. (`get_version()` strips the file's text before matching, so
+here `\Z` states the rule in the pattern rather than being the only defence.)
+
+And `fullmatch`, the third way to say "all of it". A request's id — the client's
+`X-Request-ID` when it sent one — is put into an error message only if it has the expected
+shape:
+
+```python
+# 📁 backend/app/core/logger.py
+#: The shape a request id must have to be shown to a user in a response body.
+#: The same rule the SSO module applies to the ids it shows.
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+...
+    value = _log_context.get().get("request_id")
+    if isinstance(value, str) and REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return None
+```
+
+`{1,128}` is "between 1 and 128 of these": a bounded quantifier, so the length is part of the
+rule. `fullmatch` succeeds only if the pattern covers the whole string. `.match("abc 123")`
+succeeds (on `abc`); `.fullmatch("abc 123")` does not; and a 129-character id passes `.match`
+(it finds the first 128) and fails `.fullmatch`.
+
+> **By the Way.** Earlier editions taught compiled patterns with the metrics middleware's
+> `normalize_path`, which turned UUID and numeric path segments into `{id}` for metric labels.
+> It is gone since v0.40.0: the middleware now labels a request with the template of the route
+> it matched, or `unmatched` (`route_template()` in
+> `backend/app/middleware/prometheus_metrics_middleware.py`, #1611). A regex over the path a
+> client sent can only replace the segments it anticipates; any other path became a label of
+> its own. The router already knows which route matched. When the program already holds the
+> structure, read it rather than re-deriving it from text.
 
 `partition` for a one-split with a guarantee of three parts (unlike `split`, which returns
 one or two):
@@ -719,13 +833,19 @@ one or two):
             return [i.strip() for i in v.split(",") if i.strip()]
 ```
 
-`startswith` with a tuple of prefixes, and `join` to build a message:
+`startswith` against a tuple of prefixes, and a tuple return of a name and a nested pair:
 
 ```python
 # 📁 backend/app/middleware/rate_limiter.py
     if any(path.startswith(prefix) for prefix in SDK_PATH_PREFIXES):
-        return (int(sdk_limit_per_minute), 60)
+        return SDK_BUCKET, (int(sdk_limit_per_minute), 60)
 ```
+
+`any(...)` over a generator stops at the first prefix that matches. `str.startswith` also
+accepts a tuple directly — `path.startswith(SDK_PATH_PREFIXES)` gives the same answer — so the
+generator form is a choice of readability, not a necessity. The return value is
+`(bucket, (limit, window_seconds))`: the bucket names which rule matched, and the rate-limit
+metrics are labelled with it rather than with the path (the By the Way above, again).
 
 Logging's deferred `%s` formatting — not an f-string, on purpose:
 
@@ -763,12 +883,23 @@ b'user-42:hero_banner'
 ['http://a', 'http://b']
 >>> p = 0.05123; f"{p:.2%} {p!r} {42:04d} {'x':>5}"
 '5.12% 0.05123 0042     x'
->>> "/api/v1/experiments/550e8400-e29b-41d4-a716-446655440000/results".replace("550e8400-e29b-41d4-a716-446655440000", "{id}")
+>>> unstorable = re.compile("[\x00\ud800-\udfff]")
+>>> len(unstorable.pattern), bool(unstorable.search("a\x00b")), bool(unstorable.search("café"))
+(6, True, False)
+>>> "\ud800".encode()          # UnicodeEncodeError: ... surrogates not allowed
+>>> unstorable.sub("\ufffd", "a\x00b")
+'a�b'
+>>> bool(re.match(r"^\d+$", "42\n")), bool(re.match(r"\A\d+\Z", "42\n"))
+(True, False)
+>>> rid = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+>>> bool(rid.match("abc 123")), bool(rid.fullmatch("abc 123")), bool(rid.fullmatch("x" * 129))
+(True, False, False)
 ```
 
-Then run `normalize_path` from the real module on `/api/v1/users/42` and
-`/api/v1/experiments/<a uuid>/results`, and explain why the UUID pattern runs before the
-numeric one.
+Then, with the venv active, call the real `contains_unstorable_text` (from
+`backend.app.schemas.storable_text`) on `{"note": ["ok", {"key\x00": 1}]}` and the real
+`normalise_audit_text` (from `backend.app.models.audit_log`) on `"a\x00b"`, and explain why one
+refuses and the other replaces.
 
 ### Common mistakes
 
@@ -776,7 +907,13 @@ numeric one.
 - **`s.replace(...)` without assigning** — strings are immutable; the result is a new
   string.
 - **Regex without a raw string** — `"\d"` is a deprecation warning today and a bug
-  tomorrow; write `r"\d"`.
+  tomorrow; write `r"\d"`. (A plain string works only when every backslash is an escape
+  Python itself knows, as in `"[\x00\ud800-\udfff]"`.)
+- **`$` for "the end of the string"** — it also matches before a final newline. Use `\Z`, or
+  `fullmatch` for a whole-string check.
+- **Nested repetition on text from outside** (`(a+)+`, `(\w+\s?)*`) — the kind of pattern
+  that can backtrack for a very long time. Prefer a single character class or a bounded
+  quantifier, as `_UNSTORABLE` and `REQUEST_ID_PATTERN` do.
 - **f-strings in `logger.*` calls** and in anything that becomes SQL.
 
 ### Key takeaways
@@ -785,8 +922,11 @@ numeric one.
   the bytes boundary (hashing needs bytes).
 - f-strings everywhere except logging (`%s`, deferred) and data-driven templates.
 - `partition` for one guaranteed three-way split; `split`+`strip`+filter for CSV config.
-- `re.compile` once, `.sub`/`.match` many; raw strings; anchors; never build SQL with
-  f-strings.
+- `re.compile` once, `.search`/`.sub`/`.match` many; raw strings; `\A`…`\Z` or `fullmatch`
+  for "all of it"; character classes and bounded quantifiers on untrusted text; never build
+  SQL with f-strings.
+- A regex is for text you can't avoid parsing. When the program already knows the structure
+  (the matched route), read that instead.
 
 ---
 
@@ -850,9 +990,12 @@ as `(user, variant, converted)`, compute `{variant: (assigned, conversions)}` wi
 start, then `[a-z0-9_-]`) and `slugify(name) -> str` (the platform's rule without the random
 suffix), and test both on `"Search v2"`, `"search_v2"`, `"--Weird  Name--"`.
 
-**E2.5 — Path normalisation.** Write `normalize(path)` that replaces UUID and numeric
-segments with `{id}` using compiled patterns, and explain what goes wrong if the numeric
-pattern runs first on `/experiments/123e4567-e89b-12d3-a456-426614174000`.
+**E2.5 — Text the database can store.** With one compiled pattern, write
+`contains_unstorable(value) -> bool`, which walks nested dicts (keys and values), lists and
+tuples **without recursion** and reports a NUL or a lone surrogate anywhere, and
+`replace_unstorable(text) -> str`, which puts U+FFFD in their place. Try it on
+`json.loads('{"a": ["ok", {"b\\u0000": 1}]}')`, `json.loads('"\\ud83d\\ude00"')` and
+`json.loads('"\\ud800"')`, and explain the middle answer.
 
 ---
 
@@ -943,18 +1086,40 @@ slugify("Search v2"), slugify("--Weird  Name--")                  # ('search-v2'
 **S2.5**
 
 ```python
+import json
 import re
-UUID_RE = re.compile(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
-NUM_RE = re.compile(r"/\d+")
 
-def normalize(path: str) -> str:
-    path = UUID_RE.sub("/{id}", path)
-    return NUM_RE.sub("/{id}", path)
+UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
+
+def contains_unstorable(value) -> bool:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if UNSTORABLE.search(item):
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
+
+def replace_unstorable(text: str) -> str:
+    return UNSTORABLE.sub("\ufffd", text)
+
+contains_unstorable(json.loads('{"a": ["ok", {"b\\u0000": 1}]}'))   # True: a key counts too
+contains_unstorable(json.loads('"\\ud83d\\ude00"'))                 # False
+contains_unstorable(json.loads('"\\ud800"'))                        # True
+replace_unstorable("a\x00b")                                        # 'a�b'
 ```
 
-If `NUM_RE` ran first, the leading digits of the UUID segment (`/123`) would be replaced
-with `/{id}`, leaving `/{id}e4567-e89b-...`, which the UUID pattern then fails to match —
-the label would be a mangled, high-cardinality string. UUIDs first, numbers second.
+The middle one is a surrogate _pair_. JSON spells characters outside the Basic Multilingual
+Plane as two `\u` escapes, and `json.loads` joins a valid pair into one character, `😀`
+(U+1F600), which is outside the class. Only a surrogate with no partner survives as a
+surrogate. And why no recursion: a recursive walk uses a Python stack frame per level, and
+Python stops at its recursion limit (1,000 frames by default) with `RecursionError`; a list
+used as a stack just grows.
 
 ---
 
