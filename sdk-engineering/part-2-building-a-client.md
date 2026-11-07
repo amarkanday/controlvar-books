@@ -19,25 +19,27 @@ by. Keep `sdk/python/controlvar/`, `sdk/js/src/` and `sdk/react/src/` open as yo
 
 ### What & why
 
-The Python SDK's server mode is a 593-line client plus four small modules — and the four
-modules are the design. **Transport** isolates HTTP so the client can be tested without a network and
-users can swap `urllib` for `requests` or `httpx`. **Request** is one private method that
-turns a `(method, path, body, query)` into decoded JSON or a typed error, with the 429 retry
-in exactly one place. **Cache** is the `UserKeyCache` from Hour 3, twice. **Types** are
-frozen dataclasses so callers get attribute access, equality (the contract smoke compares two
-assignments with `==`) and nothing mutable. (The package on PyPI and on disk is `controlvar`;
-the class is still called `ExperimentationClient`, as it is in every SDK.)
+The Python SDK's server mode is a client of about 940 lines plus a handful of small modules —
+and the small modules are the design. **Transport** isolates HTTP so the client can be tested
+without a network and users can swap `urllib` for `requests` or `httpx`. **Request** is one
+private method pair that turns a `(method, path, body, query)` into decoded JSON or a typed
+error, with the 429 retry in exactly one place. **Cache** is the `UserKeyCache` from Hour 3,
+twice. **Types** are frozen dataclasses so callers get attribute access, equality (the contract
+smoke compares two assignments with `==`) and nothing mutable. Two modules arrived with 0.2.0
+and 0.3.0: **attribution** (the 24-hour record of Hour 3) and **exposure** (the one path
+between `on_exposure` and the client). (The package on PyPI and on disk is `controlvar`; the
+class is still called `ExperimentationClient`, as it is in every SDK.)
 
 The constraint that shaped it: **no runtime dependencies**. A server-side SDK gets installed
 into applications with their own pinned `requests`/`urllib3`/`httpx` versions; a dependency
 of our own is a conflict waiting to happen. `urllib.request` is in the standard library and
 is enough for four JSON endpoints.
 
-Local mode (Hour 3) adds two more modules, also standard library only: `local.py` (569
-lines: the refresh thread, backoff, `ready()`/`status()`, and the counts it sends to
-`POST /api/v1/tracking/evaluations`) and `evaluator.py` (495 lines: the operators and the
-`md5-mod100-v1` bucket). Nothing in this Hour depends on them: a client created without
-`evaluation="local"` never fetches a ruleset.
+Local mode (Hour 3) adds two more modules, also standard library only: `local.py` (575
+lines: the refresh thread, backoff, `ready()`/`status()`, fork safety, and the counts it sends
+to `POST /api/v1/tracking/evaluations`) and `evaluator.py` (573 lines: the operators, the
+`md5-mod100-v1` bucket and the flag values). Nothing in this Hour depends on them: a client
+created without `evaluation="local"` never fetches a ruleset.
 
 ### How Controlvar does it
 
@@ -81,7 +83,7 @@ class UrllibTransport:
         except (OSError, http.client.HTTPException, ValueError) as exc:
             # URLError, socket.timeout/TimeoutError and ConnectionError are OSError
             # subclasses; ValueError covers malformed URLs.
-            raise TransportError(f"{method} {url} failed: {exc}") from exc
+            raise TransportError(failure_message(method, url, exc)) from exc
 ```
 
 `urllib` raises `HTTPError` for 4xx/5xx by default; the transport catches it and converts it
@@ -89,10 +91,52 @@ back into a `Response`, because the _client_ owns the policy for what a 404 or a
 A transport that decided "404 is an exception" would have put contract semantics in the
 wrong layer.
 
-The single request method — URL building, JSON, the retry, the error:
+The last line changed for a reason worth a sentence. The message used to name the whole URL,
+and a flag evaluation's URL carries `?user_id=…&context=…`: the user's id and attributes,
+copied into every log line that printed the error. `failure_message` names the URL without its
+query, and removes the query from the exception's own text too, because some exceptions
+repeat the URL (#1556). An error message is output, and output leaks.
+
+The request path is a pair: `_exchange` sends and retries, `_request` turns the response into
+JSON or an error. `report_error` calls `_exchange` directly, because it needs the raw status
+(only a 201 means the report was stored); every other call goes through `_request`:
 
 ```python
 # 📁 sdk/python/controlvar/client.py
+    def _exchange(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[Mapping[str, Any]] = None,
+        query: Optional[Mapping[str, str]] = None,
+    ) -> Response:
+        """Send one API call and return its response, whatever the status.
+        ...
+        """
+        url = self.api_url + path
+        if query:
+            url += "?" + urlencode(query, quote_via=quote)
+        data = None
+        if body is not None:
+            # Only json.dumps is in the try. A lone surrogate in the query makes urlencode above
+            # raise UnicodeEncodeError, also a ValueError, and that keeps its own path.
+            try:
+                encoded = json.dumps(body, default=_json_default, allow_nan=False)
+            except ValueError as exc:
+                raise ExperimentationError(
+                    f"{method} {path} was not sent: its body holds a value JSON cannot represent ({exc})"
+                ) from exc
+            data = encoded.encode("utf-8")
+
+        response = self._send(method, url, data)
+        if response.status == 429:
+            wait = _retry_after_seconds(response)
+            logger.debug("429 from %s %s; retrying once after %.1fs", method, path, wait)
+            self._sleep(wait)
+            response = self._send(method, url, data)
+        return response
+
     def _request(
         self,
         method: str,
@@ -102,23 +146,9 @@ The single request method — URL building, JSON, the retry, the error:
         query: Optional[Mapping[str, str]] = None,
     ) -> Any:
         """Perform one API call and return the decoded JSON body (``None`` if empty).
-
-        Retries exactly once on 429, sleeping for ``Retry-After`` (capped at
-        :data:`MAX_RETRY_AFTER_SECONDS`). Raises :class:`ExperimentationError`
-        for any non-2xx response, network failure or undecodable body.
+        ...
         """
-        url = self.api_url + path
-        if query:
-            url += "?" + urlencode(query, quote_via=quote)
-        data = None if body is None else json.dumps(body, default=_json_default).encode("utf-8")
-
-        response = self._send(method, url, data)
-        if response.status == 429:
-            wait = _retry_after_seconds(response)
-            logger.debug("429 from %s %s; retrying once after %.1fs", method, path, wait)
-            self._sleep(wait)
-            response = self._send(method, url, data)
-
+        response = self._exchange(method, path, body=body, query=query)
         if response.status < 200 or response.status >= 300:
             raise ExperimentationError(
                 f"{method} {path} failed with HTTP {response.status}",
@@ -137,13 +167,17 @@ The single request method — URL building, JSON, the retry, the error:
             ) from exc
 ```
 
-Two details worth a second look. `urlencode(query, quote_via=quote)` — the default
+Three details worth a second look. `urlencode(query, quote_via=quote)` — the default
 `quote_plus` would turn the spaces in a JSON `context` into `+`, which the server decodes as
-literal plus signs; `quote` percent-encodes. And `self._sleep = time.sleep` as an instance
-attribute — tests replace it with a recorder so a 429 test runs in microseconds (Hour 10).
+literal plus signs; `quote` percent-encodes. `allow_nan=False` — Python's `json.dumps`
+happily writes `NaN` and `Infinity`, which are not JSON; the SDK now refuses to send such a
+body at all (a `track(event_value=float("nan"))` returns `False` and sends nothing, #1760), and
+the server answers 422 to anyone else who sends one. And `self._sleep = time.sleep` as an
+instance attribute — tests replace it with a recorder so a 429 test runs in microseconds
+(Hour 10).
 
 `get_assignment` — cache check, body, request, **validation of the response shape**, cache
-write:
+write, the fan-out record, and last of all the exposure hook:
 
 ```python
 # 📁 sdk/python/controlvar/client.py
@@ -153,6 +187,7 @@ write:
         user_id: str,
         user_attributes: Optional[Mapping[str, Any]] = None,
     ) -> Assignment:
+        ...
         cached = self._assignments.get(user_id, experiment_key)
         if cached is not None:
             return cached
@@ -160,7 +195,13 @@ write:
         body: Dict[str, Any] = {"experiment_key": experiment_key, "user_id": user_id}
         if user_attributes is not None:
             body["context"] = dict(user_attributes)
-        data = self._request("POST", "/api/v1/tracking/assign", body=body)
+        try:
+            data = self._request("POST", "/api/v1/tracking/assign", body=body)
+        except ExperimentationError as exc:
+            # A 404: a key-less track() must no longer reach this experiment.
+            if exc.status == 404:
+                self._attributed.forget_experiment(user_id, experiment_key)
+            raise
 
         if not isinstance(data, dict) or not isinstance(data.get("variant_name"), str):
             raise ExperimentationError(
@@ -181,7 +222,14 @@ write:
             assigned=data["assigned"] if isinstance(data.get("assigned"), bool) else None,
             reason=data["reason"] if isinstance(data.get("reason"), str) else None,
         )
-        self._assignments.set(user_id, experiment_key, assignment)
+        new = self._assignments.set_new(user_id, experiment_key, assignment)
+        self._attributed.record_experiment(user_id, assignment.experiment_key, assignment.reason)
+        # Last, once the answer is stored and recorded, with no lock held. The server recorded an
+        # exposure for this request only if it said ``assigned`` True (a missing field is not
+        # taken as True). Threads that asked for the same new user and experiment at once each
+        # sent a request; only the one whose answer filled the empty slot calls the hook.
+        if new and assignment.assigned is True:
+            self._exposed(user_id, assignment)
         return assignment
 ```
 
@@ -191,6 +239,17 @@ misconfigured `api_url` that points at the dashboard, would otherwise produce an
 error with the body attached, and the failure is never cached. Note also how `assigned` is
 read: only a real boolean is taken, so a server that predates the field yields `None`
 ("unknown"), never `False` ("not enrolled").
+
+The last three statements are 0.2.0 and 0.3.0, and each answers a concurrency or ordering
+question. `set_new` checks and stores under one lock and says whether the slot was empty: the
+Python client has no in-flight dedupe (threads, not promises), so two threads asking for the
+same new user at once each send a request, the server records each, and only the one whose
+answer filled the slot calls the hook. The hook counts answers the client stored, not
+requests, which is the one difference from JavaScript, where the two calls would have shared
+one request in the first place. The hook runs after the answer is cached and recorded, with no
+lock held, so a slow or re-entrant hook can neither block other threads nor see a half-stored
+answer. And a 404 removes the experiment from the fan-out record, so a key-less event never
+credits an arm the server no longer serves.
 
 The types:
 
@@ -205,7 +264,9 @@ class Assignment:
     returned the control variant instead, with no exposure recorded. ``reason``
     says why: ``"assigned"``, ``"holdout"``, ``"mutual_exclusion"`` or
     ``"targeting"``. Both are ``None`` when the server predates the fields; such
-    a server cannot tell you, so do not read ``None`` as either answer.
+    a server cannot tell you, so do not read ``None`` as either answer. For an
+    experiment that is not ACTIVE, ``assigned`` is ``False`` and ``reason`` is its
+    status (``"draft"``, ``"paused"``, ``"completed"`` or ``"archived"``).
     """
 
     experiment_key: str
@@ -216,8 +277,7 @@ class Assignment:
     configuration: Optional[Dict[str, Any]]
     assigned: Optional[bool] = None
     reason: Optional[str] = None
-
-
+...
 @dataclass(frozen=True)
 class FlagEvaluation:
     """A server-side flag decision, from ``GET /api/v1/feature-flags/evaluate/{key}``.
@@ -227,6 +287,9 @@ class FlagEvaluation:
     not send one. A local answer carries the reason the server would have given.
     ``source`` is set only with ``evaluation="local"``: ``"local"`` when answered
     in-process from the ruleset, ``"server"`` when the server evaluated it.
+    ...
+    ``value`` and ``value_type`` come after the older fields, so code that
+    builds a ``FlagEvaluation`` by position keeps working.
     """
 
     key: str
@@ -234,7 +297,51 @@ class FlagEvaluation:
     config: Any = None
     reason: Optional[str] = None
     source: Optional[str] = None
+    value: Any = None
+    value_type: Optional[str] = None
 ```
+
+The last sentence of that docstring is a compatibility rule you will meet again in every
+port: **new fields go at the end, with defaults**. A dataclass is also a positional
+constructor, so `FlagEvaluation("f", True, None, "rollout")` written against 0.1 still builds
+the same object against 0.3.
+
+The typed getters (`get_string_value` and its two siblings) share one check, and its order is
+the design: no value at all, then the wrong type, then a value that does not match the type it
+claims. Each failure is a different `code`, so a caller's `on_error` can tell "the server is
+too old" from "you asked a string flag for a number":
+
+```python
+# 📁 sdk/python/controlvar/client.py
+def _served_value(evaluation: FlagEvaluation, flag_key: str, value_type: str, method: str) -> Any:
+    """The value ``evaluation`` serves when it is of ``value_type`` (a copy); otherwise raises
+    :class:`ExperimentationError` with ``code`` ``"INVALID_RESPONSE"`` or ``"TYPE_MISMATCH"``."""
+    flag = json.dumps(str(flag_key), ensure_ascii=False)
+    value = evaluation.value
+    if value is None:
+        raise ExperimentationError(
+            f"Flag {flag} came back without a value (from a server without flag values, or one that "
+            f"cannot serve this flag's stored value); {method} returned your default",
+            code="INVALID_RESPONSE",
+        )
+    served = evaluation.value_type if isinstance(evaluation.value_type, str) else _json_type_of(value)
+    if served != value_type:
+        raise ExperimentationError(
+            f"Flag {flag} serves {_describe_type(served)}; {method} returned your default",
+            code="TYPE_MISMATCH",
+        )
+    if not is_value_of_type(value, value_type):
+        raise ExperimentationError(
+            f"Flag {flag} serves {_describe_type(value_type)}, but the server's value is not one; "
+            f"{method} returned your default",
+            code="INVALID_RESPONSE",
+        )
+    return copy_value(value)
+```
+
+The getter that calls it catches everything, logs, passes the error to
+`on_error(error, "value")` and returns the default; the messages all end "returned your
+default", so a log line says what the caller got as well as why.
 
 And the batch path, with the index arithmetic that keeps error positions meaningful across
 chunks:
@@ -276,9 +383,11 @@ chunks:
                     result.errors.append(entry)
 ```
 
-> **By the Way** — `ExperimentationClient` is safe to share between threads: the caches
-> lock, the transport is stateless, and `urllib` opens a connection per call (no pool to
-> corrupt). That's the intended usage — one client per process, created at startup. It has a
+> **By the Way** — `ExperimentationClient` is safe to share between threads: the caches and
+> the fan-out record lock, the transport is stateless, and `urllib` opens a connection per
+> call (no pool to corrupt). `on_exposure` runs in the calling thread, and an `async def` hook
+> is refused at construction, because the client would never await it and its body would
+> never run. That's the intended usage — one client per process, created at startup. It has a
 > `close()` (and `with ExperimentationClient(...) as client:`), but in server mode it is a
 > no-op: there is nothing to release. In local mode `close()` stops the refresh thread and
 > sends the evaluation counts not yet sent. A pooled transport (`requests.Session`) can be
@@ -300,9 +409,15 @@ Assignment(experiment_key='sdk_contract_ab', user_id='u-hour4', variant_id='…'
 >>> a == c.get_assignment("sdk_contract_ab", "u-hour4")        # cached, equal (frozen dataclass)
 True
 >>> c.get_feature_flag("sdk_contract_flag", "u-hour4")
-FlagEvaluation(key='sdk_contract_flag', enabled=True, config=None, reason='rollout', source=None)
->>> c.track("u-hour4", "purchase", event_value=9.99)            # fans out to both
+FlagEvaluation(key='sdk_contract_flag', enabled=True, config=None, reason='rollout', source=None, value=True, value_type='boolean')
+>>> c.get_string_value("sdk_contract_value_string", "u-hour4", default="dflt")
+'on-copy'
+>>> c.get_number_value("sdk_contract_flag", "u-hour4", default=0)   # a boolean flag: TYPE_MISMATCH, logged
+0
+>>> c.track("u-hour4", "purchase", event_value=9.99)            # fans out to all three
 True
+>>> c.track("u-hour4", "purchase", event_value=float("nan"))    # refused before sending
+False
 >>> c.get_feature_flag("nope", "u-hour4")
 Traceback (most recent call last): ...
 controlvar.types.ExperimentationError: GET /api/v1/feature-flags/evaluate/nope failed with HTTP 404
@@ -316,9 +431,12 @@ send(self, *a): print(a[0], a[1]); return super().send(*a)`) and watch the cache
 
 ### Key takeaways
 
-- Four modules: transport (HTTP errors are responses, not exceptions), one `_request`
-  (URL, JSON, one 429 retry, typed error), two `UserKeyCache`s, frozen dataclasses.
+- Small modules: transport (HTTP errors are responses, not exceptions; error messages carry no
+  query string), one `_exchange`/`_request` pair (URL, JSON without NaN, one 429 retry, typed
+  error), two `UserKeyCache`s, the fan-out record, frozen dataclasses with new fields last.
 - Response shapes are validated before caching; a bad 200 raises and is not cached.
+- `on_exposure` is called once per stored `assigned: true` answer, after it is stored, with
+  no lock held; typed getters check value, type, then shape, and return the caller's default.
 - No runtime dependencies; thread-safe; one client per process; inject a transport for
   pooling or tests. `close()` matters only in local mode.
 - `get_all_flags` is uncached and outside the fan-out by design.
@@ -339,7 +457,9 @@ failure is invisible — so there's an `onError` hook.
 
 The additions over Python, then: an abort-based timeout, **in-flight deduplication** (ten
 components asking for the same flag share one request), a custom `fetch` slot, `onError`,
-and a `Retry-After` parser that also accepts HTTP-dates.
+and a `Retry-After` parser that also accepts HTTP-dates. The 0.2.0 and 0.3.0 features are the
+same as Python's under camelCase names: `onExposure`, `eventId`, `reportError` and the typed
+getters `getStringValue`, `getNumberValue` and `getJsonValue`.
 
 ### How Controlvar does it
 
@@ -359,13 +479,19 @@ The class contract:
  * - Successful evaluations/assignments are cached per user + key for
  *   `cacheTtlMs`; failures are never cached. Concurrent calls for the same
  *   user + key share one in-flight request.
+ * - Every successful answer also records its key for the key-less `track()`
+ *   fan-out, for 24 hours, or the cache lifetime if longer (see `attribution.ts`); `clearCache()` keeps that record.
  * - `getAssignment`, `evaluateFlag`, `getAllFlags` and `fetchAssignments` throw
  *   `ExperimentationError`; `getVariant` / `isFeatureEnabled` return safe
- *   defaults instead; `track` / `trackBatch` never reject.
+ *   defaults instead; `getStringValue` / `getNumberValue` / `getJsonValue` return
+ *   the caller's default and pass the reason to `onError(err, 'value')`;
+ *   `track` / `trackBatch` / `reportError` never reject.
  * - A 429 is retried once after the server's `Retry-After` (capped at `timeoutMs`).
  */
 export class ExperimentationClient {
   ...
+  /** The keys a key-less `track()` is sent to; outlives the cache entries. */
+  private readonly attributed: AttributedKeys;
   /** Requests currently in flight, so concurrent callers share one fetch. */
   private readonly inflight = new Map<string, Promise<unknown>>();
 ```
@@ -412,15 +538,22 @@ fetch in the dedupe:
           enabled: answer.enabled,
           config: null,
           reason: answer.reason,
+          // A copy: a caller changing it must not change the ruleset every user is answered from.
+          value: copyValue(answer.value),
+          valueType: answer.valueType,
           source: 'local',
         };
         // Recorded for the key-less track() fan-out, exactly as a server answer is.
         this.flags.set(userId, flagKey, evaluation);
+        this.attributed.recordFlag(userId, flagKey);
         return evaluation;
       }
     }
+    // Only a server answer is reused here. A local one stays in the cache (getCachedFlags), but
+    // it was computed from a ruleset that no longer answers this call (discarded, too stale, closed,
+    // the flag now remote or gone, or attributes it cannot compare), so the server is asked (#1709).
     const cached = this.flags.get(userId, flagKey);
-    if (cached) return cached;
+    if (cached && cached.source !== 'local') return cached;
 
     return this.dedupe(`flag\u0000${userId}\u0000${flagKey}`, async () => {
       const data = await this.requestJson<FlagEvaluateResponse>(
@@ -432,17 +565,25 @@ fetch in the dedupe:
         config: data?.config === undefined ? null : data.config,
       };
       if (typeof data?.reason === 'string') evaluation.reason = data.reason;
+      // Only copied when the server sent them: an older server's answer has neither.
+      if (data?.value !== undefined && data.value !== null) evaluation.value = data.value;
+      if (typeof data?.value_type === 'string') evaluation.valueType = data.value_type;
       if (this.local) evaluation.source = 'server';
       this.flags.set(userId, flagKey, evaluation);
+      this.attributed.recordFlag(userId, flagKey);
       return evaluation;
     });
   }
 ```
 
-The local branch runs
-**before** the cache read: a local answer is computed from this call's attributes, so it is
-never stale in the way a cached server answer can be. It is still written to the cache, so the
-key-less `track()` fan-out attributes events to it like any other evaluation.
+The local branch runs **before** the cache read: a local answer is computed from this call's
+attributes, so it is never stale in the way a cached server answer can be. It is still written
+to the cache (`getCachedFlags` returns it) and to the fan-out record. And the cache read below
+it skips a local entry: the one line `cached.source !== 'local'` is the whole of the #1712
+fix of Hour 3. If the ruleset declined this call, the cached local answer came from a ruleset
+that no longer applies, and only the server may answer. The `copyValue` comment is the other
+quiet rule: a JSON value is an object, and handing out the ruleset's own object would let one
+caller's mutation change the answer every other user gets.
 
 The request — abort timeout, unbound fetch, typed error codes, one retry:
 
@@ -450,6 +591,8 @@ The request — abort timeout, unbound fetch, typed error codes, one retry:
 // 📁 sdk/js/src/client.ts
   private async request(path: string, init: RequestInitLite = {}): Promise<Response> {
     const method = init.method ?? 'GET';
+    const url = `${this.apiUrl}${path}`;
+    const shown = withoutQuery(path);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let response: Response;
@@ -461,7 +604,7 @@ The request — abort timeout, unbound fetch, typed error codes, one retry:
           code: 'NETWORK_ERROR',
         });
       }
-      response = await fetchImpl(`${this.apiUrl}${path}`, {
+      response = await fetchImpl(url, {
         method,
         headers: {
           ...(init.headers ?? {}),
@@ -476,12 +619,17 @@ The request — abort timeout, unbound fetch, typed error codes, one retry:
       if (err instanceof ExperimentationError) throw err;
       if (controller.signal.aborted) {
         throw new ExperimentationError(
-          `Request timed out after ${this.timeoutMs} ms (${method} ${path})`,
+          `Request timed out after ${this.timeoutMs} ms (${method} ${shown})`,
           { code: 'TIMEOUT', cause: err }
         );
       }
-      const message = err instanceof Error ? err.message : String(err);
-      throw new ExperimentationError(`Network error (${method} ${path}): ${message}`, {
+      let message = err instanceof Error ? err.message : String(err);
+      // A fetch implementation may name the URL in its own message, as passed or as the URL
+      // parser writes it (`'` as `%27`, for one). The query is removed in both forms.
+      for (const query of [path.slice(shown.length), serialisedQuery(url)]) {
+        if (query.length > 1) message = message.split(query).join('');
+      }
+      throw new ExperimentationError(`Network error (${method} ${shown}): ${message}`, {
         code: 'NETWORK_ERROR',
         cause: err,
       });
@@ -496,6 +644,9 @@ The request — abort timeout, unbound fetch, typed error codes, one retry:
     return response;
   }
 ```
+
+`shown` is the same fix as Python's `failure_message`, with one more case: a `fetch` may quote
+the URL as its own parser rewrote it, so the query is removed in both spellings.
 
 The error type has a `code` the Python one doesn't need — in Python the distinction between
 "no response" and "bad response" is `status is None`; in JS, where a timeout and a CORS
@@ -512,25 +663,70 @@ export type ExperimentationErrorCode =
   /** The request exceeded `timeoutMs`. */
   | 'TIMEOUT'
   /** The server answered 2xx but the body was not what the SDK expects. */
-  | 'INVALID_RESPONSE';
+  | 'INVALID_RESPONSE'
+  /**
+   * A typed getter (`getStringValue`, `getNumberValue`, `getJsonValue`) was called for a flag
+   * that serves another type; it returned the caller's default.
+   */
+  | 'TYPE_MISMATCH'
+  /**
+   * Only passed to `onError`, with the operation `'exposure'`: your `onExposure` threw, or the
+   * Promise it returned rejected. `cause` is what it threw; the answer is unchanged.
+   */
+  | 'HOOK_ERROR';
 ```
 
 `onError` — the only window into swallowed failures, and itself guarded so a throwing
-handler can't break fire-and-forget. Local mode added three operations to it, all background
-work with no caller to reject to:
+handler can't break fire-and-forget. Every feature that added a "never rejects" method added
+an operation to it: local mode three (background work with no caller to reject to), then
+error reports, typed getters and the exposure hook:
 
 ```ts
 // 📁 sdk/js/src/types.ts
-export type SwallowedOperation = 'track' | 'trackBatch' | 'refresh' | 'flush' | 'evaluate';
+export type SwallowedOperation =
+  | 'track'
+  | 'trackBatch'
+  | 'refresh'
+  | 'flush'
+  | 'evaluate'
+  | 'reportError'
+  | 'value'
+  | 'exposure';
 ...
   /**
-   * Called with the error whenever `track` / `trackBatch` swallow a failure, and in local mode
-   * when a ruleset refresh (`'refresh'`), an evaluation-count report (`'flush'`) or a local
-   * evaluation (`'evaluate'`, which then goes to the server) fails.
+   * Called with the error whenever `track` / `trackBatch` / `reportError` swallow a failure,
+   * whenever a typed getter returns the caller's default (`'value'`), whenever `onExposure`
+   * throws or its Promise rejects (`'exposure'`), and in local mode when a ruleset refresh
+   * (`'refresh'`), an evaluation-count report (`'flush'`) or a local evaluation (`'evaluate'`,
+   * which then goes to the server) fails.
    * Those operations never reject; this is the only way to observe their failures.
    */
   onError?: (error: ExperimentationError, operation: SwallowedOperation) => void;
 ```
+
+The exposure hook is where JavaScript needs more care than Python. A hook may be `async`, and
+the client deliberately does not wait for it, so a rejected Promise nobody handles would end a
+Node process as an unhandled rejection. `callExposureHook` attaches the rejection handler
+itself:
+
+```ts
+// 📁 sdk/js/src/exposure.ts
+  try {
+    const result: unknown = hook(exposure);
+    if (result !== null && (typeof result === 'object' || typeof result === 'function')) {
+      // Read `then` once, inside the try: a getter that throws is the hook's failure too.
+      const then = (result as { then?: unknown }).then;
+      if (typeof then === 'function') then.call(result, undefined, reportSafely);
+    }
+  } catch (thrown) {
+    reportSafely(thrown);
+  }
+```
+
+Python made the opposite choice for the same problem: it refuses an `async def` hook at
+construction, because a coroutine that is never awaited never runs. Same contract (a hook's
+failure must never change or delay an answer, in the words of
+`sdk/python/controlvar/exposure.py`), two idioms.
 
 ```ts
 // 📁 sdk/js/src/client.ts
@@ -565,12 +761,15 @@ And `Retry-After` in both forms the RFC allows:
   }
 ```
 
-The fan-out is the same rule, expressed as `expand` — one function that produces either
-one keyed body or the list:
+The fan-out is the same rule, expressed as `expand` — one function that produces one keyed
+body, the list, or the single body with no key:
 
 ```ts
 // 📁 sdk/js/src/client.ts
-  /** Build the wire bodies for one event: a single keyed body, or the fan-out list. */
+  /**
+   * Build the wire bodies for one event: a single keyed body, the fan-out list, or,
+   * with nothing to attribute it to, the single body with no key.
+   */
   private expand(event: TrackEvent): TrackBody[] {
     const base: TrackBody = {
       event_type: event.eventType ?? event.eventName,
@@ -580,6 +779,10 @@ one keyed body or the list:
     if (event.value !== undefined) base.value = event.value;
     if (event.properties !== undefined) base.metadata = event.properties;
     if (event.timestamp !== undefined) base.timestamp = toIso(event.timestamp);
+    // The caller's id, copied into every fan-out entry below. None is made here.
+    if (event.eventId !== undefined && event.eventId !== null && event.eventId !== '') {
+      base.event_id = event.eventId;
+    }
 
     if (event.experimentKey || event.featureFlagKey) {
       const body: TrackBody = { ...base };
@@ -588,12 +791,18 @@ one keyed body or the list:
       return [body];
     }
 
-    return [
-      ...this.getAssignments(event.userId).map(a => ({ ...base, experiment_key: a.experimentKey })),
-      ...this.getEvaluatedFlags(event.userId).map(flagKey => ({ ...base, feature_flag_key: flagKey })),
+    const { experiments, flags } = this.attributed.keys(event.userId);
+    const bodies: TrackBody[] = [
+      ...experiments.map(experimentKey => ({ ...base, experiment_key: experimentKey })),
+      ...flags.map(flagKey => ({ ...base, feature_flag_key: flagKey })),
     ];
+    return bodies.length > 0 ? bodies : [base];
   }
 ```
+
+Before the fix the last statement read the cache (`getAssignments`, `getEvaluatedFlags`) and
+returned an empty list for a user whose answers had expired; `track` then sent nothing. Now the
+record decides, and an empty record yields `[base]`, which `track` sends to `/track`.
 
 > **Watch Out!** The retry cap is `timeoutMs`, not a fixed 5 s as in Python — because the
 > whole call's budget in a browser is the timeout, and a 4 s `Retry-After` on a 5 s timeout
@@ -614,28 +823,36 @@ cd sdk/js && npm run build --silent && node --input-type=module -e "
 import { ExperimentationClient } from './dist/index.js';
 import { readFileSync } from 'node:fs';
 const c = new ExperimentationClient({ apiUrl: 'http://localhost:8000', apiKey: readFileSync('../../tests/sdk-contract/live/.api_key','utf8').trim(),
-  onError: (e, op) => console.log('swallowed', op, e.code, e.status) });
+  onError: (e, op) => console.log('swallowed', op, e.code, e.status),
+  onExposure: x => console.log('exposure', x.experimentKey, x.variantName) });
 const user = { userId: 'u-hour5', attributes: { country: 'US' } };
 const [a, b, c2] = await Promise.all([c.getAssignment('sdk_contract_ab', user), c.getAssignment('sdk_contract_ab', user), c.evaluateFlag('sdk_contract_flag', user)]);
-console.log(a === b, a.variantName, c2.enabled, c2.reason);          // same object: deduped
-await c.track('u-hour5', 'purchase', { value: 3 });                    // fan-out
+console.log(a === b, a.variantName, c2.enabled, c2.reason, c2.value, c2.valueType);   // same object: deduped; one 'exposure' line
+console.log(await c.getStringValue('sdk_contract_value_string', user, 'dflt'));      // 'on-copy'
+console.log(await c.getNumberValue('sdk_contract_flag', user, 0));                   // 0, and 'swallowed value TYPE_MISMATCH'
+await c.track('u-hour5', 'purchase', { value: 3, eventId: 'order-5' });               // fan-out, one id in every entry
 await c.track('u-hour5', 'purchase', { experimentKey: 'nope' });       // 404 → onError, no throw
 try { await c.evaluateFlag('nope', user) } catch (e) { console.log(e.code, e.status, e.message) }
 "
 ```
 
-Then set `timeoutMs: 1` and observe `code: 'TIMEOUT'`; then `apiUrl: 'http://localhost:1'`
-for `NETWORK_ERROR`.
+The two concurrent `getAssignment` calls share one request, so the server records one exposure
+and `onExposure` prints once. Then set `timeoutMs: 1` and observe `code: 'TIMEOUT'`; then
+`apiUrl: 'http://localhost:1'` for `NETWORK_ERROR`, and note that neither message contains
+`user_id` or `context`.
 
 ### Key takeaways
 
 - Same semantics as Python plus what the environment demands: `AbortController` timeouts,
   in-flight dedupe keyed by user + key (cleared on settle), injectable `fetch`, `onError`
-  for swallowed failures (`track`, `trackBatch`, and in local mode `refresh`, `flush`,
-  `evaluate`), a bundled MD5.
-- Local mode answers before the cache, and the constructor refuses it in a browser.
-- `ExperimentationError.code` ∈ HTTP_ERROR | NETWORK_ERROR | TIMEOUT | INVALID_RESPONSE —
-  the distinction `fetch` doesn't give you.
+  for swallowed failures (`track`, `trackBatch`, `reportError`, `value`, `exposure`, and in
+  local mode `refresh`, `flush`, `evaluate`), a bundled MD5.
+- Local mode answers before the cache, the cache never reuses a local answer, and the
+  constructor refuses local mode in a browser.
+- `ExperimentationError.code` ∈ HTTP_ERROR | NETWORK_ERROR | TIMEOUT | INVALID_RESPONSE |
+  TYPE_MISMATCH | HOOK_ERROR — the distinctions `fetch` doesn't give you.
+- An async `onExposure` is not awaited, and its rejection is caught; a deduped call does not
+  call the hook twice.
 - `Retry-After` accepts seconds or an HTTP-date; the single retry is capped at `timeoutMs`.
 
 ---
@@ -659,15 +876,31 @@ path alias, which is how the SDK gets exercised by real UI on every demo run.
 
 ### How Controlvar does it
 
-The provider — one client per config, one context value per user _content_:
+The provider — one client per config, one context value per user _content_, and (since the
+React SDK's first release, 0.1.0) an optional `bootstrap`:
 
 ```tsx
 // 📁 sdk/react/src/context/ExperimentationProvider.tsx
-export function ExperimentationProvider({ config, user, children }: ProviderProps) {
+export function ExperimentationProvider({ config, user, bootstrap, children }: ProviderProps) {
+  // The client below only ever sees the wrapper, so the Provider refuses a
+  // value that is not a function itself, as the client's constructor would.
+  const onExposure = checkOnExposure(config.onExposure);
+  // The latest render's onExposure, set during render (an effect does not run
+  // in a server render, and useLayoutEffect warns there), so the wrapper calls
+  // it without the client being recreated when an inline function changes.
+  const exposureRef = useRef(onExposure);
+  exposureRef.current = onExposure;
+
   // Stabilise the client — only recreate when a config primitive changes, so
   // callers may pass an inline config object without losing the cache.
   const client = useMemo(
-    () => new ExperimentationClient(config),
+    () =>
+      new ExperimentationClient({
+        ...config,
+        // Returns what the hook returns, so the client's guard sees a Promise
+        // it returns and handles its rejection.
+        onExposure: (exposure: Exposure) => exposureRef.current?.(exposure),
+      }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [config.apiKey, config.baseUrl, config.timeoutMs, config.cacheTtlMs]
   );
@@ -681,9 +914,12 @@ export function ExperimentationProvider({ config, user, children }: ProviderProp
     [client, user.userId, attributesKey]
   );
 
+  // From the props alone, so the server render and the hydration decide the same.
+  const read = useMemo(() => readBootstrap(bootstrap, user.userId), [bootstrap, user.userId]);
+  ...
   return (
     <ExperimentationContext.Provider value={value}>
-      {children}
+      <BootstrapContext.Provider value={read}>{children}</BootstrapContext.Provider>
     </ExperimentationContext.Provider>
   );
 }
@@ -696,9 +932,25 @@ the "attributes changed, cache is stale" problem from Hour 3: a new attributes o
 the same content doesn't re-run hooks; changed content does, and the hooks refetch with the
 new `context`.
 
-A hook — safe default while loading, the answer when it arrives, the default again (with
-`error`) on failure, and a cancellation flag so a stale response can't overwrite a newer
-one:
+The `onExposure` wiring is the same problem one level up. An inline `onExposure={...}` is a
+new function every render, and putting it in the client's memo would recreate the client (and
+empty its cache) on every render. So the client gets one stable wrapper, and the wrapper calls
+whatever function the latest render left in a ref. The comment says why the ref is written
+during render rather than in an effect: effects do not run in a server render.
+
+`bootstrap` is the answer to a flicker. A server-rendered page that assigns in the browser
+first paints control (the loading default), then repaints the treatment when `/assign`
+answers. `ServerClient.bootstrap({ flags, experiments }, user)` asks the server for those
+answers during the server render and returns them as plain JSON; passed to the provider, each
+hook whose key it holds _starts_ from the server's answer. Three guards keep it honest: it is
+used only when its `userId` is the provider's (otherwise it is ignored with a warning, so
+answers computed for one user are never shown to another), it is read from the props alone
+(so the server render and the hydration decide the same and React sees no mismatch), and each
+entry must have the shape of the route's own response, or it is ignored with a warning.
+
+A hook — safe default while loading (or the bootstrapped answer), the answer when it arrives,
+the default again (with `error`) on failure, and a cancellation flag so a stale response can't
+overwrite a newer one:
 
 ```ts
 // 📁 sdk/react/src/hooks/useExperiment.ts
@@ -707,28 +959,49 @@ one:
  *
  * While loading or on error the control defaults are returned
  * (`variantKey: 'control'`, `variantName: 'Control'`, `variantId: null`,
- * `isControl: true`, `configuration: null`). Re-assigns when the experiment
+ * `isControl: true`, `configuration: null`). When the Provider's `bootstrap`
+ * has this experiment, it starts from that assignment with `loading: false`
+ * instead, then asks the server as always; if that request fails it keeps the
+ * bootstrapped assignment, with `error` set. Re-assigns when the experiment
  * key or user changes (the server keeps assignments sticky).
  */
 export function useExperiment(experimentKey: string): ExperimentAssignment {
   const { client, user } = useExperimentation();
-  const [state, setState] = useState<ExperimentAssignment>(() =>
-    defaultAssignment(experimentKey, { loading: true })
+  const bootstrap = useBootstrap();
+  const [seed] = useState<Seed<ExperimentAssignment> | null>(() => {
+    const value = bootstrap.experiments.get(experimentKey);
+    return value ? { key: experimentKey, user, value } : null;
+  });
+  const [state, setState] = useState<ExperimentAssignment>(
+    () => seed?.value ?? defaultAssignment(experimentKey, { loading: true })
   );
+  // The bootstrapped assignment while the hook still shows it; cleared by its
+  // own answer and by a change of key or user.
+  const seeded = useRef(seed);
 
   useEffect(() => {
     let cancelled = false;
-    setState(defaultAssignment(experimentKey, { loading: true }));
+    const kept =
+      seeded.current && seeded.current.key === experimentKey && seeded.current.user === user
+        ? seeded.current.value
+        : null;
+    if (!kept) {
+      seeded.current = null;
+      setState(defaultAssignment(experimentKey, { loading: true }));
+    }
 
     client
       .assignExperiment(user, experimentKey)
       .then(assignment => {
-        if (!cancelled) setState(assignment);
+        if (!cancelled) {
+          seeded.current = null;
+          setState(assignment);
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
           const error = err instanceof Error ? err : new Error(String(err));
-          setState(defaultAssignment(experimentKey, { error }));
+          setState(kept ? { ...kept, error } : defaultAssignment(experimentKey, { error }));
         }
       });
 
@@ -740,6 +1013,14 @@ export function useExperiment(experimentKey: string): ExperimentAssignment {
   return state;
 }
 ```
+
+Notice that a bootstrapped hook still sends its `/assign` after hydration, and that request is
+recorded: the server stores an exposure for every `/assign` it answers with `assigned: true`,
+for a returning user too ("the user recorded as seen in it on every call", in
+`AssignmentService._sticky_result`). The live contract (Hour 11) pins exactly that: one
+exposure row after the server render, one more after hydration. So the bootstrap changes what
+the user _sees first_, never what the server _records_. The React SDK also keeps its own
+exposure hook out of the server render: `onExposure` is never called during one.
 
 `defaultAssignment` is the React SDK's version of "return control on failure": the shape a
 component renders against is complete at every moment, so `if (hero.variantKey ===
@@ -803,6 +1084,10 @@ The SSR entry point — same calls, never throws, no hooks:
  *   const hero = await client.assignExperiment('shoplab_hero_banner', user);
  *   return { props: { flags, hero } };
  * }
+ *
+ * `client.bootstrap({ flags, experiments }, user)` returns the answers in the
+ * form `ExperimentationProvider`'s `bootstrap` prop takes, so the page's first
+ * render shows them.
  */
 ```
 
@@ -884,8 +1169,29 @@ map, two spellings: webpack takes the absolute paths as they are, and Turbopack
 (the default bundler since Next 16) gets them rewritten relative to the package. StreamPulse
 uses the same alias.
 
+The storefront's "Controlvar panel" shows what the SDK did, and it changed in one telling way.
+It used to call `useExperiment` for all four experiments so that it could display them, which
+assigned every visitor to all four — and recorded an exposure for each — on any page. Now it
+assigns nothing; it reads the experiments the pages have assigned from the client
+(`useAssignedExperiments` in `demo/shoplab/src/lib/assignments.ts`, over
+`client.getAssignments`), and evaluates only the two flags it displays:
+
+```tsx
+// 📁 demo/shoplab/src/components/ControlvarPanel.tsx
+  // The panel assigns no experiment: an assignment records that the visitor saw the
+  // experiment, so only the page that uses one assigns it. The panel shows what the
+  // pages have assigned. Flags have no such record and are evaluated here.
+  const assigned = useAssignedExperiments();
+  const newSearch = useFeatureFlag(FLAG_KEYS.newSearch);
+  const freeShipping = useFeatureFlag(FLAG_KEYS.freeShippingBanner);
+```
+
+That is the exposure rule from the integrator's side: **an assignment is a measurement**. A
+debugging widget that assigns users to show them their variants is enrolling them in
+experiments they never saw, and diluting every result.
+
 The checkout page tracks with no key — the fan-out attributes the purchase to every
-experiment and flag the storefront showed this visitor:
+experiment and flag the storefront answered for this visitor in the last 24 hours:
 
 ```ts
 // 📁 demo/shoplab/src/pages/checkout.tsx
@@ -926,19 +1232,25 @@ cd sdk/react && npm test -- --silent > /tmp/react-sdk-tests.txt 2>&1; tail -5 /t
 cd ../../demo/shoplab && npm run dev                          # http://localhost:3200
 ```
 
-Open the storefront, open the **Controlvar panel** (it uses `useExperiment` ×4 and
-`useFeatureFlag` ×2), and in DevTools' Network tab watch: four `/assign` and two `/evaluate`
-calls on first load, none on navigation (cached), and one `/batch` with six entries when you
-complete a checkout. Then change the visitor's attributes in localStorage and reload — the
-provider re-keys, the hooks refetch.
+Open the storefront and DevTools' Network tab. The home page sends one `/assign` (its hero
+experiment) and one `/evaluate` per distinct flag on the page and in the **Controlvar panel**
+(the free-shipping banner flag is used by both, and the dedupe makes it one request). Each
+page that renders an experiment assigns it when you first visit it; nothing is re-sent on a
+return visit while the cache holds the answer. Complete a checkout and watch one `/batch`
+whose entries are exactly the experiments and flags you were answered — open the panel to
+compare. Then change the visitor's attributes in localStorage and reload — the provider
+re-keys, the hooks refetch.
 
 ### Key takeaways
 
 - Provider: one memoised client, context value keyed by user _content_ (attributes JSON) —
-  the cache survives renders and refreshes when attributes really change.
-- Hooks: complete default shape while loading and on error (control / off), cancellation
-  guard against stale responses, stable `track` function.
-- `ServerClient` = the same calls, never throwing, for SSR and for the contract harness.
+  the cache survives renders and refreshes when attributes really change; `onExposure`
+  reaches the client through a ref, so an inline hook does not recreate it.
+- Hooks: complete default shape while loading and on error (control / off), or the
+  bootstrapped answer; cancellation guard against stale responses; stable `track` function.
+- `ServerClient` = the same calls, never throwing, for SSR and for the contract harness;
+  `ServerClient.bootstrap()` gives the provider the server's answers for the first paint.
+- Every `/assign` answered `assigned: true` records an exposure; assign only what you render.
 - The demo apps consume the SDK from source via an alias and mock it at the package name
   in their tests.
 
@@ -961,16 +1273,25 @@ One. The first call puts a promise in `inflight` under the user + key; the other
 the same promise; when it settles, the value is in the cache for the TTL.
 
 **Q4. When is `onError` called, and why can it not throw?**
-When `track`/`trackBatch` swallow a failure, and in local mode when a ruleset refresh, an
-evaluation-count report or a local evaluation fails — background work with no caller to
+When `track`/`trackBatch`/`reportError` swallow a failure, when a typed getter returns the
+caller's default, when `onExposure` throws or rejects, and in local mode when a ruleset
+refresh, an evaluation-count report or a local evaluation fails — work with no caller to
 reject to; it's the only window into them. It's wrapped in try/catch because a throwing
 handler would turn fire-and-forget into a rejection.
+
+**Q4b. Ten components mount at once and each calls `getAssignment('hero', user)` for a new
+user. How many times is `onExposure` called?**
+Once. The ten calls share one in-flight request, the server records one exposure, and the hook
+runs inside that one request's handler. A later call is answered from the cache and calls
+nothing. (In Python, which has no dedupe, two threads may send two requests; `set_new` makes
+sure only the one that filled the empty slot calls the hook.)
 
 **Q5. What does `useExperiment` return between mount and the server's answer, and why is
 that safe?**
 `defaultAssignment(key, { loading: true })` — control, `isControl: true`, `configuration:
-null`. A component branching on `variantKey === 'treatment'` renders control until told
-otherwise, which is the right default for an experiment.
+null` — unless the provider's `bootstrap` holds the experiment, in which case the server's
+answer with `loading: false`. A component branching on `variantKey === 'treatment'` renders
+control until told otherwise, which is the right default for an experiment.
 
 **Q6. Why does ShopLab render nothing until it has a visitor ID?**
 Sticky assignment needs a stable `user_id`; rendering with a placeholder ID would assign
@@ -1002,10 +1323,11 @@ date in the past, assert the wait was 0.
 `assignment.configuration?.[field] ?? fallback` with the same loading/error semantics, and
 test it with the ShopLab mock's `__setExperiment`.
 
-**E2.5 — SSR round trip.** In a Next.js page, assign in `getServerSideProps` with
-`ServerClient`, pass the assignment as a prop, and render the variant without a loading
-state; then confirm in the DB that only one exposure was recorded even though the client
-provider also mounts.
+**E2.5 — SSR round trip.** In a Next.js page, call `ServerClient.bootstrap({ experiments:
+['sdk_contract_ab'] }, user)` in `getServerSideProps`, pass the result as the provider's
+`bootstrap`, and render the variant without a loading state; then count in the DB the
+assignment rows and the exposure events for that user after the server render and again after
+hydration.
 
 ---
 
@@ -1047,11 +1369,13 @@ export function useAssignmentConfig<T>(experimentKey: string, field: string, fal
 }
 ```
 
-**S2.5** — the server-side `assignExperiment` creates the assignment row and one exposure;
-when the browser provider mounts and `useExperiment` calls `/assign` again, the server finds
-the sticky row and returns it without a new exposure (`AssignmentService.assign_user`
-returns existing assignments as-is). One exposure, two calls — the contract's stickiness at
-work.
+**S2.5** — after the server render: one assignment row and one exposure event. After
+hydration: still one assignment row, and two exposure events. The hook's `/assign` finds the
+sticky row and returns the same variant (`AssignmentService.assign_user` returns existing
+assignments as-is), but `_sticky_result` records the user as seen again on every call that
+asks for it. One assignment, two exposures — stickiness is about the _variant_, not about how
+often the user was seen. (An earlier edition of this book said one exposure; the live contract
+now pins two, in the React bootstrap row of Hour 11.)
 
 ---
 

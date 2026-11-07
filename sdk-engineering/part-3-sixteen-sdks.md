@@ -9,7 +9,8 @@ This Part is about porting well. Hour 7 walks the nine "native" ports — Go, Ja
 starter), Swift, Kotlin, Ruby, PHP, .NET, Elixir, Flutter — and shows that each one is the
 same five decisions expressed in its language's idiom for concurrency, errors and lifetime.
 Hour 8 covers the three that sit on a standard or a special runtime: the OpenFeature
-providers, the edge client, React Native. Hour 9 is a case study with an ending: a _second
+providers, the edge client, React Native; and the MCP server, the one directory under `sdk/`
+that is not an SDK. Hour 9 is a case study with an ending: a _second
 implementation of the server's decision_, the four hash functions that drifted apart, and the
 two changes that closed it.
 
@@ -25,15 +26,20 @@ A port has to preserve five things exactly and is free to change everything else
 |---|---|
 | The four endpoints, bodies and headers | HTTP library (`net/http`, OkHttp, `URLSession`, `Net::HTTP`, curl, `HttpClient`, `:httpc`, `package:http`) |
 | Cache per user + key, TTL, successes only | Cache structure (map + lock, LRU, `NSCache`, ETS) |
-| Fan-out rule (keyed → `/track`, key-less → `/batch` over cached entries, empty → nothing) | Concurrency model (goroutines, coroutines, async/await, threads, processes) |
+| Fan-out rule (keyed → `/track`, key-less → `/batch` over what was answered) | Concurrency model (goroutines, coroutines, async/await, threads, processes) |
 | Failure policy: detailed call fails loudly, convenience call returns a safe default, `track` never fails | How "fails loudly" is spelled (`error`, exception, `throws`, `{:error, _}`, `null`) |
 | The hash and the golden vectors | Everything about packaging and DI |
 | `context` sent on flag evaluation; `assigned`/`reason` passed through on assignment | |
+| Newer: the exposure hook (once per fresh `assigned: true` answer), `event_id`, flag values | |
 
-The last row is where the ports are not all there yet; the Watch Out at the end of this
-section names the gaps. The second column is where language taste lives. The first column is the contract, and the
-docblock at the top of every client restates it — deliberately, in nearly the same words, so
-a reviewer can diff the _promises_ across ports without reading the code.
+The last two rows are where the ports are not all there yet, and the fan-out row has moved
+under them: the JavaScript, Python and React SDKs now fan out over a 24-hour record and send an
+unattributable event with no key (Hour 3), while the others still read their cache and send
+nothing. The Watch Out at the end of this section names every gap. The second column is where
+language taste lives. The first column is the contract, and the docblock at the top of every
+client restates it — deliberately, in nearly the same words, so a reviewer can diff the
+_promises_ across ports without reading the code. That is also how you find a port that has
+fallen behind: its docblock still says "from the cache".
 
 ### How Controlvar does it
 
@@ -45,15 +51,24 @@ a reviewer can diff the _promises_ across ports without reading the code.
 // Implementations must be safe for concurrent use by multiple goroutines.
 type Client interface {
 	// EvaluateFlag evaluates a feature flag for the given user via
-	// GET /api/v1/feature-flags/evaluate/{flagKey}?user_id=... The server
-	// decides; successful results are cached per user + key for the cache TTL.
-	// On failure it returns a disabled EvalResult together with the error.
+	// GET /api/v1/feature-flags/evaluate/{flagKey}?user_id=...&context=...,
+	// where context is user.Attributes as JSON, sent only when there are any,
+	// so the flag's targeting rules can match them. The server decides;
+	// successful results are cached per user + key for the cache TTL, and the
+	// attributes are not part of that key. On failure it returns a disabled
+	// EvalResult together with the error; attributes that cannot be encoded as
+	// JSON are a failure that sends nothing.
+	// Each call returns an EvalResult of its own; a string, number or json
+	// flag's value is read with its StringValue, NumberValue or DecodeValue.
 	EvaluateFlag(ctx context.Context, flagKey string, user *User) (*EvalResult, error)
 
 	// GetAssignment assigns the user to an experiment variant via
 	// POST /api/v1/tracking/assign (sticky server-side; records the exposure).
 	// Successful assignments are cached per user + key for the cache TTL.
-	// On failure it returns (nil, err).
+	// On failure it returns (nil, err). When the server answers
+	// "assigned": true and no unexpired answer was cached, the function set
+	// with WithOnExposure is called before it returns; a cached answer calls
+	// nothing.
 	GetAssignment(ctx context.Context, experimentKey string, user *User) (*Assignment, error)
 	...
 	// Close releases all resources held by the client (HTTP connections, caches).
@@ -75,6 +90,24 @@ result _and_ the error — so `enabled, _ := c.EvaluateFlag(...)` is the conveni
 	}
 ```
 
+Typed values follow the same idiom from the other side. They are methods on the result that
+take the default, so `res.StringValue("Buy")` is the whole of the safe path, with no error to
+forget, and they are safe on a nil result too:
+
+```go
+// 📁 sdk/go/value.go
+func (r *EvalResult) StringValue(def string) string {
+	if r == nil || r.ValueType != valueTypeString || !hasValue(r.Value) {
+		return def
+	}
+	var s string
+	if err := json.Unmarshal(r.Value, &s); err != nil {
+		return def
+	}
+	return s
+}
+```
+
 The 429 policy shows up as data on the error rather than a retry: Go callers commonly own
 their retry loop (`context` deadlines, their own backoff), so the SDK exposes `RetryAfter`
 and lets them:
@@ -92,6 +125,12 @@ type APIError struct {
 }
 ```
 
+Read that comment against Hour 1 and it is wrong: since #1362 an experiment that is not ACTIVE
+answers 200 with its control variant, and only an unknown key (or a draft with no control) is
+a 404. The code is right — `GetAssignment` decodes the 200 like any other — and the comment
+was not touched by the change that made it false. That is the usual way a port drifts: not in
+what it does, but in what it says it does, which is the part a reviewer reads first.
+
 `Close()` exists because Go's `http.Transport` keeps idle connections. The Python SDK's
 `close()` is a no-op in server mode because `urllib` keeps none; it does real work only in
 local mode, where there is a refresh thread to stop. Same contract, different resource model.
@@ -106,15 +145,25 @@ gets an injectable bean from a handful of properties:
 @EnableConfigurationProperties(ExperimentationProperties.class)
 @ConditionalOnProperty(prefix = "experimentation", name = "api-key")
 public class ExperimentationAutoConfiguration {
-
+    ...
     @Bean
     @ConditionalOnMissingBean
-    public ExperimentationClient experimentationClient(ExperimentationProperties properties) {
+    public ExperimentationClient experimentationClient(ExperimentationProperties properties,
+                                                       ObjectProvider<ExposureListener> exposureListener) {
         SdkConfig config = SdkConfig.builder(properties.getApiKey(), properties.getBaseUrl())
                 .timeoutMs(properties.getTimeoutMs())
                 .cacheSize(properties.getCacheSize())
                 // SdkConfig.Builder uses milliseconds; properties expose seconds for user-friendliness
                 .cacheTtlMs((long) properties.getCacheTtlSeconds() * 1000L)
+                // getIfAvailable() throws NoUniqueBeanDefinitionException for two beans, which
+                // stops startup; getIfUnique() would silently give none. That holds while this
+                // module's class files carry no parameter names, neither the MethodParameters
+                // attribute (-parameters) nor, for Spring Framework 6.0 (Boot 3.0 and 3.1), the
+                // LocalVariableTable (javac -g; the POM sets debuglevel lines,source): with
+                // either, Spring would pick the bean named like this parameter
+                // ("exposureListener") and ignore the other.
+                // ExperimentationAutoConfigurationTest pins it.
+                .exposureListener(exposureListener.getIfAvailable())
                 .build();
         return new ExperimentationClient(config);
     }
@@ -128,6 +177,14 @@ Spring property prefix is still `experimentation`, the generic word; only the Ja
 moved to `com.controlvar.sdk`.) The comment about milliseconds vs seconds is the kind of
 unit boundary a port introduces and must document (the deleted Lambda copy had a worse one;
 Hour 9).
+
+The exposure hook is where the idiom shows most. Java's form is an `ExposureListener` bean: an
+application that declares one gets it wired into the client. The eight-line comment is about
+what happens when it declares _two_. `getIfUnique()` reads like the safe choice and would
+silently wire none; `getIfAvailable()` stops the application at startup, which is the only
+honest answer to "which of your two listeners should hear every exposure?". The comment even
+names the compiler flag that would quietly change Spring's choice, and the test that pins it.
+A silent failure in an exposure hook costs data nobody notices is missing.
 
 **Swift** — `async throws`, `NSCache`, an offline store, and the same in-flight dedupe as JS:
 
@@ -244,17 +301,31 @@ caller would be _correct_ but would give up the drain-on-stop guarantee that thi
 > `cache_ttl_seconds` is seconds. Each is idiomatic; each is documented at the boundary.
 > A port review checklist item: _every_ duration parameter names its unit in the identifier.
 
-> **Watch Out!** Two contract rows are not yet met by every port, and both are known gaps
-> rather than design choices (the .NET, Flutter and Elixir sources say the evaluate
-> endpoint's `context` is "not sent yet"). **Context on flag evaluation:** only the React,
-> JavaScript and Python SDKs send the user's attributes as `context` today; the others
-> evaluate with `user_id` alone, so a flag's attribute targeting never matches through them
-> (Ruby's `evaluate_flag` takes `_attributes` and ignores it). The most visible case is native
-> mobile: React Native, iOS, Android and Flutter. (Every port does send attributes as `context`
-> on *assignment*.) **`assigned` / `reason`:** the JavaScript and Python SDKs pass both through
-> (unknown when an older server omits them), React defaults a missing `assigned` to `true`, and
-> the other ports drop both fields — so their callers cannot tell an ineligible user from an
-> enrolled one. A port review should check these two rows explicitly until the gaps close.
+> **Watch Out!** The newer contract rows are not yet met by every port, and each is a known
+> gap rather than a design choice (the Ruby, Elixir and Flutter sources say the evaluate
+> endpoint's `context` is something "this SDK does not send yet"). Read from the code at the
+> pin:
+>
+> - **Context on flag evaluation:** JavaScript, Python, React, React Native, Go, Java and .NET
+>   send the user's attributes as `context` (the last four since #1629, #1546, #1723 and
+>   #1722), and so do both OpenFeature providers, through their SDKs. Ruby, PHP, Elixir,
+>   Flutter, iOS, Android and the edge client evaluate with `user_id` alone, so a flag's
+>   attribute targeting never matches through them (Ruby's `evaluate_flag` takes `_attributes`
+>   and ignores it). Every port does send attributes as `context` on *assignment*.
+> - **`assigned` / `reason`:** the JavaScript and Python SDKs pass both through (unknown when an
+>   older server omits them), React defaults a missing `assigned` to `true`, and the other
+>   ports drop both from what they return — so their callers cannot tell an ineligible user
+>   from an enrolled one, or a paused experiment from a running one.
+> - **The exposure hook:** JavaScript, Python, React, React Native, Go (`WithOnExposure`), Java
+>   (`ExposureListener`) and .NET (`OnExposure`).
+> - **`event_id`:** JavaScript, Python and Java.
+> - **Typed values:** JavaScript, Python and Go, and the two OpenFeature providers.
+> - **The 24-hour fan-out record:** JavaScript, Python and React.
+>
+> The live harness of Hour 11 checks the exposure hook and the event id for exactly the SDKs
+> above, in both directions, and the attributes for four of the seven that send them
+> (JavaScript, React Native, Java, .NET). A port review should check every row explicitly
+> until the gaps close.
 
 > **Did You Know?** The Android SDK's Kotlin touches no `android.*` API — deliberately, so
 > `sdk/android/jvm` can compile it for a plain JVM and the contract smoke runs on a Linux CI
@@ -274,7 +345,8 @@ sed -n '1,40p' ../elixir/lib/controlvar/client.ex
 ```
 
 Then run the same smoke through both: `python tests/sdk-contract/live/run_live_contract.py
---sdk go --sdk ruby` — one JSON line each, same shape.
+--sdk go --sdk ruby` — one JSON line each, with the same required fields; Go's also carries
+an `exposure` report and Ruby's must not (Hour 11 says why the check runs both ways).
 
 ### Key takeaways
 
@@ -285,7 +357,11 @@ Then run the same smoke through both: `python tests/sdk-contract/live/run_live_c
 - Mobile ports add an offline store with the 404-never-falls-back rule; server ports add
   lifecycle (`Close`, `stop/1`) where the runtime holds resources.
 - Watch the unit boundaries; keep cores platform-free so CI can run them.
-- Known gaps: only React, JS and Python send `context` on flag evaluation (native mobile among them); most ports drop `assigned`/`reason`.
+- Known gaps: Ruby, PHP, Elixir, Flutter, iOS, Android and the edge client still send no
+  `context` on flag evaluation; most ports drop `assigned`/`reason`; the exposure hook, the
+  event id, typed values and the 24-hour fan-out are in some ports only.
+- A port drifts first in its comments: Go's `APIError` still documents the 404 that #1362
+  removed.
 
 ---
 
@@ -301,12 +377,15 @@ client** runs in Cloudflare Workers, Vercel Edge and Deno Deploy, where there ar
 built-ins, request budgets are hundreds of milliseconds, and a memory cache lives only as
 long as an isolate — so it adds a shared store (KV). **React Native** is the React SDK's
 shape on a device: `fetch` and hooks, but persistent storage is `AsyncStorage` and nothing
-may throw into a UI thread.
+may throw into a UI thread. And one adapter in `sdk/` is not an SDK at all: the **MCP
+server**, which puts the platform behind the Model Context Protocol so an AI assistant can
+read it. It is the end of this Hour.
 
 ### How Controlvar does it
 
-**OpenFeature (JS)** — the resolution rules map the platform's `{enabled, config}` onto
-OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
+**OpenFeature (JS)** — the resolution rules map the platform's `{enabled, value, value_type,
+reason}` onto OpenFeature's typed resolutions, `targetingKey` becomes `user_id`, and every
+other context key becomes an attribute:
 
 ```ts
 // 📁 sdk/openfeature/src/ExperimentationProvider.ts
@@ -314,23 +393,34 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
  * OpenFeature Provider for Controlvar.
  *
  * Implements the @openfeature/server-sdk `Provider` interface on top of
- * `@controlvar/js-sdk`. Every evaluation is decided by the
- * server (`GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…`); the
+ * `@controlvar/js-sdk`. Every evaluation is decided by the server
+ * (`GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…&context=…`); the
  * JS SDK caches successful answers per user + flag for `cacheTtlMs` and never
  * caches failures.
  *
- * Resolution rules:
- *   boolean → `enabled`
- *   string, number, object → the caller's default with reason DEFAULT. The
- *   evaluate endpoint returns `config: null` for every flag, so there is
- *   nothing to read. The provider would read `config.variant` (or `config`
- *   itself, for a string), `config.value` (or `config` itself, for a number)
- *   and `config` (for an object) if the server ever sent one.
- *   A disabled flag yields the default with reason DISABLED for non-boolean types.
+ * Resolution rules, the same for every call type: the value the flag serves
+ * when the flag is of the type the call reads (a boolean call reads a boolean
+ * flag, whose value is `enabled`; an object call reads a json flag): its on
+ * value when the flag is on for the user, its off value otherwise, an inactive
+ * flag included. The reason is the server's: `targeting_rule` →
+ * TARGETING_MATCH, `rollout` → SPLIT, `inactive` → DISABLED (anything else
+ * UNKNOWN), or CACHED when the SDK's cache answered; the variant is "on" or
+ * "off". Otherwise the caller's default with reason ERROR: TYPE_MISMATCH when
+ * the flag serves another type, GENERAL for `reason: "error"` or an answer
+ * with no value, PARSE_ERROR for a value that is not of the flag's type. A
+ * server without flag values sends no `value_type`: a boolean call there
+ * answers `enabled`.
  *
- * Context mapping: `targetingKey` → `user_id`. Other context attributes are
- * NOT sent: the evaluate endpoint takes a `context`, which this provider does
- * not send yet.
+ * Context mapping: `targetingKey` → `user_id`. Every other key of the
+ * evaluation context is passed to the SDK as the user's attributes, which it
+ * sends as the evaluate call's `context`; a Date, at any depth, as an ISO 8601
+ * string. The SDK's cache key is user + flag, not the attributes: within
+ * `cacheTtlMs` a user's answer is reused whatever attributes come with the
+ * next call. A client with local evaluation answers each call it can from its
+ * ruleset, with that call's attributes, and such an answer is never CACHED. A
+ * call it cannot answer gets the server's answer: CACHED when the client
+ * already held one for that user and flag, the server's reason otherwise. A
+ * local answer in its cache is never reused, so it does not count.
  *
  * Experiments and event tracking are not OpenFeature concepts; use
  * `provider.client` (the underlying JS SDK client) for `getAssignment`,
@@ -340,7 +430,6 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
 
 ```ts
 // 📁 sdk/openfeature/src/ExperimentationProvider.ts
-  /** Resolve `targetingKey` → `user_id` and evaluate through the JS SDK (cached per user + flag). */
   private async evaluate(flagKey: string, context: EvaluationContext | undefined): Promise<Lookup> {
     const userId = context?.targetingKey;
     if (typeof userId !== 'string' || userId.length === 0) {
@@ -351,14 +440,15 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
       };
     }
 
-    const cached = this.client.getEvaluatedFlags(userId).includes(flagKey);
+    const held = this.holdsServerAnswer(userId, flagKey);
     try {
-      const evaluation = await this.client.evaluateFlag(flagKey, { userId });
-      return {
-        ok: true,
-        evaluation,
-        reason: cached ? StandardResolutionReasons.CACHED : StandardResolutionReasons.TARGETING_MATCH,
-      };
+      const attributes = attributesOf(context ?? {});
+      const evaluation = await this.client.evaluateFlag(flagKey, { userId, attributes });
+      // A hit is the server's answer, held before this call, returned again. A local answer is
+      // computed afresh from this call's attributes, so it is never one, even when the cache
+      // also holds a server answer for the flag.
+      const cached = held && evaluation.source !== 'local';
+      return { ok: true, evaluation, cached };
     } catch (err) {
       const status = (err as { status?: number })?.status;
       ...
@@ -372,20 +462,23 @@ OpenFeature's typed resolutions, and `targetingKey` becomes `user_id`:
       ...
 ```
 
-Two things to notice. The provider _composes_ the JS SDK rather than reimplementing the
-contract — the cache, dedupe and error codes come for free, and the golden vectors already
-cover its hash. And it's honest about the mismatch between the standards: OpenFeature has no
-concept of experiments or events, so those are reached through `provider.client`, and the
-provider reports the SDK's cache hit as OpenFeature's `CACHED` reason. Note also what the
-docblock admits about typed values: the evaluate endpoint returns `config: null` for every
-flag, so a string, number or object resolution returns the caller's default with reason
-`DEFAULT` today; the provider reads `config.variant` / `config.value` / `config` only so that
-it keeps working if the server ever sends a config. The Python provider mirrors it
-(`resolve_boolean_details` etc., `Reason.CACHED` / `TARGETING_MATCH` / `DISABLED` /
-`ERROR`), and the same docblock rules apply. The JS provider is the package
-`@controlvar/openfeature-provider` and takes `@openfeature/server-sdk` as a peer
-dependency, so the application chooses the OpenFeature version; the Python one is
-`controlvar-openfeature` (module `controlvar_openfeature`).
+Three things to notice. The provider _composes_ the JS SDK rather than reimplementing the
+contract — the cache, dedupe, values and error codes come for free, and the golden vectors
+already cover its hash. It's honest about the mismatch between the standards: OpenFeature has
+no concept of experiments or events, so those are reached through `provider.client`, and its
+reasons are mapped from the server's (`rollout` is OpenFeature's `SPLIT`, a percentage split,
+not a `TARGETING_MATCH`). And `CACHED` turned out to be the hardest word in it. "Did the cache
+answer?" has to be asked _before_ the call, and with local evaluation a cached entry can be a
+local answer the client will never reuse (Hour 3). Asking `getEvaluatedFlags(userId)`, as the
+provider once did, could not tell the two apart, so the server's first answer after local
+evaluation stopped was reported `CACHED`; `holdsServerAnswer` reads `getCachedFlags` and counts
+only an entry whose `source` is not `local` (#1717). The Python provider mirrors all of it
+(`resolve_boolean_details` etc., the same reason table, attributes from
+`EvaluationContext.attributes`, a `datetime` sent as ISO 8601), and adds one rule JavaScript
+does not need: an integer call accepts `10.0` and answers `10`, but refuses `10.5`. The JS
+provider is the package `@controlvar/openfeature-provider` and takes
+`@openfeature/server-sdk` as a peer dependency, so the application chooses the OpenFeature
+version; the Python one is `controlvar-openfeature` (module `controlvar_openfeature`).
 
 The server once had OpenFeature-shaped routes of its own. The evaluate routes were removed in
 #345 (they never returned a result), and the flag listing under `/api/v1/openfeature/` was
@@ -477,11 +570,54 @@ is possible: its client is plain TypeScript over `fetch`, with the RN-specific s
 an interface and mocked in tests. What that run does not prove is behaviour on a device
 (Metro bundling, real `AsyncStorage`, backgrounding).
 
-> **By the Way** — the OpenFeature providers send **no** attributes even though the evaluate
-> endpoint accepts `context`. That's a documented gap, not an oversight: OpenFeature's
-> `EvaluationContext` is a flat map with its own conventions, and mapping it onto the
-> platform's aliased attribute names (`country` ↔ `user.country`) deserves a decision, not a
-> default. Until then, targeting rules on OpenFeature-evaluated flags only see `user_id`.
+**The MCP server** (`sdk/mcp`, npm `@controlvar/mcp-server`) is the newest directory under
+`sdk/`, and the clearest test of this book's one idea, because it is not a cache in front of
+four calls. An assistant such as Claude Code or Cursor starts it on the user's computer and
+talks to it over stdio; it calls one Controlvar instance's API with the user's own key, and
+offers six tools:
+
+```json
+// 📁 sdk/mcp/tools.json
+      "name": "list_feature_flags",
+      ...
+      "name": "get_feature_flag",
+      ...
+      "name": "evaluate_feature_flag",
+      ...
+      "name": "list_experiments",
+      ...
+      "name": "get_experiment",
+      ...
+      "name": "get_experiment_results",
+```
+
+Every one of them reads. That is a decision with three layers of enforcement, and they are
+worth naming because each would be enough on its own only until it failed. The tools: the
+server registers no tool that changes anything. The key: four dashboard read routes accept an
+API key carrying the **`mcp:read`** scope (`backend/app/api/read_scope.py`), and every route
+that creates, changes or deletes still takes a sign-in only, so even a server that tried could
+not write with that key. The test: `tests/mcp-contract/run_mcp_contract.py`, the second step of
+the required `SDK Live Contract` job, starts the built server once per key, speaks raw JSON-RPC
+to it without using an MCP SDK (so the client and the server are not the same code), and puts
+a recording proxy between the server and the API. The set of `(method, route)` pairs the proxy
+saw must be exactly an allow-list, and the database must show no audit entry, no new key and
+no new user for the run. It also checks that no key, nor any nine-character piece of one,
+appears in any output, and that the answers are the same for a key of each role, from a
+VIEWER to a superuser.
+
+It is the one directory under `sdk/` that the golden-vector job lists as "hashes nothing": it
+evaluates nothing itself, and its `evaluate_feature_flag` tool calls the API's evaluate route
+and is counted as one evaluation of the flag, as an SDK's is. The server decides, here too.
+
+> **By the Way** — the OpenFeature providers used to send **no** attributes, and the reason
+> given was that mapping OpenFeature's `EvaluationContext` onto the platform's aliased
+> attribute names (`country` ↔ `user.country`) deserved a decision, not a default. The
+> decision, when it came (#1549, #1550), was the plainest one: every key except `targetingKey`
+> is sent as it is, and the server's `expand_context` does the aliasing it already did for
+> every other SDK. The one conversion is a `Date` (`datetime` in Python), sent as an ISO 8601
+> string so a local answer and the server's compare the same text. Note what the docblock says
+> about the cache: it is keyed by user and flag, not by attributes, so the provider inherits the
+> SDK's "attributes are assumed stable" caveat from Hour 3.
 
 > **Watch Out!** The edge TTL is one minute, not five: a Worker isolate lives seconds to
 > minutes, so a five-minute memory TTL would rarely matter, and the shared KV store's own
@@ -499,12 +635,18 @@ import { readFileSync } from 'node:fs';
 const p = new ExperimentationProvider({ apiKey: readFileSync('../../tests/sdk-contract/live/.api_key','utf8').trim(), baseUrl: 'http://localhost:8000' });
 await OpenFeature.setProviderAndWait(p);
 const client = OpenFeature.getClient();
-console.log(await client.getBooleanDetails('sdk_contract_flag', false, { targetingKey: 'u-hour8' }));   // reason TARGETING_MATCH
+console.log(await client.getBooleanDetails('sdk_contract_flag', false, { targetingKey: 'u-hour8' }));   // reason SPLIT (a 100% rollout)
 console.log(await client.getBooleanDetails('sdk_contract_flag', false, { targetingKey: 'u-hour8' }));   // reason CACHED
 console.log(await client.getBooleanDetails('sdk_contract_flag', false, {}));                            // TARGETING_KEY_MISSING
-console.log(await client.getStringDetails('sdk_contract_flag', 'dflt', { targetingKey: 'u-hour8' }));   // config null → DEFAULT
+console.log(await client.getStringDetails('sdk_contract_value_string', 'dflt', { targetingKey: 'u-hour8' }));  // 'on-copy', SPLIT, variant 'on'
+console.log(await client.getStringDetails('sdk_contract_flag', 'dflt', { targetingKey: 'u-hour8' }));   // 'dflt', ERROR, TYPE_MISMATCH
+console.log(await client.getBooleanDetails('sdk_contract_targeted', false, { targetingKey: 'u-pro', plan: 'pro' }));    // true, TARGETING_MATCH
+console.log(await client.getBooleanDetails('sdk_contract_targeted', false, { targetingKey: 'u-free', plan: 'free' }));  // false, SPLIT, variant 'off'
 "
 ```
+
+The last two lines are the attributes at work: `sdk_contract_targeted` is at 0% except
+through one rule, `plan` equals `pro`, so only a provider that sends `plan` can turn it on.
 
 Then read `sdk/edge/src/adapters/deno.ts` and `sdk/edge/src/adapters/cloudflare.ts` side by
 side: the Cloudflare adapter is a KV-backed `EdgeStore` whose `get` / `put` map onto
@@ -512,13 +654,17 @@ side: the Cloudflare adapter is a KV-backed `EdgeStore` whose `get` / `put` map 
 
 ### Key takeaways
 
-- OpenFeature providers compose the JS/Python SDK, map `targetingKey` → `user_id`, resolve
-  boolean from `enabled` (typed values would come from `config`, which the server leaves null today), report `CACHED` on SDK cache hits;
-  experiments and tracking go through the underlying client.
+- OpenFeature providers compose the JS/Python SDK, map `targetingKey` → `user_id` and every
+  other key → attributes, resolve every call type from the flag's `value` when the type
+  matches, map the server's reasons (`rollout` → `SPLIT`), and report `CACHED` only for a
+  held server answer; experiments and tracking go through the underlying client.
 - Edge: no Node built-ins, 500 ms timeout, 60 s TTL, memory → KV → network, never throws.
   The bootstrap route is removed (#770); the adapters keep no-op shims.
 - React Native: JS SDK shape + `AsyncStorage` + `onError`; testable under plain node by
   design, and run by the live contract in CI.
+- The MCP server: six read-only tools for AI assistants, over the user's own key with the
+  `mcp:read` scope; read-only by its tools, by the key's routes and by a contract suite that
+  records every request it makes.
 
 ---
 
@@ -739,8 +885,9 @@ Exercise E3.5 measures the agreement rate between the two deciders.
 **Q1. List the five things a port must preserve exactly.**
 Endpoints/bodies/headers; per-user+key cache with TTL, successes only; the fan-out rule;
 the failure policy (loud detailed call, safe convenience call, `track` never fails); the
-hash and its golden vectors. Two more rows are part of the contract but not yet met by every
-port: sending `context` on flag evaluation and passing `assigned`/`reason` through.
+hash and its golden vectors. More rows are part of the contract but not yet met by every port:
+sending `context` on flag evaluation, passing `assigned`/`reason` through, the exposure hook,
+`event_id`, flag values, and the 24-hour fan-out record of the reference SDKs.
 
 **Q2. Go returns `(&EvalResult{Enabled:false}, err)` on failure. Which two contract
 behaviours does that single return satisfy?**
@@ -756,10 +903,15 @@ What does it return?**
 It throws / returns disabled — never the stale `true`. A definitive 404 means the flag is
 gone or inactive; masking that with last week's value would be the worst kind of wrong.
 
-**Q5. Why do the OpenFeature providers report `CACHED` as a reason?**
+**Q5. Why do the OpenFeature providers report `CACHED` as a reason, and why was it hard to
+get right?**
 Because the underlying SDK's cache is where the answer came from, and OpenFeature's standard
-reasons include `CACHED`; the provider checks `getEvaluatedFlags(userId)` before evaluating
-so it can tell.
+reasons include `CACHED`. The provider must ask before evaluating whether the client already
+holds the _server's_ answer for this user and flag. With local evaluation the cache can also
+hold a local answer the client will never reuse, and the old check
+(`getEvaluatedFlags(userId)`, keys only) could not tell the two apart, so a fresh server
+answer was reported `CACHED`. `holdsServerAnswer` reads `getCachedFlags` and ignores local
+entries (#1717).
 
 **Q6. Before the fixes in Hour 9, two teams integrated the same experiment — one through the
 API, one through the Lambda copy. What went wrong, how would you have detected it, and what
@@ -787,10 +939,11 @@ isn't in its name.
 with `curl`) implementing all five invariants, plus a `contract_smoke` that prints the JSON
 line the harness expects (Hour 11). Verify the hash against the golden vectors first.
 
-**E3.3 — OpenFeature attributes.** Propose (in a short design note) how
+**E3.3 — OpenFeature attributes.** Before reading `attributesOf` in
+`sdk/openfeature/src/ExperimentationProvider.ts`, write a short design note on how
 `EvaluationContext` attributes should map to the platform's `context` parameter, including
 the `targetingKey` → `user_id` rule and the aliasing (`country` ↔ `user.country`). List one
-attribute name that would collide.
+attribute name that would collide. Then compare your note with what the provider does.
 
 **E3.4 — Edge store.** Read the Cloudflare KV adapter in `sdk/edge/src/adapters/cloudflare.ts`
 and write a test for it: with two simulated isolates sharing one in-memory `KVNamespace`
@@ -827,7 +980,11 @@ Add the entry to `MANIFEST` in `run_live_contract.py` with its required executab
 `context[key]` verbatim, nested objects flattened by the server's `expand_context`; document
 that `user.country` and a top-level `country` are aliases so a rule written either way
 matches. Collision: an OpenFeature context that supplies both `country` and `user.country`
-with different values — pick top-level wins and say so.
+with different values — pick top-level wins and say so. The provider does the first three
+(#1549): `attributesOf` drops `targetingKey`, passes every other key to the SDK as it is, and
+turns a `Date` at any depth into its ISO 8601 string; the aliasing is left to the server, as
+it is for every other SDK. It does not resolve the collision itself, which is why a design
+note should.
 
 **S3.4** — the adapter's store does exactly this:
 
@@ -862,7 +1019,7 @@ agree = sum(
 print(agree / len(users))                     # ~0.5: independent functions
 ```
 
-Agreement is about 0.5 (0.4996 over 10,000 users at v0.36.4) — the two are
+Agreement is about 0.5 (0.4996 over 10,000 users, re-run at the book's pin) — the two are
 independent. Aligning the Lambda would have meant porting the hash _and_ the holdout, mutual
 exclusion and targeting gates, and keeping them aligned for ever, for a function no stack
 deployed. Deleting it left one decider; that is the cheaper invariant.

@@ -10,7 +10,8 @@ every SDK exports and the golden vectors that pin it, together with the story of
 server came to use that same hash for experiment assignment (Hour 2); and the semantics that
 make sixteen implementations behave as one — what's cached, what fans out, what happens when
 the network is gone, and when an SDK may answer a flag itself (Hour 3). Have a clone of
-`Controlvar/controlvar` at `v0.36.4` open: the Try-It sections run against it.
+`Controlvar/controlvar` at the commit this book is checked against (the README names it) open:
+the Try-It sections run against it.
 
 ---
 
@@ -26,12 +27,27 @@ authenticated with an API key, addressing experiments and flags by their public 
 | Purpose | Method and path | Body / query | Response |
 |---|---|---|---|
 | Assign a user (sticky) | `POST /api/v1/tracking/assign` | `{experiment_key, user_id, context?}` | `{experiment_key, user_id, variant_id, variant_name, is_control, configuration, assigned, reason}` |
-| Evaluate a flag | `GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…&context=<url-encoded JSON>` | — | `{key, enabled, config, reason}` |
-| Track one event | `POST /api/v1/tracking/track` | `{event_type, event_name?, user_id, experiment_key? \| feature_flag_key?, value?, metadata?, timestamp?}` | stored event |
-| Track up to 100 | `POST /api/v1/tracking/batch` | `{events: [...]}` | `{success_count, failure_count, errors}` |
+| Evaluate a flag | `GET /api/v1/feature-flags/evaluate/{flag_key}?user_id=…&context=<url-encoded JSON>` | — | `{key, enabled, value, value_type, config, reason}` |
+| Track one event | `POST /api/v1/tracking/track` | `{event_type, event_name?, user_id, experiment_key? \| feature_flag_key?, value?, metadata?, timestamp?, event_id?}` | stored event, with `duplicate` and `event_id` |
+| Track up to 100 | `POST /api/v1/tracking/batch` | `{events: [...]}` | `{success_count, failure_count, duplicate_count, errors}` |
 
 `assigned` and `reason` are always sent by a current server: an enrolled user gets
-`assigned: true, reason: "assigned"`; only servers that predate the fields omit them.
+`assigned: true, reason: "assigned"`; an ineligible one `assigned: false` and the gate that
+stopped them (`holdout`, `mutual_exclusion`, `targeting`); every user of an experiment that is
+not running gets `assigned: false` and the experiment's status as the reason (`draft`,
+`paused`, `completed`, `archived`). Only servers that predate the fields omit them.
+
+Two fields of the table are newer than the rest. **`value` and `value_type`**: a flag can
+serve a string, a number or a JSON value, not only on/off. `value` is the flag's `on_value`
+when `enabled` is true and its `off_value` otherwise, so every way of being off (inactive,
+no rule matched, outside the percentage) serves the off value; for a boolean flag `value` is
+`enabled` itself. `value_type` is `boolean`, `string`, `number` or `json`. `config` is still
+in the answer and is always `null`: an SDK written before values existed keeps parsing, and
+the value travels in `value`, never in `config`. **`event_id`**: the caller's own name for one
+occurrence of an event, at most 255 characters. The server stores the first event it receives
+for a given user, experiment, flag, event name and `event_id`; a later one with the same five
+values is answered with `duplicate: true` and writes nothing. That makes a retry safe: an SDK
+whose request timed out after the server had stored it can send it again.
 
 More endpoints exist, all under the same API key:
 
@@ -41,10 +57,20 @@ More endpoints exist, all under the same API key:
   /api/v1/tracking/assignments/{user_id}` (a user's assignments) — reads for debugging and
   dashboards, not part of the hot path.
 - `POST /api/v1/tracking/errors` and `POST /api/v1/tracking/errors/batch` — client error
-  reports, the numerator of the safety monitor's error rate. No SDK has a method for them
-  yet; an application posts them itself.
+  reports, the numerator of the safety monitor's error rate. The JavaScript and Python SDKs
+  send one with `reportError` / `report_error`; the other SDKs have no method for it, and an
+  application posts it itself. Any valid key may report, but a report counts toward automatic
+  rollback only when it comes with a server-side key (the `sdk:ruleset` scope below); the
+  others are stored and shown as `uncounted_error_count` on the flag's safety check. A browser
+  or mobile app whose errors should count sends them to its own server, which forwards them
+  with a server-side key (the docstring of `backend/app/api/v1/endpoints/client_errors.py`
+  says so).
 - `GET /api/v1/sdk/ruleset` and `POST /api/v1/tracking/evaluations` (both beta) — the
   server side of local evaluation (Hour 3). They require a key with the `sdk:ruleset` scope.
+- `POST /api/v1/tracking/assign/batch` (beta) — up to 1,000 users of one ACTIVE experiment in
+  one request, each answered as `/assign` would answer them. Same scope, and the key's owner
+  must also be able to change experiments; 60 requests a minute per address. No SDK calls it
+  yet.
 
 The **one rule**: _the server decides_. An SDK never makes a decision the server would make
 differently. By default it asks, caches the answer, and reports events. The JavaScript and
@@ -89,33 +115,54 @@ async def assign_user_to_experiment(
     ``holdout`` | ``mutual_exclusion`` | ``targeting``; nothing is recorded
     for them.  Existing assignments are always returned as-is.
 
+    An experiment that is not ACTIVE (a draft, or paused, completed or
+    archived) answers every user, enrolled or not, with HTTP 200, its control
+    variant, ``assigned: false`` and ``reason`` set to its status: ``draft``
+    | ``paused`` | ``completed`` | ``archived``.  Nothing is recorded, and
+    users who were assigned keep their assignment, so a resumed experiment
+    gives them their variant again.  A draft with no control variant answers
+    404.
+
     **Authentication**: Requires a valid API key in the X-API-Key header.
     ...
     Raises:
         HTTPException 401: If the API key is invalid
-        HTTPException 404: If the experiment doesn't exist or is not active
+        HTTPException 404: If no experiment has the key, or a draft has no
+            control variant
+        HTTPException 500: If there's an error during assignment
     """
-    # Get experiment by key
+    ...
+    # Get experiment by key, whatever its status (the key is unique).
     experiment = (
-        db.query(Experiment)
-        .filter(
-            Experiment.key == request.experiment_key,
-            Experiment.status == ExperimentStatus.ACTIVE,
-        )
-        .first()
+        db.query(Experiment).filter(Experiment.key == request.experiment_key).first()
     )
 
     if not experiment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Active experiment with key '{request.experiment_key}' not found",
+            detail=f"No experiment has the key '{request.experiment_key}'.",
         )
+
+    if experiment.status != ExperimentStatus.ACTIVE:
+        return _not_running_answer(request, experiment)
 ```
 
 Two contract details that every SDK must honour: an ineligible user is **200, not an
-error** (the SDK returns control and doesn't treat it as a failure), and a non-ACTIVE
-experiment is **404** (the SDK returns its default variant and _does_ log it). Both are
-decisions a local bucketing client could never have made.
+error** (the SDK returns control and doesn't treat it as a failure), and so is every user of
+an experiment that is not running: **200**, the experiment's own control variant,
+`assigned: false` and the status as the `reason`. Only an unknown key is a **404** (the SDK
+returns its default variant and _does_ log it), and so is the one state the API cannot create,
+a draft with no variant marked as the control, because serving its first variant could show a
+treatment to everyone. Both answers are decisions a local bucketing client could never have
+made: it cannot know the experiment was paused a minute ago.
+
+The paused-experiment answer used to be a 404, and the change (#1362) is a model of a
+contract change done well. A 404 made pausing a test look like an outage: every assignment
+call became an error, logged by every SDK. The fix needed **no SDK release**, because it used
+fields the contract already had: every SDK already rendered control for `assigned: false`, and
+read `reason` or ignored it. The server also stops recording while the experiment is not
+running (no assignment row, no exposure), and keeps the stored assignments, so resuming the
+test gives each enrolled user their variant back.
 
 Flag evaluation, with the same "inactive is not an error" rule:
 
@@ -130,6 +177,14 @@ def _evaluate_flag_by_key(
     archived, ...) evaluates to ``enabled: false`` with ``reason: "inactive"``
     rather than 404: the client should treat it as "off", not as an error.
     Only an unknown key is a 404.
+
+    ``value`` is what the flag serves this user (#1497): its ``on_value`` when
+    ``enabled``, its ``off_value`` otherwise, so every way a flag is off --
+    inactive, archived, no match, outside the percentage, ``reason: "error"``
+    -- serves the off value; a boolean flag's ``value`` is ``enabled``. A
+    stored value outside the value rules is answered with no ``value`` key
+    (``flag_values.served_value``). ``config`` is always ``None``: the value
+    travels in ``value``, never in ``config``.
     """
     db_flag = db.query(FeatureFlag).filter(FeatureFlag.key == flag_key).first()
     if not db_flag:
@@ -142,15 +197,23 @@ def _evaluate_flag_by_key(
     evaluation = feature_flag_service.evaluate_flag_detailed(db_flag, user_id, context)
     record_flag_evaluation(flag_key, "enabled" if evaluation["enabled"] else "disabled")
 
-    # ``config`` has always been ``None`` here (the flag dict has no ``value``);
-    # kept for backwards compatibility with existing SDKs.
-    return {
-        "key": flag_key,
-        "enabled": evaluation["enabled"],
-        "config": None,
-        "reason": evaluation["reason"],
-    }
+    answer: Dict[str, Any] = {"key": flag_key, "enabled": evaluation["enabled"]}
+    servable, value = served_value(db_flag, evaluation["enabled"])
+    if servable:
+        answer["value"] = value
+    answer["value_type"] = flag_value_type(db_flag)
+    answer["config"] = None
+    answer["reason"] = evaluation["reason"]
+    return answer
 ```
+
+Read the order of the keys as a compatibility decision. `value` and `value_type` were added
+beside the old four, never in place of one: an SDK from before flag values ignores the two
+keys it does not know and keeps working, and one that knows them must cope with an answer that
+has no `value` (an older server, or a stored value this server will not serve). The SDKs that
+read values today (JavaScript, Python, Go, and the two OpenFeature providers through them)
+return the caller's default for a missing `value`, never a made-up `false` or `""`; the
+others read `enabled` only.
 
 `record_flag_evaluation` here only increments a Prometheus counter. The safety monitor's
 denominator (Build book Day 18) is elsewhere: `FeatureFlagService.evaluate_flag_detailed`
@@ -198,53 +261,63 @@ def get_api_key(
         )
 ```
 
-A valid key is enough for the four endpoints. The two local-evaluation routes also require
-the key to carry the **`sdk:ruleset`** scope. Only a user who can change feature flags
-(ADMIN or DEVELOPER) can create such a key, and the owner's role is checked again on every
-request: a key without the scope, or one whose owner has since become an ANALYST or VIEWER,
-gets 403. The ruleset contains every flag's targeting rules and the values written in them,
-which is why the key belongs on a server and never in a browser or an app.
+A valid key is enough for the four endpoints. The local-evaluation routes and batch
+assignment also require the key to carry the **`sdk:ruleset`** scope. Only a user who can
+change feature flags can create such a key (ADMIN, DEVELOPER, a superuser, or in the full
+profile someone whose custom role or direct grant gives `feature_flag (update)`), and the
+owner's rights are checked again on every request: a key without the scope, or one whose
+owner can no longer change flags, gets 403. The ruleset contains every flag's targeting rules,
+the values written in them and each flag's served values, which is why the key belongs on a
+server and never in a browser or an app. (A second scope, `mcp:read`, lets a key read four
+dashboard routes for the MCP server of Hour 8; it carries no role rule of its own.)
 
-And the tracking side of the contract — the event is resolved to a `variant_id` **at write
-time** from the user's assignment row, so the SDK never sends a variant:
+And the tracking side of the contract — the event is resolved to a `variant_id` **when the
+server receives it**, from the user's assignment row, so the SDK never sends a variant:
 
 ```python
 # 📁 backend/app/api/v1/endpoints/tracking.py
-    if request.experiment_key:
-        experiment = (
-            db.query(Experiment)
-            .filter(Experiment.key == request.experiment_key)
-            .first()
+def _variant_at_receipt(db: Session, experiment: Experiment, user_id: str) -> Any:
+    """The variant ``/track`` and ``/batch`` tag an event with.
+
+    The user's stored assignment, while the experiment is ACTIVE; otherwise
+    ``None``. The status is the one read when the event is received. For a
+    draft, paused, completed or archived experiment the event is stored with
+    its ``experiment_id`` and no variant, so it counts in no variant's
+    results: an event received while the experiment is not running is not
+    taken as evidence about the variant the user was assigned. The assignment
+    rows are kept, and ``backend/scripts/retag_events_from_assignments.py``
+    can tag such events from them afterwards.
+    """
+    if experiment.status != ExperimentStatus.ACTIVE:
+        return None
+    assignment = (
+        db.query(Assignment)
+        .filter(
+            Assignment.experiment_id == experiment.id,
+            Assignment.user_id == user_id,
         )
-
-        if experiment:
-            experiment_id = experiment.id
-
-            # Find variant if user has an assignment
-            assignment = (
-                db.query(Assignment)
-                .filter(
-                    Assignment.experiment_id == experiment_id,
-                    Assignment.user_id == request.user_id,
-                )
-                .order_by(Assignment.created_at.desc())
-                .first()
-            )
-
-            if assignment:
-                variant_id = assignment.variant_id
+        .order_by(Assignment.created_at.desc())
+        .first()
+    )
+    return assignment.variant_id if assignment else None
 ```
 
 That's why the contract's `track` body has `experiment_key` and `user_id` but no
 `variant_name`: a client that reported "user X converted in treatment" could be wrong (stale
-cache, a bug, a malicious caller); the server's own assignment row can't be.
+cache, a bug, a malicious caller); the server's own assignment row can't be. And because the
+server decides, it can also decide that an event says nothing about a variant: a purchase
+made while the test is paused is kept, with its experiment and no variant, instead of being
+counted for the arm the user was in before the pause. No SDK had to change for that rule.
 
-> **By the Way** — the contract's rate limit is per IP and shared across the SDK paths:
-> `SDK_RATE_LIMIT_PER_MINUTE` (default 6,000/min) covers `/tracking/*`,
+> **By the Way** — the SDK paths have a higher rate limit than the rest of the API:
+> `SDK_RATE_LIMIT_PER_MINUTE` (default 6,000 a minute) for `/tracking/*`,
 > `/feature-flags/evaluate/*`, `/feature-flags/user/*` and `/sdk/*` (the ruleset that a fleet
-> of servers behind one NAT polls). A server-side SDK behind a single
-> NAT can hit it; that's what the 429 handling in Hour 3 is for, and what the cache is for
-> before that.
+> of servers behind one NAT polls). The counter is per client address **and per path**
+> (`rate_limit_key` in `backend/app/middleware/rate_limiter.py` returns `client_ip:path`), so
+> `/tracking/assign` and `/tracking/batch` each have their own 6,000, and so does each flag
+> key's evaluate path. Batch assignment has its own exact limit, 60 a minute. A busy
+> server-side SDK behind a single NAT can still hit a limit; that's what the 429 handling in
+> Hour 3 is for, and what the cache is for before that.
 
 > **Watch Out!** `event_type` vs `event_name`. The SDKs default `event_type` to the
 > `event_name` you pass (`"purchase"`), and analysis matches conversions on `event_name`
@@ -263,11 +336,13 @@ export K=$(cat tests/sdk-contract/live/.api_key)
 # 1. assign (sticky): run it twice, same variant
 curl -s -X POST localhost:8000/api/v1/tracking/assign -H "X-API-Key: $K" -H 'Content-Type: application/json' \
   -d '{"experiment_key":"sdk_contract_ab","user_id":"u-hour1","context":{"country":"US"}}' | jq .
-# 2. evaluate the flag (100% rollout → enabled, reason "rollout")
+# 2. evaluate the flag (100% rollout → enabled, reason "rollout"; a boolean flag's value is enabled)
 curl -s "localhost:8000/api/v1/feature-flags/evaluate/sdk_contract_flag?user_id=u-hour1" -H "X-API-Key: $K" | jq .
-# 3. track with a key, then batch
-curl -s -X POST localhost:8000/api/v1/tracking/track -H "X-API-Key: $K" -H 'Content-Type: application/json' \
-  -d '{"event_type":"purchase","event_name":"purchase","user_id":"u-hour1","experiment_key":"sdk_contract_ab","value":12.5}' | jq .variant_id
+# 2b. a string flag serves its on value
+curl -s "localhost:8000/api/v1/feature-flags/evaluate/sdk_contract_value_string?user_id=u-hour1" -H "X-API-Key: $K" | jq '{value, value_type}'
+# 3. track with a key, twice with one event_id: the second answer says duplicate
+for i in 1 2; do curl -s -X POST localhost:8000/api/v1/tracking/track -H "X-API-Key: $K" -H 'Content-Type: application/json' \
+  -d '{"event_type":"purchase","event_name":"purchase","user_id":"u-hour1","experiment_key":"sdk_contract_ab","value":12.5,"event_id":"order-1001"}' | jq '{variant_id, duplicate}'; done
 # 4. the three non-happy paths
 curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/api/v1/tracking/assign -H 'Content-Type: application/json' -d '{"experiment_key":"sdk_contract_ab","user_id":"x"}'   # 401
 curl -s -X POST localhost:8000/api/v1/tracking/assign -H "X-API-Key: $K" -H 'Content-Type: application/json' -d '{"experiment_key":"nope","user_id":"x"}' | jq .detail             # 404
@@ -277,10 +352,13 @@ curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/api/v1/sdk/ruleset -H "X
 curl -s localhost:8000/api/v1/sdk/ruleset -H "X-API-Key: $(cat tests/sdk-contract/live/.api_key_local)" | jq '{schema, bucketing}'   # 1, "md5-mod100-v1"
 ```
 
-Then pause the experiment in the dashboard and repeat step 1: 404 — the SDK's "return
-default variant" path. Two more status details every SDK route shares: a NUL or an unpaired
-surrogate in a path segment answers 422, and an unexpected failure answers a fixed sentence
-with a request ID that is also in the `X-Request-ID` header (quote it when you report a bug).
+The unknown experiment's detail is `"No experiment has the key 'nope'."`. Then pause the
+experiment in the dashboard and repeat step 1: **200**, the control variant,
+`"assigned": false, "reason": "paused"`, the same for every user. Resume it, repeat, and
+`u-hour1` is back in the variant it had. Two more status details every SDK route shares: a NUL
+or an unpaired surrogate in a path segment answers 422, and an unexpected failure answers a
+fixed sentence with a request ID that is also in the `X-Request-ID` header (quote it when you
+report a bug).
 
 ### Key takeaways
 
@@ -288,12 +366,16 @@ with a request ID that is also in the `X-Request-ID` header (quote it when you r
 - The server decides: gates, stickiness, bandit weights and `variant_id` resolution all live
   in one place. Local flag evaluation reproduces the server's answer from its ruleset or
   asks; experiments never leave the server.
-- Ineligible = 200 + `assigned:false` + a reason; inactive flag = 200 + `reason:"inactive"`;
-  unknown or non-ACTIVE experiment = 404. SDKs must distinguish these.
+- Ineligible = 200 + `assigned:false` + a reason; an experiment that is not running = 200 +
+  control + `assigned:false` + its status; inactive flag = 200 + `reason:"inactive"`; only an
+  unknown key is 404. SDKs must distinguish these.
+- A flag answer carries `value` (on value or off value; `enabled` for a boolean flag) and
+  `value_type`; `config` stays, always `null`. An event may carry an `event_id`, and the server
+  stores it once.
 - Evaluations feed the safety monitor's denominator (server rows, plus counts reported by
-  local mode); events match on `event_name`.
-- The local-evaluation routes need a key with the `sdk:ruleset` scope, owned by an ADMIN or
-  DEVELOPER, kept on a server.
+  local mode); events match on `event_name`; error reports count only with a server-side key.
+- The local-evaluation routes and batch assignment need a key with the `sdk:ruleset` scope,
+  owned by someone who can change flags, kept on a server.
 
 ---
 
@@ -547,13 +629,13 @@ the input — and watch the suite go red (the Try It below lets you do the first
 
 ### Try It Yourself
 
-From a clone of `Controlvar/controlvar` (checked out at `v0.36.4`):
+From a clone of `Controlvar/controlvar` (checked out at the book's pin):
 
 ```bash
 cd controlvar
 python tests/sdk-contract/hash_contract.py --list
 python tests/sdk-contract/hash_contract.py python          # add js edge react-native go once they are built
-python -m pytest tests/sdk-contract -q -o addopts=""
+python -m pytest tests/sdk-contract -q -o addopts=""       # needs the network and node 18+ (Hour 12)
 python -m pytest backend/tests/unit/core/test_consistent_hash.py -q -o addopts=""
 python - <<'EOF'
 import hashlib, struct, json
@@ -566,8 +648,12 @@ print("flag rollout bucket  ", int(d.hex(), 16) % 100)                       # 7
 EOF
 ```
 
-Then write the hash in a language you know that isn't in `sdk/` (bash with `md5sum` and
-`xxd` works) and check it against three vectors.
+The pytest run is no longer offline. Besides the comparison's own tests it downloads every
+published release of the JavaScript and Python SDKs that evaluates flags locally, checks each
+file's digest, and runs it under node or Python against the server's ruleset (Hour 12 explains
+why). Without the network or without node it fails and says so; it never skips. At the pin it
+reports 84 passed. Then write the hash in a language you know that isn't in `sdk/` (bash with
+`md5sum` and `xxd` works) and check it against three vectors.
 
 ### Key takeaways
 
@@ -598,15 +684,44 @@ error must not pin a user to "control" for five minutes. Concurrent calls for th
 key share one in-flight request (where the language makes that natural).
 
 **Fan-out.** `track(user, event)` with an `experiment_key` or `feature_flag_key` sends one
-`/track`. With **no key**, the SDK sends one `/batch` containing one entry per cached
-assignment and one per cached evaluated flag for that user — "attribute this event to
-everything this client has shown this user." If nothing is cached, **nothing is sent**.
+`/track`. With **no key**, the SDK sends one `/batch` containing one entry per experiment and
+one per flag it has answered for that user — "attribute this event to everything this client
+has shown this user." _Which_ answers count is where the SDKs now differ. The JavaScript,
+Python and React SDKs keep a record of the keys they answered for each user, apart from the
+cache, for **24 hours** after the latest answer (or the cache lifetime, if that is longer);
+they skip an experiment whose latest answer said it is a draft, paused, completed or archived;
+and when there is nothing to attribute the event to, they send it **once with no key**, which
+the server stores as history (it counts in no experiment's results). The other ports still
+fan out over their cache and send **nothing** when nothing is cached (Hour 7 lists them).
 
 **Failure policy.** The "detailed" methods (`get_assignment`, `get_feature_flag`,
 `get_all_flags`) **raise** a typed error carrying the HTTP status; the convenience wrappers
 (`get_variant`, `is_feature_enabled`) **swallow** it and return a safe default (`"control"`,
 `False`); `track` / `track_batch` **never raise**. A 429 is retried **once** after
-`Retry-After` (capped).
+`Retry-After` (capped). The newer methods take the convenience side: the typed getters below
+return the caller's default, and an error report (`report_error`) never raises.
+
+Three newer semantics sit on top, so far in some of the SDKs only:
+
+- **Typed values.** `get_string_value`, `get_number_value` and `get_json_value` (in
+  JavaScript `getStringValue`, `getNumberValue`, `getJsonValue`) read the `value` of Hour 1.
+  They never raise: they return the default the caller passed, and report why, when the call
+  fails, the flag is unknown, the answer has no value, or the flag serves another type
+  (`TYPE_MISMATCH`). Nothing is coerced: a boolean flag asked for a string is a mismatch, not
+  `"true"`. A JSON value comes back as a new copy every time, so a caller that changes it
+  cannot change what the SDK has cached for the next caller.
+- **The exposure hook.** `on_exposure` / `onExposure` is called **once for each fresh
+  enrolment answer the client stores**: when `/tracking/assign` answers `assigned: true` and
+  the client had no unexpired answer for that user and experiment. Not for a cached answer,
+  not for `assigned: false`, not for a flag. The SDK pages give its use: sending the exposure
+  to your own analytics tool or warehouse at the moment the server records it. A failing hook
+  cannot change the answer: what it raises goes to `on_error` with the operation `exposure`
+  and the code `HOOK_ERROR`. But it runs before the call returns, so a slow one is a slow
+  call; the pages say to hand the exposure to your analytics library, which sends it later.
+- **An event id.** `track(..., event_id=...)` sends the caller's id with the event, and every
+  entry of a fan-out carries the same id. The SDK never makes one up: an id it invented per
+  call would be different on a retry, which is exactly the case the server's deduplication is
+  for.
 
 Why these particular answers? The cache TTL trades staleness for load: five minutes means a
 paused experiment keeps serving its variant for at most five minutes, and a server-side SDK
@@ -617,6 +732,15 @@ control for the afternoon." The fan-out rule exists because product code that fi
 the funnel — but the SDK does, because it served them. And raise-vs-swallow gives the
 integrator a choice: "I need to know" (`get_assignment`, handle the error) or "just give me
 something safe" (`get_variant`).
+
+The 24-hour record has the most instructive history of these. The fan-out used to read the
+cache, which keeps an answer for 300 seconds. A shopper who spent six minutes
+in checkout made a purchase that was sent nowhere: no request, no error, and Python's `track()`
+returned `False`. The loss grows with the time users take to convert, so an experiment whose
+arms differ in exactly that, such as a longer checkout, was biased toward the faster arm
+(#1358). The cure separated two lifetimes that had been one: how long an _answer_ may be reused
+(the TTL) and how long an _attribution_ stays true (a sticky assignment does not change after
+five minutes).
 
 ### How Controlvar does it
 
@@ -653,8 +777,35 @@ class UserKeyCache(Generic[T]):
         """All live (unexpired) entries for a user, in insertion order."""
 ```
 
-`entries(user_id)` is the fan-out's data source. The client keeps two of these — one for
-assignments, one for flags — and `track` reads both:
+The client keeps two of these — one for assignments, one for flags — and `entries(user_id)`
+was the fan-out's data source until the fix above. It now feeds only `cached_assignments()` and
+`cached_flags()`. The fan-out reads a third structure, `AttributedKeys`, which every successful
+answer writes to and `clear_cache()` leaves alone:
+
+```python
+# 📁 sdk/python/controlvar/attribution.py
+#: Users kept per client instance; the user answered least recently is dropped first.
+MAX_ATTRIBUTED_USERS = 10_000
+
+#: A key is used for this long after its latest successful answer, then dropped.
+ATTRIBUTION_HORIZON_SECONDS = 24 * 60 * 60
+
+#: An experiment whose latest answer gave one of these reasons is not running, so a
+#: key-less event is not sent to it. Other reasons (``holdout``,
+#: ``mutual_exclusion``, ``targeting``) are kept: holdout results count those
+#: users' events.
+LIFECYCLE_REASONS: FrozenSet[str] = frozenset({"draft", "paused", "completed", "archived"})
+...
+    def __init__(self, cache_ttl_seconds: float = 0) -> None:
+        # 24 hours, or the cache lifetime when that is longer, so a cached answer never
+        # outlives the record that tags its events (#1423).
+        self._horizon = max(ATTRIBUTION_HORIZON_SECONDS, cache_ttl_seconds)
+```
+
+Two bounds, both deliberate: 10,000 users per client, least recently answered dropped first, so
+a long-lived server process cannot grow the record without limit; and a horizon never shorter
+than the cache, because an answer still being served from the cache must still tag its
+events. `track` reads it:
 
 ```python
 # 📁 sdk/python/controlvar/client.py
@@ -668,22 +819,24 @@ assignments, one for flags — and `track` reads both:
         feature_flag_key: Optional[str] = None,
         event_type: Optional[str] = None,
         timestamp: Union[datetime, str, None] = None,
+        event_id: Optional[str] = None,
     ) -> bool:
         """Record an event. Never raises.
 
         * With ``experiment_key`` and/or ``feature_flag_key``: one
           ``POST /api/v1/tracking/track``.
         * Without a key: one ``POST /api/v1/tracking/batch`` (chunked at 100)
-          containing one entry per cached assignment (``experiment_key``) plus
-          one per cached evaluated flag (``feature_flag_key``) for this user.
-          If nothing is cached for the user, nothing is sent and ``False`` is
-          returned.
-
-        ``event_type`` defaults to ``event_name``. Returns ``True`` only when
-        the server accepted the event(s).
+          containing one entry per experiment (``experiment_key``) plus one per
+          flag (``feature_flag_key``) this client answered for the user in the
+          last 24 hours, cached or not. An experiment whose latest answer said it
+          is a draft, paused, completed or archived gets no entry.
+        * Without a key and with nothing to attribute it to: one
+          ``POST /api/v1/tracking/track`` with no key, which the server stores as
+          history.
+        ...
         """
         try:
-            base = self._event_body(user_id, event_name, event_value, properties, event_type, timestamp)
+            base = self._event_body(user_id, event_name, event_value, properties, event_type, timestamp, event_id)
             if experiment_key or feature_flag_key:
                 body = dict(base)
                 if experiment_key:
@@ -693,22 +846,27 @@ assignments, one for flags — and `track` reads both:
                 self._request("POST", "/api/v1/tracking/track", body=body)
                 return True
 
-            events: List[Dict[str, Any]] = [
-                dict(base, experiment_key=assignment.experiment_key)
-                for assignment in self.cached_assignments(user_id)
-            ]
-            events.extend(dict(base, feature_flag_key=flag.key) for flag in self.cached_flags(user_id))
+            experiments, flags = self._attributed.keys(user_id)
+            events: List[Dict[str, Any]] = [dict(base, experiment_key=key) for key in experiments]
+            events.extend(dict(base, feature_flag_key=key) for key in flags)
             if not events:
-                logger.debug("track(%s, %s): nothing cached for user; nothing sent", user_id, event_name)
-                return False
-            return self.track_batch(events).ok
+                # Nothing to attribute it to: sent once with no key, stored as history.
+                self._request("POST", "/api/v1/tracking/track", body=base)
+                return True
+            return self._post_batches(events)
         except Exception as exc:  # noqa: BLE001 - fire-and-forget
             logger.warning("track(%s, %s) failed: %s", user_id, event_name, exc)
             return False
 ```
 
-The same rule in Go, where the cache is a single LRU and entries carry their user so
-`Range` can find them:
+The `event_id` goes into `base`, so every fan-out entry carries it; `_event_body` drops `None`
+and `""`, which the server also reads as "no id". The docstring is just as precise about what
+`True` means: the event was sent and every request was answered 2xx. A 2xx batch can still
+report a failed entry (a key the server no longer has), so code that needs per-entry results
+calls `track_batch` and reads them.
+
+The older rule in Go, where the cache is a single LRU and entries carry their user so `Range`
+can find them, and where the docblock still says "from the cache":
 
 ```go
 // 📁 sdk/go/client.go
@@ -753,20 +911,33 @@ Raise vs swallow, side by side:
 ```
 
 and the error type that makes "raise" useful — status and body attached, `None` status for
-network failures:
+network failures, and a `code` only on the errors the SDK makes itself:
 
 ```python
 # 📁 sdk/python/controlvar/types.py
 class ExperimentationError(Exception):
     """Raised by ``get_assignment``, ``get_feature_flag``, ``get_all_flags`` and
-    ``get_assignments`` when the API call fails.
+    ``get_assignments`` when the API call fails, and passed to ``on_error`` for
+    the failures the other methods swallow.
 
     Attributes:
         status: HTTP status code of the failed response, or ``None`` for
-            network errors and timeouts.
+            network errors, timeouts and a request the SDK did not send (its
+            body held NaN or an infinite number).
         body: Raw response body (text) when a response was received.
+        code: Set on the errors a typed getter (``get_string_value``,
+            ``get_number_value``, ``get_json_value``) makes itself:
+            ``"TYPE_MISMATCH"`` when the flag serves another type, and
+            ``"INVALID_RESPONSE"`` when its answer carries no value of the type
+            it names. ``"HOOK_ERROR"`` only on the error passed to ``on_error``
+            with the operation ``"exposure"``: ``on_exposure`` raised, or
+            returned a coroutine; its ``__cause__`` is what it raised. Other
+            errors carry no code in this version; ``status`` describes them.
     """
 ```
+
+The same object is now both raised and _reported_: the swallowing methods hand theirs to
+`on_error(error, operation)`, so one handler sees every failure the caller was not shown.
 
 The 429 policy — one retry, `Retry-After` honoured and capped:
 
@@ -798,11 +969,14 @@ pipeline would make a different choice; this SDK is not one.
 > JSON (Hour 6). A flag answered by local evaluation (below) is computed from the attributes
 > of that call, so the caveat does not apply to it.
 
-> **By the Way** — "nothing cached → nothing sent" surprises people. A server-side SDK that's
-> just been restarted has an empty cache; the first `track("purchase")` without a key sends
-> nothing and returns `False`. It's the right behaviour — the SDK genuinely doesn't know what
+> **By the Way** — a restart still empties the record. A server-side SDK that has just been
+> restarted has answered nothing for anyone, so the first `track("purchase")` without a key
+> is sent once with no key: stored, counted in no experiment's results (a port without the
+> record sends nothing at all). It's the right behaviour — the SDK genuinely doesn't know what
 > the user was shown — and the fix is to pass `experiment_key` when you know it, or to
-> assign/evaluate before tracking in the same process. The contract smoke (Hour 11) tests
+> assign/evaluate before tracking in the same process. The record is per process, too: a
+> fleet of ten servers behind a load balancer has ten records, and the purchase is attributed
+> only if it lands on a server that answered that user. The contract smoke (Hour 11) tests
 > exactly this ordering.
 
 ### Local evaluation: when an SDK may answer a flag itself (beta)
@@ -832,20 +1006,35 @@ server mode.** It never guesses. The mechanics:
 
 - **The ruleset.** `GET /api/v1/sdk/ruleset` serves every flag in one normalised document with
   an `ETag`; a refresh that sends it back in `If-None-Match` gets `304` while nothing changed.
-  Each flag is marked `"evaluation": "local"` or `"remote"`.
+  Each flag is marked `"evaluation": "local"` or `"remote"`. A string, number or json flag
+  also carries `value_type`, `on_value` and `off_value` (#1524), so a local answer carries the
+  same `value` the server would send. A boolean flag's entry has no value field at all, so a
+  deployment with no value flags serves exactly the bytes it served before values existed.
 - **What is answered locally.** Only conditions using `eq`, `neq`, `in`, `not_in`, `contains`,
   `not_contains`, `starts_with`, `ends_with`, `gt`, `gte`, `lt`, `lte`, `is_null` and
   `is_not_null`, on values the SDK can compare exactly as the server does (strings with
   strings, numbers with numbers, no coercion). Any other operator, a type mismatch, a number
   beyond 2⁵³ − 1, an unpaired surrogate, `is_null` on a string containing whitespace, or a
   flag key the ruleset does not have yet: the server answers.
+- **An entry the SDK cannot read.** From 0.3.0, a flag entry with an `evaluation` other than
+  `local` or `remote`, a `value_type` the SDK does not know, or a mistyped value goes to the
+  server **on its own**, and the rest of the ruleset stays in use; a newer server can add a
+  flag shape without switching local evaluation off for every other flag. A known shape that
+  is malformed (an active `local` entry without integer percentages) still rejects the whole
+  document. The published 0.1.1 and 0.2.0 releases reject the whole document in both cases and
+  keep answering from the ruleset they had; Hour 12 is about catching that.
 - **Bucketing.** Rollouts use the server's flag function, `md5-mod100-v1` (the whole digest
   `% 100`) — **not** the exported `consistentHash` from Hour 2.
 - **Freshness.** A refresh every 30 s by default (never below 5 s, ±10% jitter); on errors the
   SDK keeps serving the last ruleset and backs off up to 5 minutes; 401/403 (key revoked,
-  scope removed, owner no longer allowed) **discard** the ruleset and every flag goes to the
-  server. `maxStaleMs` / `max_stale_seconds` bound how old a ruleset may be before evaluations
-  go back to the server.
+  scope removed, owner no longer allowed), a 404 (a server older than the route) and an
+  unknown `schema` or `bucketing` **discard** the ruleset, and every flag goes to the server,
+  retried every 10 minutes. `maxStaleMs` / `max_stale_seconds` bound how old a ruleset may be
+  before evaluations go back to the server. "Goes to the server" means exactly that: not to
+  the cache. Until #1712 the SDKs answered such a call from a cached _local_ answer for up to
+  five minutes, because every local answer is written to the cache for the fan-out, and the
+  deferral path read the cache before asking the server. The tests of every discard had called
+  `clear_cache()` before asserting, so none of them could see it.
 - **Where it may run.** Server-side only: the ruleset carries every flag's targeting values,
   so the key needs the `sdk:ruleset` scope, and the JavaScript SDK throws at construction if
   asked for local mode in a browser.
@@ -866,44 +1055,58 @@ Offline, with the fake transport (Hour 10 has the full tour):
 
 ```python
 >>> from controlvar import ExperimentationClient
->>> from controlvar.testing import FakeTransport, make_response
->>> t = FakeTransport().route("POST", "/api/v1/tracking/assign", json={"experiment_key": "exp", "user_id": "u", "variant_name": "treatment", "is_control": False, "variant_id": "v1", "configuration": None})
->>> t.route("GET", "/api/v1/feature-flags/evaluate/f", json={"key": "f", "enabled": True, "config": None, "reason": "rollout"})
->>> t.route("POST", "/api/v1/tracking/batch", json={"success_count": 2, "failure_count": 0, "errors": []})
+>>> from controlvar.testing import FakeTransport
+>>> t = (FakeTransport()
+...      .route("POST", "/api/v1/tracking/assign", json={"experiment_key": "exp", "user_id": "u", "variant_name": "treatment", "is_control": False, "variant_id": "v1", "configuration": None, "assigned": True, "reason": "assigned"})
+...      .route("GET", "/api/v1/feature-flags/evaluate/f", json={"key": "f", "enabled": True, "value": True, "value_type": "boolean", "config": None, "reason": "rollout"})
+...      .route("POST", "/api/v1/tracking/batch", json={"success_count": 2, "failure_count": 0, "duplicate_count": 0, "errors": None})
+...      .route("POST", "/api/v1/tracking/track", json={"id": "e1"}))
 >>> c = ExperimentationClient("http://test", "key", transport=t)
->>> c.track("u", "purchase")                       # nothing cached → False, and no request
-False
->>> len(t.requests)
-0
+>>> c.track("u", "purchase")                       # nothing answered yet → one /track with no key
+True
+>>> t.calls(), "experiment_key" in t.last.json(), "feature_flag_key" in t.last.json()
+(['POST /api/v1/tracking/track'], False, False)
 >>> c.get_variant("exp", "u"), c.is_feature_enabled("f", "u")
 ('treatment', True)
->>> c.get_variant("exp", "u"); len(t.requests)     # cached: still 2 requests
-2
->>> c.track("u", "purchase")                       # fans out: one /batch with 2 events
+>>> c.get_variant("exp", "u"); len(t.requests)     # cached: still 3 requests
+'treatment'
+3
+>>> c.clear_cache(); c.track("u", "purchase")      # the cache is empty, the record is not
 True
 >>> t.last.path, [e.get("experiment_key") or e.get("feature_flag_key") for e in t.last.json()["events"]]
 ('/api/v1/tracking/batch', ['exp', 'f'])
->>> t.route("POST", "/api/v1/tracking/assign", status=500, json={"detail": "boom"})
->>> c.clear_cache(); c.get_variant("exp", "u")     # swallowed → default
+>>> c.track("u", "purchase", event_id="order-1001"); [e["event_id"] for e in t.last.json()["events"]]
+True
+['order-1001', 'order-1001']
+>>> _ = t.route("POST", "/api/v1/tracking/assign", status=500, json={"detail": "boom"})
+>>> c.get_variant("exp", "u")                      # swallowed → default
 'control'
 >>> c.get_assignment("exp", "u")                   # raised → status 500
-Traceback (most recent call last): ...
+Traceback (most recent call last):
+  ...
 controlvar.types.ExperimentationError: POST /api/v1/tracking/assign failed with HTTP 500
 >>> c.cached_assignments("u")                      # failure not cached
 []
 ```
 
+(This transcript was run with `python -m doctest` against `sdk/python` at the pin. `route`
+returns the transport, which is why the routes chain and why the later one is assigned to `_`.)
+
 ### Key takeaways
 
 - Cache per user + key, TTL 300 s (edge 60 s), successes only, expired-on-read; attributes
   are assumed stable (clear the cache when they change).
-- Fan-out: keyed events → `/track`; key-less → one `/batch` over cached assignments + flags;
-  nothing cached → nothing sent.
-- Detailed methods raise a typed error with `status`; convenience wrappers return
-  `"control"` / `False`; `track` never raises; 429 retried once after `Retry-After`.
+- Fan-out: keyed events → `/track`; key-less → one `/batch` over what the client answered for
+  the user. JS, Python and React read a 24-hour record kept apart from the cache and send an
+  unattributable event once with no key; the other ports read the cache and send nothing.
+- Detailed methods raise a typed error with `status`; convenience wrappers and typed getters
+  return a default; `track` never raises; 429 retried once after `Retry-After`.
+- `on_exposure` fires once per fresh `assigned: true` answer the client stores, never from
+  the cache; an `event_id` is the caller's, copied into every fan-out entry, never invented
+  by the SDK.
 - Local mode (JS and Python, server-side, beta): flags only, from `GET /api/v1/sdk/ruleset`,
-  bucketed with `md5-mod100-v1`; anything it cannot answer exactly goes to the server; counts
-  go to `POST /api/v1/tracking/evaluations`.
+  bucketed with `md5-mod100-v1`, values included; anything it cannot answer exactly goes to
+  the server, not to the cache; counts go to `POST /api/v1/tracking/evaluations`.
 - These semantics, not the language, are the SDK. Part III is about keeping them identical.
 
 ---
@@ -924,8 +1127,17 @@ nothing is logged as an error. The JavaScript and Python SDKs return the assignm
 `is_control: true` **and** `assigned: false, reason: "targeting"`. Render control, and never
 count that user as enrolled: export only `assigned: true` rows to a warehouse. Against a server
 that predates the fields, JS and Python leave them unset (unknown, not `false`); React
-defaults `assigned` to `true`; the other SDKs drop both fields today, a known gap (issue
-#316, Hour 12). Only 4xx/5xx are errors.
+defaults `assigned` to `true`; the other SDKs drop both fields from what they return, a known
+gap (Hour 7), although several of them read `assigned` internally to decide whether to call
+their exposure hook. Only 4xx/5xx are errors.
+
+**Q2b. The experiment is paused. What does `/tracking/assign` answer, and what does a
+key-less `track()` do afterwards in the Python SDK?**
+200, the control variant, `assigned: false, reason: "paused"`, for every user. The SDK records
+that latest answer, and a key-less event then gets no entry for that experiment (a lifecycle
+reason is skipped); with nothing else answered for the user, it is sent once with no key and
+stored as history. Had the event named the experiment explicitly, the server would store it
+with the experiment and no variant.
 
 **Q3. Why does the `track` body carry no variant?**
 The server resolves `variant_id` from the user's assignment row at write time; a client-sent
@@ -938,8 +1150,18 @@ signed `int32` read) — it only shows on inputs whose digest has a high bit set
 
 **Q5. A server-side SDK restarts and immediately handles a checkout that calls
 `track("purchase")` with no key. What happens?**
-Nothing is sent (`False`): the cache is empty so there's nothing to fan out to. Pass the
+In JS, Python and React: one `/track` with no key, stored as history and counted in no
+experiment's results, because the record of answered keys is empty after a restart. In the
+other ports: nothing is sent. Either way the purchase reaches no experiment. Pass the
 experiment key, or assign before tracking.
+
+**Q5b. Why is the fan-out record kept for 24 hours when the cache keeps an answer for five
+minutes?**
+Because they answer different questions. The TTL bounds how stale a _decision_ may be when it
+is reused; an assignment is sticky, so the _attribution_ "this user is in this experiment"
+stays true long after. Reading the fan-out from the cache dropped every purchase made more
+than five minutes after the assignment, and so biased any experiment whose arms differ in how
+long users take to buy (#1358).
 
 **Q6. Should a 429 be retried with exponential backoff?**
 Not here: the client is on a request path with a ~5 s budget. One retry after `Retry-After`
@@ -974,7 +1196,7 @@ which vectors fail.
 cached and the next call hits the transport; (b) an evaluation with `reason: "inactive"` _is_
 cached; (c) after `cache_ttl_seconds=0.1` and a `sleep(0.2)`, the next call refetches.
 
-**E1.4 — Fan-out limits.** Cache 150 flags for one user and call `track` without a key;
+**E1.4 — Fan-out limits.** Evaluate 150 flags for one user and call `track` without a key;
 count the batch requests and their sizes.
 
 **E1.5 — Rate limit.** Route `/tracking/assign` to a 429 with `Retry-After: 2`, then to 200
@@ -1020,8 +1242,10 @@ c.is_feature_enabled("f", "u"); c.is_feature_enabled("f", "u"); assert len(t.req
 import time; time.sleep(0.2); c.is_feature_enabled("f", "u"); assert len(t.requests) == 4     # (c) expired
 ```
 
-**S1.4** — 150 cached flags → `track` builds 150 events → `track_batch` chunks at
-`BATCH_LIMIT = 100` → two `/batch` requests of 100 and 50; `BatchResult` sums both.
+**S1.4** — 150 answered flags → `track` builds 150 events → `_post_batches` chunks at
+`BATCH_LIMIT = 100` → two `/batch` requests of 100 and 50 (run at the pin: `[100, 50]`).
+`track` returns `True` only when both chunks were answered 2xx; a failed chunk is logged and
+the other is still sent.
 
 **S1.5**
 
