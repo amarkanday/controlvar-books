@@ -275,8 +275,8 @@ Three facts about tasks that the scheduler code depends on:
 an awaitable — the escape hatch for CPU-bound or blocking work inside a coroutine. It's
 what the bandit runner uses for Monte Carlo and its database work, and what
 `async_scheduler_lock` (Hour 15) uses to take and release the advisory lock, so a database
-that hangs blocks a worker thread rather than the event loop. The other schedulers go through
-a stricter wrapper, `run_in_worker` in `backend/app/core/scheduler_tick.py`; by v0.43.2 every
+that hangs blocks a worker thread rather than the event loop. The other four schedulers
+(experiment, safety, metrics and rollout) go through a stricter wrapper, `run_in_worker` in `backend/app/core/scheduler_tick.py`; by v0.43.2 every
 tick's database work, and the run record each tick writes, runs in a worker thread. The second
 half of this Hour is why the wrapper exists.
 
