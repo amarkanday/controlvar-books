@@ -19,3 +19,8 @@ V2 | learn-react-nextjs-in-24-hours/part-6-production.md | path relative to fron
 # about (`git log --all -- <path>` at REF prints nothing); frontend/node_modules is what `npm ci` creates, never committed.
 V2 | using-ai-tools-effectively/chapter-2-instructions-that-work.md | CLAUDE.md quoted verbatim saying this file never existed; that absence is the lesson | and `backend/tests/unit/metrics/test_metrics_imports.py` were cited here for
 V2 | using-ai-tools-effectively/chapter-6-tamper-testing.md | CLAUDE.md quoted verbatim; frontend/node_modules is created by npm ci, never committed | Cheap moves that would have caught all three: `mv frontend/node_modules` aside
+
+# V2: Chapter 6's exercise plants this file and removes it in the same step; the lines are the real command and
+# the real grep output, run at REF. The file is never committed, so it cannot exist at any REF.
+V2 | using-ai-tools-effectively/chapter-6-tamper-testing.md | planted by the reader and removed in the same step; never committed | rm backend/app/models/planted_imports.py
+V2 | using-ai-tools-effectively/chapter-6-tamper-testing.md | real grep output naming the planted file; never committed | backend/app/models/planted_imports.py:2:from app.models.metrics.metric import RawMetric
