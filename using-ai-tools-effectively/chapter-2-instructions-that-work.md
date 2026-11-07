@@ -72,8 +72,8 @@ did not name.
 
 ## Instructions go stale
 
-A written instruction is a claim, and claims drift from the code they describe. Three examples, all true at
-`09d815ea`.
+A written instruction is a claim, and claims drift from the code they describe. Three examples: the first
+was a drift that has since been corrected, and the other two are still live at `09d815ea`.
 
 **A cited script that never existed.** `CLAUDE.md` once told readers to verify the import convention with
 a script and a test. It now says:
@@ -146,8 +146,9 @@ ends (📁 `CLAUDE.md`):
 > command — either pin it with a test or write it as intent, not as fact.
 
 For the user-facing documentation, Controlvar enforces the second rule with a tool. Every sentence of a
-registered page has an entry in `docs/_claims/` that names the test holding it, and
-`scripts/doc_claims.py check` refuses a page and its registry that disagree. Chapter 9's fix added one:
+registered page has an entry in `docs/_claims/` that names what verifies it (a test, or a recorded
+exemption), and `scripts/doc_claims.py check` refuses a page and its registry that disagree. Chapter 9's fix
+added one, and a later change extended it. At `09d815ea` it reads:
 
 ```toml
 # 📁 docs/_claims/docs/guides/user-guide.md.toml
